@@ -667,6 +667,12 @@ static void set_local_val(JC *c, uint32_t idx, uint32_t reg) {
 // restores EXACTLY that set, with want[j] pinned to slot j (the head was
 // compiled with that register assignment)
 static void warm_backedge(JC *c) {
+    if (getenv("EA_WDBG")) {
+        fprintf(stderr, "[B] pass=%u map:", c->wl_pass);
+        for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++)
+            fprintf(stderr, " %d", c->cache_map[i]);
+        fprintf(stderr, "\n");
+    }
     if (c->wl_pass == 1) {
         c->wl_n_want = 0;
         for (uint32_t i = 0; i < EA_CACHE_SLOTS && c->wl_n_want < EA_CACHE_SLOTS; i++) {
@@ -1299,6 +1305,13 @@ static bool compile_function(JC *c) {
                 c->csp--;
                 c->skip_depth = -1;
                 c->reachable = true;
+                // the warm loop's END can be reached in skip mode (its body
+                // exited via an interior br); finalize the wl context here or
+                // it stays stuck and later branches corrupt registers
+                if (c->wl_pass && pc == c->wl_end_idx) {
+                    c->wl_pass = 0;
+                    flush_cache(c);
+                }
                 pc++;
                 continue;
             }
@@ -1331,6 +1344,7 @@ static bool compile_function(JC *c) {
             // hole remains for >6-live-local unrolled bodies (bench kernels);
             // EA_WARM=1 opts in while that is being chased down
             if (c->wl_pass == 0 && c->cache_on && getenv("EA_WARM") != NULL) {
+                if (getenv("EA_WDBG")) fprintf(stderr, "[L] loop pc=%u head=%u end=%u\n", pc, pc + 1, in->end_idx);
                 c->wl_pass = 1;
                 c->wl_head_pc = pc + 1;
                 c->wl_end_idx = in->end_idx;
@@ -1381,6 +1395,7 @@ static bool compile_function(JC *c) {
                 c->depth = c->ctrl[c->csp - 1].height + c->ctrl[c->csp - 1].rarity;
                 c->csp--;
             }
+            if (getenv("EA_WDBG")) fprintf(stderr, "[E] end pc=%u wl_end=%u pass=%u\n", pc, c->wl_end_idx, c->wl_pass);
             if (c->wl_pass && pc == c->wl_end_idx) {
                 if (c->wl_pass == 1 && c->wl_n_want > 0) {
                     // pass 2: discard the body, restart at the head with the
@@ -1456,6 +1471,7 @@ static bool compile_function(JC *c) {
             }
             // emitted before the branch so both paths establish the state the
             // compile-time cache map describes
+            if (getenv("EA_WDBG")) fprintf(stderr, "[X] brif pc=%u tpc=%u head=%u pass=%u\n", pc, tpc, c->wl_head_pc, c->wl_pass);
             if (c->wl_pass && tpc == c->wl_head_pc) warm_backedge(c);
             else flush_cache(c);
             uint32_t cc;
