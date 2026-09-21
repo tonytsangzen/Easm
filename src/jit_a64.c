@@ -426,6 +426,19 @@ typedef struct {
                             // branch on them (-1 = none)
     uint8_t vpops;          // operands the last pop_pair took from registers
     uint8_t skip_next;      // the next pc (a LOCAL_SET) was fused: skip it
+    int16_t cache_map[6];   // local cached in x19-x24 per slot (-1 = none)
+    uint8_t cache_dirty;    // bit per slot: register fresher than frame
+    uint8_t cache_clock;    // eviction hand
+    uint8_t cache_on;       // EA_CACHE/EA_WARM opt-in (stale-value hole under
+                            // eviction being chased down)
+    // warm-loop two-pass state: pass 1 records the cache state at the loop
+    // back-edge; the body is then recompiled with those locals pre-loaded at
+    // the head, so loop-carried values never touch memory
+    uint32_t wl_pass;       // 0 none, 1 record, 2 warm
+    uint32_t wl_head_pc, wl_end_idx, wl_loop_pc;
+    uint32_t wl_em0, wl_nfx0, wl_ntfx0;
+    int16_t wl_want[6];
+    uint32_t wl_n_want;
     char why[80];
     bool failed;
 } JC;
@@ -598,6 +611,109 @@ static void pop_pair_x(JC *c) {
 static int32_t local_off(JC *c, uint32_t k);
 static void push_s(JC *c, uint32_t vt);
 static void push_d(JC *c, uint32_t vt);
+
+// local cache in x19-x24 (callee-saved, so C helpers keep them); the frame
+// slot may be stale.  Within loops the warm-backedge restores the recorded
+// head state, so loop-carried locals stay in registers across iterations.
+#define EA_CACHE_SLOTS 6
+static const uint32_t ea_cache_reg[EA_CACHE_SLOTS] = {19, 20, 21, 22, 23, 24};
+
+static void flush_cache(JC *c) {
+    for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) {
+        if (c->cache_map[i] >= 0 && (c->cache_dirty & (1u << i)))
+            a64_str_imm64(&c->em, ea_cache_reg[i], FP, local_off(c, (uint32_t)c->cache_map[i]));
+        c->cache_map[i] = -1;
+    }
+    c->cache_dirty = 0;
+}
+static void load_local_val(JC *c, uint32_t reg, uint32_t idx) {
+    if (!c->cache_on) { a64_ldr_imm64(&c->em, reg, FP, local_off(c, idx)); return; }
+    for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) {
+        if (c->cache_map[i] == (int16_t)idx) {
+            a64_mov_reg64(&c->em, reg, ea_cache_reg[i]);
+            return;
+        }
+    }
+    a64_ldr_imm64(&c->em, reg, FP, local_off(c, idx));
+}
+static void set_local_val(JC *c, uint32_t idx, uint32_t reg) {
+    if (!c->cache_on) { a64_str_imm64(&c->em, reg, FP, local_off(c, idx)); return; }
+    for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) {
+        if (c->cache_map[i] == (int16_t)idx) {
+            a64_mov_reg64(&c->em, ea_cache_reg[i], reg);
+            c->cache_dirty |= (uint8_t)(1u << i);
+            return;
+        }
+    }
+    uint32_t s = EA_CACHE_SLOTS;
+    for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++)
+        if (c->cache_map[i] < 0) { s = i; break; }
+    if (s == EA_CACHE_SLOTS) {
+        for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) {
+            uint32_t k = (c->cache_clock + i) % EA_CACHE_SLOTS;
+            if (!(c->cache_dirty & (1u << k))) { s = k; break; }
+        }
+        if (s == EA_CACHE_SLOTS) {
+            s = c->cache_clock % EA_CACHE_SLOTS;
+            a64_str_imm64(&c->em, ea_cache_reg[s], FP, local_off(c, (uint32_t)c->cache_map[s]));
+        }
+    }
+    c->cache_clock = (uint8_t)(s + 1);
+    a64_mov_reg64(&c->em, ea_cache_reg[s], reg);
+    c->cache_map[s] = (int16_t)idx;
+    c->cache_dirty |= (uint8_t)(1u << s);
+}
+// a branch back to the loop head: pass 1 records the cached set; pass 2
+// restores EXACTLY that set, with want[j] pinned to slot j (the head was
+// compiled with that register assignment)
+static void warm_backedge(JC *c) {
+    if (c->wl_pass == 1) {
+        c->wl_n_want = 0;
+        for (uint32_t i = 0; i < EA_CACHE_SLOTS && c->wl_n_want < EA_CACHE_SLOTS; i++) {
+            if (c->cache_map[i] < 0) continue;
+            int16_t v = c->cache_map[i];
+            bool have = false;
+            for (uint32_t j = 0; j < c->wl_n_want; j++) have |= c->wl_want[j] == v;
+            if (!have) c->wl_want[c->wl_n_want++] = v;
+        }
+        flush_cache(c);
+        return;
+    }
+    // write back and free slots holding non-want locals
+    for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) {
+        if (c->cache_map[i] < 0) continue;
+        bool in_want = false;
+        for (uint32_t j = 0; j < c->wl_n_want; j++)
+            in_want |= c->wl_want[j] == c->cache_map[i];
+        if (!in_want) {
+            if (c->cache_dirty & (1u << i))
+                a64_str_imm64(&c->em, ea_cache_reg[i], FP, local_off(c, (uint32_t)c->cache_map[i]));
+            c->cache_map[i] = -1;
+            c->cache_dirty &= (uint8_t)~(1u << i);
+        }
+    }
+    // pin want[j] to slot j: move or reload as needed
+    for (uint32_t j = 0; j < c->wl_n_want; j++) {
+        int32_t cur = -1;
+        for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++)
+            if (c->cache_map[i] == c->wl_want[j]) { cur = (int32_t)i; break; }
+        if (cur == (int32_t)j) continue;
+        if (c->cache_map[j] >= 0 && (c->cache_dirty & (1u << j)))
+            a64_str_imm64(&c->em, ea_cache_reg[j], FP, local_off(c, (uint32_t)c->cache_map[j]));
+        if (cur >= 0) {
+            a64_mov_reg64(&c->em, ea_cache_reg[j], ea_cache_reg[cur]);
+            c->cache_map[j] = c->wl_want[j];
+            c->cache_dirty = (uint8_t)((c->cache_dirty & ~(1u << cur)) |
+                                       ((c->cache_dirty >> cur) & 1u) << j);
+            c->cache_map[cur] = -1;
+            c->cache_dirty &= (uint8_t)~(1u << cur);
+        } else {
+            a64_ldr_imm64(&c->em, ea_cache_reg[j], FP, local_off(c, (uint32_t)c->wl_want[j]));
+            c->cache_map[j] = c->wl_want[j];
+            c->cache_dirty &= (uint8_t)~(1u << j);
+        }
+    }
+}
 static uint32_t cc_invert(uint32_t cc) {
     switch (cc) {
     case CC_EQ: return CC_NE; case CC_NE: return CC_EQ;
@@ -636,7 +752,7 @@ static void push_result_w(JC *c) {
     if (nx < (uint32_t)c->f->code.n && !c->is_target[nx]) {
         uint32_t nop = c->f->code.v[nx].opcode;
         if (nop == EA_OP_LOCAL_SET) {
-            a64_str_imm64(&c->em, R16, FP, local_off(c, c->f->code.v[nx].imm.u32));
+            set_local_val(c, c->f->code.v[nx].imm.u32, R16);
             c->skip_next = 1;
             return;
         }
@@ -659,7 +775,7 @@ static void push_result_x(JC *c) {
     if (nx < (uint32_t)c->f->code.n && !c->is_target[nx]) {
         uint32_t nop = c->f->code.v[nx].opcode;
         if (nop == EA_OP_LOCAL_SET) {
-            a64_str_imm64(&c->em, R16, FP, local_off(c, c->f->code.v[nx].imm.u32));
+            set_local_val(c, c->f->code.v[nx].imm.u32, R16);
             c->skip_next = 1;
             return;
         }
@@ -1075,6 +1191,12 @@ static bool compile_function(JC *c) {
     c->def_first = 0;
     c->fused_cc = -1;
     c->skip_next = 0;
+    for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) c->cache_map[i] = -1;
+    c->cache_dirty = 0;
+    c->cache_clock = 0;
+    c->wl_pass = 0;
+    c->wl_n_want = 0;
+    c->cache_on = (getenv("EA_CACHE") != NULL || getenv("EA_WARM") != NULL);
     c->is_target = (uint8_t *)calloc(n + 2, 1);
     if (c->is_target)
         for (uint32_t i = 0; i < n; i++) {
@@ -1130,6 +1252,21 @@ static bool compile_function(JC *c) {
             continue;
         }
         c->insn_at[pc] = e->len;
+        // the register file caching locals lives only inside straight-line
+        // runs; AFTER insn_at so branches targeting this label execute the
+        // write-backs (BR/BR_IF resolve their target first and may keep a
+        // warm loop state)
+        switch (code->v[pc].opcode) {
+        case EA_OP_BR_TABLE:
+        case EA_OP_RETURN:
+        case EA_OP_CALL: case EA_OP_CALL_INDIRECT: case EA_OP_CALL_REF:
+        case EA_OP_RETURN_CALL: case EA_OP_RETURN_CALL_INDIRECT:
+        case EA_OP_RETURN_CALL_REF:
+        case EA_OP_BLOCK: case EA_OP_LOOP: case EA_OP_IF:
+        case EA_OP_ELSE: case EA_OP_END:
+            flush_cache(c);
+            break;
+        }
         c->depth = c->f->depths[pc];
         c->cur_pc = pc;
         EaInstr *in = &code->v[pc];
@@ -1190,6 +1327,19 @@ static bool compile_function(JC *c) {
             c->csp++;
             break;
         case EA_OP_LOOP:
+            // warm-loop two-pass: correct on the spec suite but a stale-value
+            // hole remains for >6-live-local unrolled bodies (bench kernels);
+            // EA_WARM=1 opts in while that is being chased down
+            if (c->wl_pass == 0 && c->cache_on && getenv("EA_WARM") != NULL) {
+                c->wl_pass = 1;
+                c->wl_head_pc = pc + 1;
+                c->wl_end_idx = in->end_idx;
+                c->wl_loop_pc = pc;
+                c->wl_em0 = c->em.len;
+                c->wl_nfx0 = c->nfx;
+                c->wl_ntfx0 = c->ntfx;
+                c->wl_n_want = 0;
+            }
             c->ctrl[c->csp].height = in->height;
             c->ctrl[c->csp].arity = in->arity_out;
             c->ctrl[c->csp].rarity = in->arity_res;
@@ -1231,6 +1381,36 @@ static bool compile_function(JC *c) {
                 c->depth = c->ctrl[c->csp - 1].height + c->ctrl[c->csp - 1].rarity;
                 c->csp--;
             }
+            if (c->wl_pass && pc == c->wl_end_idx) {
+                if (c->wl_pass == 1 && c->wl_n_want > 0) {
+                    // pass 2: discard the body, restart at the head with the
+                    // recorded locals pre-loaded into registers
+                    c->em.len = c->wl_em0;
+                    c->nfx = c->wl_nfx0;
+                    c->ntfx = c->wl_ntfx0;
+                    for (uint32_t i = 0; i < c->wl_n_want && i < EA_CACHE_SLOTS; i++) {
+                        a64_ldr_imm64(e, ea_cache_reg[i], FP, local_off(c, (uint32_t)c->wl_want[i]));
+                        c->cache_map[i] = c->wl_want[i];
+                    }
+                    c->cache_dirty = 0;
+                    EaInstr *lin = &code->v[c->wl_loop_pc];
+                    c->ctrl[c->csp].height = lin->height;
+                    c->ctrl[c->csp].arity = lin->arity_out;
+                    c->ctrl[c->csp].rarity = lin->arity_res;
+                    c->ctrl[c->csp].arity_in = lin->arity_in;
+                    c->ctrl[c->csp].end_idx = lin->end_idx;
+                    c->ctrl[c->csp].else_idx = UINT32_MAX;
+                    c->ctrl[c->csp].block_idx = c->wl_loop_pc;
+                    c->ctrl[c->csp].is_loop = 1;
+                    c->csp++;
+                    c->wl_pass = 2;
+                    c->reachable = true;  // the pass-1 body ended in a br
+                    c->skip_depth = -1;
+                    pc = c->wl_head_pc - 1; // pc++ lands on the head
+                    break;
+                }
+                c->wl_pass = 0;
+            }
             break;
         case EA_OP_BR: {
             uint32_t l = in->imm.u32;
@@ -1249,6 +1429,8 @@ static bool compile_function(JC *c) {
                 tpc = tloop ? c->ctrl[c->csp - 1 - l].block_idx + 1
                             : c->ctrl[c->csp - 1 - l].end_idx;
             }
+            if (c->wl_pass && tpc == c->wl_head_pc) warm_backedge(c);
+            else flush_cache(c);
             emit_br_to(c, c->depth, theight + tarity, tarity);
             em_b_label(e, 0);
             fix_to_pc(c, tpc);
@@ -1257,19 +1439,6 @@ static bool compile_function(JC *c) {
             break;
         }
         case EA_OP_BR_IF: {
-            uint32_t cc;
-            if (c->fused_cc >= 0) {
-                // comparison set the flags directly: branch on them, the bool
-                // was never materialized
-                cc = cc_invert((uint32_t)c->fused_cc);
-                c->fused_cc = -1; // depth was corrected by the comparison
-            } else {
-                pop_w(e, R16); // cond
-                a64_cmp_imm32(e, R16, 0);
-                cc = CC_EQ;
-            }
-            em_bcond_label(e, 0, cc);
-            fix_cond_to_pc(c, pc + 1, cc); // fallthrough when zero/false
             uint32_t l = in->imm.u32;
             uint32_t theight, tarity, tpc;
             bool tloop;
@@ -1285,6 +1454,23 @@ static bool compile_function(JC *c) {
                 tpc = tloop ? c->ctrl[c->csp - 1 - l].block_idx + 1
                             : c->ctrl[c->csp - 1 - l].end_idx;
             }
+            // emitted before the branch so both paths establish the state the
+            // compile-time cache map describes
+            if (c->wl_pass && tpc == c->wl_head_pc) warm_backedge(c);
+            else flush_cache(c);
+            uint32_t cc;
+            if (c->fused_cc >= 0) {
+                // comparison set the flags directly: branch on them, the bool
+                // was never materialized
+                cc = cc_invert((uint32_t)c->fused_cc);
+                c->fused_cc = -1; // depth was corrected by the comparison
+            } else {
+                pop_w(e, R16); // cond
+                a64_cmp_imm32(e, R16, 0);
+                cc = CC_EQ;
+            }
+            em_bcond_label(e, 0, cc);
+            fix_cond_to_pc(c, pc + 1, cc); // fallthrough when zero/false
             emit_br_to(c, c->depth - 1, theight + tarity, tarity); // cond already popped
             em_b_label(e, 0);
             fix_to_pc(c, tpc);
@@ -1374,26 +1560,26 @@ static bool compile_function(JC *c) {
             break;
         case EA_OP_LOCAL_GET:
             if (c->def_count == 1 && c->def_first) {
-                a64_ldr_imm64(e, R17, FP, local_off(c, in->imm.u32));
+                load_local_val(c, R17, in->imm.u32);
                 c->def_kind1 = 1; c->def_count = 2; c->def_first = 0;
             } else if (c->def_count == 0 && defer1_possible(c, pc, n)) {
-                a64_ldr_imm64(e, R17, FP, local_off(c, in->imm.u32));
+                load_local_val(c, R17, in->imm.u32);
                 c->def_kind1 = 1; c->def_count = 1;
             } else if (c->def_count == 0 && defer2_possible(c, pc, n)) {
-                a64_ldr_imm64(e, R16, FP, local_off(c, in->imm.u32));
+                load_local_val(c, R16, in->imm.u32);
                 c->def_kind0 = 1; c->def_count = 1; c->def_first = 1;
             } else {
-                a64_ldr_imm64(e, R16, FP, local_off(c, in->imm.u32));
+                load_local_val(c, R16, in->imm.u32);
                 push_x(e, R16);
             }
             break;
         case EA_OP_LOCAL_SET:
             pop_x(e, R16);
-            a64_str_imm64(e, R16, FP, local_off(c, in->imm.u32));
+            set_local_val(c, in->imm.u32, R16);
             break;
         case EA_OP_LOCAL_TEE:
             peek_x(e, R16, 0);
-            a64_str_imm64(e, R16, FP, local_off(c, in->imm.u32));
+            set_local_val(c, in->imm.u32, R16);
             break;
         case EA_OP_GLOBAL_GET:
             a64_ldr_imm64(e, R16, R28, __builtin_offsetof(EaInstance, jit_globals));
