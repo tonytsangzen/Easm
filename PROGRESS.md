@@ -643,6 +643,12 @@ memsum 0.003）：这批内核为访存带宽受限，省下的 ALU 指令本就
    该模式。下轮：以 EA_WARM 差分 dump（warm vs 冷态）逐指令比对
    pass-2 循环体，配合 mini.wat 形态枚举（多归变量 + tee + 内部
    退出分支组合）定位。
+   **迭代 20 附带修复（已合入，默认路径受益）**：JIT 前序从不零初始化
+   声明局部（只拷参数）——读先于写的局部读到栈垃圾，违反 wasm 零
+   初始化规范（sum(1) 的余数路径触发；解释器正确）。前序补
+   `str xzr` 循环。注：该修复解释了部分此前"只有 bench 内核出错"
+   的观察——零初始化缺失与 warm 缝隙可能叠加，warm 收尾时需在
+   修复后基线上重新验证。
    驻留）。(a) 可独立先行：guard page + SIGSEGV handler 方案。
 2. call_indirect 类型检查改为解码期缓存 canonical id（现为每次比较重建等价栈）。
 3. br_table / v128 的 JIT lowering；浮点参数直接 S/D 寄存器往返。

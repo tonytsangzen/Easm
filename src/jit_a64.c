@@ -1248,6 +1248,9 @@ static bool compile_function(JC *c) {
             a64_ldr_imm64(e, R16, FP, 32 + below + (int32_t)(c->n_params - 1 - i) * 16);
             a64_str_imm64(e, R16, FP, local_off(c, i));
         }
+        // wasm zeroes declared locals; the frame is raw stack memory
+        for (uint32_t i = c->n_params; i < c->n_locals; i++)
+            a64_str_imm64(e, 31, FP, local_off(c, i));
     }
 
     uint32_t pc = 0;
