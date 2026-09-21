@@ -435,6 +435,7 @@ typedef struct {
     // back-edge; the body is then recompiled with those locals pre-loaded at
     // the head, so loop-carried values never touch memory
     uint32_t wl_pass;       // 0 none, 1 record, 2 warm
+    uint32_t fn_idx;        // function being compiled (debug)
     uint32_t wl_head_pc, wl_end_idx, wl_loop_pc;
     uint32_t wl_em0, wl_nfx0, wl_ntfx0;
     int16_t wl_want[6];
@@ -668,7 +669,7 @@ static void set_local_val(JC *c, uint32_t idx, uint32_t reg) {
 // compiled with that register assignment)
 static void warm_backedge(JC *c) {
     if (getenv("EA_WDBG")) {
-        fprintf(stderr, "[B] pass=%u map:", c->wl_pass);
+        fprintf(stderr, "[B] f%u pass=%u map:", c->fn_idx, c->wl_pass);
         for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++)
             fprintf(stderr, " %d", c->cache_map[i]);
         fprintf(stderr, "\n");
@@ -1347,7 +1348,7 @@ static bool compile_function(JC *c) {
             // hole remains for >6-live-local unrolled bodies (bench kernels);
             // EA_WARM=1 opts in while that is being chased down
             if (c->wl_pass == 0 && c->cache_on && getenv("EA_WARM") != NULL) {
-                if (getenv("EA_WDBG")) fprintf(stderr, "[L] loop pc=%u head=%u end=%u\n", pc, pc + 1, in->end_idx);
+                if (getenv("EA_WDBG")) fprintf(stderr, "[L] f%u loop pc=%u head=%u end=%u nloc=%u\n", c->fn_idx, pc, pc + 1, in->end_idx, c->n_locals);
                 c->wl_pass = 1;
                 c->wl_head_pc = pc + 1;
                 c->wl_end_idx = in->end_idx;
@@ -2222,6 +2223,11 @@ static bool compile_one_function(JC *c) {
         a64_blr(&c->em, R16);
         a64_brk(&c->em, 0);
     }
+    if (getenv("EA_WDBG") && c->n_pc <= 400) {
+        for (uint32_t i = 0; i <= c->n_pc; i++)
+            if (c->insn_at[i] != UINT32_MAX)
+                fprintf(stderr, "[A] f%u pc=%u at=%u\n", c->fn_idx, i, c->insn_at[i]);
+    }
     // resolve pc fixups
     for (uint32_t i = 0; i < c->nfx; i++) {
         uint32_t at = c->fx[i].at;
@@ -2260,6 +2266,7 @@ void ea_jit_compile_module(EaModule *m) {
         em_init(&c.em);
         c.m = m;
         c.f = f;
+        c.fn_idx = fi;
         c.ft = &m->types[f->type_idx].func;
         c.n_locals = f->n_locals;
         c.n_params = c.ft->n_params;
