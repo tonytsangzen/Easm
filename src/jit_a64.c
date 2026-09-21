@@ -68,59 +68,62 @@ EaFuncInst *ea_jit_callee_lookup(EaExec *ex, EaInstance *inst, uint32_t table_id
     EaFuncInst *fi = (EaFuncInst *)inst->tables[table_idx].elems[elem_idx].ref;
     if (!fi) ea_trap(ex, TRAP_UNINIT_ELEM);
     EaFuncType *want = &inst->module->types[type_idx].func;
-    if (fi->type->n_params != want->n_params ||
-        memcmp(fi->type->params, want->params, want->n_params * sizeof(EaValType)) != 0 ||
-        fi->type->n_results != want->n_results ||
-        memcmp(fi->type->results, want->results, want->n_results * sizeof(EaValType)) != 0)
+    bool sig_ok;
+    if (fi->inst && fi->inst->module == inst->module)
+        sig_ok = ea_type_sub(inst->module, fi->type_idx, type_idx, 0);
+    else
+        sig_ok = fi->type->n_params == want->n_params &&
+                 fi->type->n_results == want->n_results &&
+                 memcmp(fi->type->params, want->params, want->n_params * sizeof(EaValType)) == 0 &&
+                 memcmp(fi->type->results, want->results, want->n_results * sizeof(EaValType)) == 0;
+    if (!sig_ok)
         ea_trap(ex, TRAP_INDIRECT_TYPE);
     return fi;
 }
 
 static WVal *ea_h_memory_size(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t memidx) {
     (void)ex;
-    sp[0].i32 = (uint32_t)inst->memories[memidx].pages;
+    EaMemInst *mem = inst->memories[memidx];
+    if (mem->is64) sp[0].i64 = mem->pages; else sp[0].i32 = (uint32_t)mem->pages;
     return sp + 1;
 }
 static WVal *ea_h_memory_grow(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t memidx) {
-    EaMemInst *mem = &inst->memories[memidx];
-    uint32_t delta = (uint32_t)sp[0].i32;
+    (void)inst;
+    EaMemInst *mem = inst->memories[memidx];
+    uint64_t delta = mem->is64 ? (uint64_t)sp[0].i64 : (uint64_t)(uint32_t)sp[0].i32;
     uint64_t old;
     if (ea_grow_memory(mem, delta, &old)) {
-        sp[0].i32 = (uint32_t)old;
-        inst->jit_mem_base = mem->base;
-        inst->jit_mem_limit = mem->size;
+        if (mem->is64) sp[0].i64 = old; else sp[0].i32 = (uint32_t)old;
     } else {
-        sp[0].i32 = 0xFFFFFFFFu;
+        if (mem->is64) sp[0].i64 = -1; else sp[0].i32 = 0xFFFFFFFFu;
     }
     return sp;
 }
 static WVal *ea_h_memory_fill(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t memidx) {
-    EaMemInst *mem = &inst->memories[memidx];
-    if (getenv("EA_JIT_STATS")) fprintf(stderr, "FILL memidx=%u sp=%p n=%u v=%u d=%u\n", memidx,
-                                       (void *)sp, (unsigned)sp[2].i32, (unsigned)sp[1].i32, (unsigned)sp[0].i32);
-    uint64_t n = (uint64_t)(uint32_t)sp[0].i32;
+    EaMemInst *mem = inst->memories[memidx];
+    uint64_t n = mem->is64 ? (uint64_t)sp[0].i64 : (uint64_t)(uint32_t)sp[0].i32;
     uint8_t byte = (uint8_t)sp[1].i32;
-    uint64_t d = (uint64_t)(uint32_t)sp[2].i32;
-    if (n > mem->size || d > mem->size - n) ea_trap(ex, TRAP_OOB_MEMORY);
+    uint64_t d = mem->is64 ? (uint64_t)sp[2].i64 : (uint64_t)(uint32_t)sp[2].i32;
+    if (d > mem->size || n > mem->size - d) ea_trap(ex, TRAP_OOB_MEMORY);
     if (n) memset(mem->base + d, byte, n);
     return sp - 3;
 }
 static WVal *ea_h_memory_copy(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t dst, uint32_t src) {
-    EaMemInst *md = &inst->memories[dst], *ms = &inst->memories[src];
-    uint64_t n = (uint64_t)(uint32_t)sp[0].i32;
-    uint64_t sv = (uint64_t)(uint32_t)sp[1].i32;
-    uint64_t dv = (uint64_t)(uint32_t)sp[2].i32;
-    if (n > ms->size || sv > ms->size - n) ea_trap(ex, TRAP_OOB_MEMORY);
-    if (n > md->size || dv > md->size - n) ea_trap(ex, TRAP_OOB_MEMORY);
+    EaMemInst *md = inst->memories[dst], *ms = inst->memories[src];
+    uint64_t n = (md->is64 && ms->is64) ? (uint64_t)sp[0].i64 : (uint64_t)(uint32_t)sp[0].i32;
+    uint64_t sv = ms->is64 ? (uint64_t)sp[1].i64 : (uint64_t)(uint32_t)sp[1].i32;
+    uint64_t dv = md->is64 ? (uint64_t)sp[2].i64 : (uint64_t)(uint32_t)sp[2].i32;
+    if (sv > ms->size || n > ms->size - sv) ea_trap(ex, TRAP_OOB_MEMORY);
+    if (dv > md->size || n > md->size - dv) ea_trap(ex, TRAP_OOB_MEMORY);
     if (n) memmove(md->base + dv, ms->base + sv, n);
     return sp - 3;
 }
 static WVal *ea_h_memory_init(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t memidx, uint32_t dataidx) {
-    EaMemInst *mem = &inst->memories[memidx];
+    EaMemInst *mem = inst->memories[memidx];
     EaData *d = &inst->module->datas[dataidx];
-    uint64_t n = (uint64_t)(uint32_t)sp[0].i32;
+    uint64_t n = (uint64_t)(uint32_t)sp[0].i32; // len/src always i32
     uint64_t sv = (uint64_t)(uint32_t)sp[1].i32;
-    uint64_t dv = (uint64_t)(uint32_t)sp[2].i32;
+    uint64_t dv = mem->is64 ? (uint64_t)sp[2].i64 : (uint64_t)(uint32_t)sp[2].i32;
     uint64_t dlen = inst->data_alive[dataidx] ? d->data_len : 0;
     if (sv + n > dlen) ea_trap(ex, TRAP_OOB_MEMORY);
     if (n > mem->size || dv > mem->size - n) ea_trap(ex, TRAP_OOB_MEMORY);
@@ -148,56 +151,59 @@ static WVal *ea_h_table_set(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t tid
 }
 static WVal *ea_h_table_size(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t tidx) {
     (void)ex;
-    sp[0].i32 = (uint32_t)inst->tables[tidx].size;
+    EaTableInst *t = &inst->tables[tidx];
+    if (t->is64) sp[0].i64 = t->size; else sp[0].i32 = (uint32_t)t->size;
     return sp + 1;
 }
 static WVal *ea_h_table_grow(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t tidx) {
     EaTableInst *t = &inst->tables[tidx];
-    uint32_t delta = (uint32_t)sp[0].i32;
+    uint64_t delta = t->is64 ? (uint64_t)sp[0].i64 : (uint64_t)(uint32_t)sp[0].i32;
     WVal init = sp[1];
     uint64_t old = t->size;
     uint64_t newsz = old + delta;
     if (newsz > t->max || newsz > (1ull << 32)) {
-        sp[0].i32 = 0xFFFFFFFFu;
+        if (t->is64) sp[0].i64 = -1; else sp[0].i32 = 0xFFFFFFFFu;
     } else {
         t->elems = (WVal *)ea_realloc(t->elems, (newsz ? newsz : 1) * sizeof(WVal));
         for (uint64_t i = old; i < newsz; i++) t->elems[i] = init;
         t->size = newsz;
-        sp[0].i32 = (uint32_t)old;
+        if (t->is64) sp[0].i64 = old; else sp[0].i32 = (uint32_t)old;
     }
     return sp;
 }
 static WVal *ea_h_table_fill(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t tidx) {
     EaTableInst *t = &inst->tables[tidx];
-    uint64_t n = (uint64_t)(uint32_t)sp[0].i32;
+    uint64_t n = t->is64 ? (uint64_t)sp[0].i64 : (uint64_t)(uint32_t)sp[0].i32;
     WVal v = sp[1];
-    uint64_t d = (uint64_t)(uint32_t)sp[2].i32;
-    if (n > t->size || d > t->size - n) ea_trap(ex, TRAP_OOB_TABLE);
+    uint64_t d = t->is64 ? (uint64_t)sp[2].i64 : (uint64_t)(uint32_t)sp[2].i32;
+    if (d > t->size || n > t->size - d) ea_trap(ex, TRAP_OOB_TABLE);
     for (uint64_t i = 0; i < n; i++) t->elems[d + i] = v;
     return sp - 3;
 }
 static WVal *ea_h_table_copy(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t dtn, uint32_t stn) {
     EaTableInst *td = &inst->tables[dtn], *ts = &inst->tables[stn];
-    uint64_t n = (uint64_t)(uint32_t)sp[0].i32;
-    uint64_t sv = (uint64_t)(uint32_t)sp[1].i32;
-    uint64_t dv = (uint64_t)(uint32_t)sp[2].i32;
-    if (n > td->size || dv > td->size - n) ea_trap(ex, TRAP_OOB_TABLE);
-    if (n > ts->size || sv > ts->size - n) ea_trap(ex, TRAP_OOB_TABLE);
+    uint64_t n = (td->is64 && ts->is64) ? (uint64_t)sp[0].i64 : (uint64_t)(uint32_t)sp[0].i32;
+    uint64_t sv = ts->is64 ? (uint64_t)sp[1].i64 : (uint64_t)(uint32_t)sp[1].i32;
+    uint64_t dv = td->is64 ? (uint64_t)sp[2].i64 : (uint64_t)(uint32_t)sp[2].i32;
+    if (dv > td->size || n > td->size - dv) ea_trap(ex, TRAP_OOB_TABLE);
+    if (sv > ts->size || n > ts->size - sv) ea_trap(ex, TRAP_OOB_TABLE);
     memmove(&td->elems[dv], &ts->elems[sv], (size_t)n * sizeof(WVal));
     return sp - 3;
 }
 static WVal *ea_h_table_init(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t tidx, uint32_t eidx) {
     EaTableInst *t = &inst->tables[tidx];
     EaElem *e = &inst->module->elems[eidx];
-    uint64_t n = (uint64_t)(uint32_t)sp[0].i32;
+    uint64_t n = (uint64_t)(uint32_t)sp[0].i32; // len/src always i32
     uint64_t sv = (uint64_t)(uint32_t)sp[1].i32;
-    uint64_t dv = (uint64_t)(uint32_t)sp[2].i32;
+    uint64_t dv = t->is64 ? (uint64_t)sp[2].i64 : (uint64_t)(uint32_t)sp[2].i32;
     uint64_t ilen = inst->elem_alive[eidx] ? e->n_items : 0;
     if (sv + n > ilen) ea_trap(ex, TRAP_OOB_TABLE);
     if (n > t->size || dv > t->size - n) ea_trap(ex, TRAP_OOB_TABLE);
     for (uint64_t i = 0; i < n; i++) {
         WVal v;
-        if (e->items) {
+        if (e->cache) {
+            v = e->cache[sv + i];
+        } else if (e->items) {
             if (ea_eval_const_expr(inst, inst->module, &e->items[sv + i], &v, e->ref_type) != 0)
                 ea_trap(ex, TRAP_OOB_TABLE);
         } else {
@@ -490,6 +496,14 @@ static void b_trap(JC *c, uint32_t code) {
     fix_to_trap(c, code);
 }
 
+// mem base/limit from the shared EaMemInst so growth through any aliasing
+// instance is visible at the next call/prologue
+static void load_mem_regs(Em *e) {
+    a64_ldr_imm64(e, R17, R28, __builtin_offsetof(EaInstance, jit_mem0));
+    a64_ldr_imm64(e, R25, R17, __builtin_offsetof(EaMemInst, base));
+    a64_ldr_imm64(e, R26, R17, __builtin_offsetof(EaMemInst, size));
+}
+
 static void push_x(JC *c, uint32_t rt) { a64_str_pre64(&c->em, rt, SP, -16); }
 static void pop_x(JC *c, uint32_t rt) { a64_ldr_post64(&c->em, rt, SP, 16); }
 static void push_w(JC *c, uint32_t rt) { a64_str_pre32(&c->em, rt, SP, -16); }
@@ -583,16 +597,15 @@ static void emit_f64_minmax(JC *c, bool is_max) {
 static void reload_ctx(JC *c) {
     int32_t so = -32 - (int32_t)c->n_locals * 16 - 16;
     a64_ldr_imm64(&c->em, R28, FP, so);
-    a64_ldr_imm64(&c->em, R25, R28, __builtin_offsetof(EaInstance, jit_mem_base));
-    a64_ldr_imm64(&c->em, R26, R28, __builtin_offsetof(EaInstance, jit_mem_limit));
+    load_mem_regs(&c->em);
 }
 
 static void emit_load(JC *c, EaInstr *in) {
     pop_x(&c->em, R16);
-    uint32_t off = in->imm.pair.b;
+    uint64_t off = in->imm.ma.offset;
     if (off) {
-        if (off < 4096) a64_add_imm64(&c->em, R16, R16, off);
-        else { a64_mov32_imm(&c->em, R17, off); a64_add_reg64(&c->em, R16, R16, R17); }
+        if (off < 4096) a64_add_imm64(&c->em, R16, R16, (uint32_t)off);
+        else { a64_mov64_imm(&c->em, R17, off); a64_add_reg64(&c->em, R16, R16, R17); }
     }
     uint64_t nat;
     switch (in->opcode) {
@@ -635,10 +648,10 @@ static void emit_store(JC *c, EaInstr *in) {
         int b = in->opcode == EA_OP_F64_STORE ? 8 : 4;
         if (b == 8) pop_d(&c->em, V0); else pop_s(&c->em, V0); // value
         pop_x(&c->em, R16);                                    // address
-        uint32_t foff = in->imm.pair.b;
+        uint64_t foff = in->imm.ma.offset;
         if (foff) {
-            if (foff < 4096) a64_add_imm64(&c->em, R16, R16, foff);
-            else { a64_mov32_imm(&c->em, R17, foff); a64_add_reg64(&c->em, R16, R16, R17); }
+            if (foff < 4096) a64_add_imm64(&c->em, R16, R16, (uint32_t)foff);
+            else { a64_mov64_imm(&c->em, R17, foff); a64_add_reg64(&c->em, R16, R16, R17); }
         }
         a64_sub_imm64(&c->em, R17, R26, (uint32_t)b);
         a64_cmp_reg64(&c->em, R16, R17);
@@ -648,11 +661,11 @@ static void emit_store(JC *c, EaInstr *in) {
     }
     pop_x(&c->em, R17); // value
     pop_x(&c->em, R16); // address
-    uint32_t off = in->imm.pair.b;
+    uint64_t off = in->imm.ma.offset;
     if (off) {
         // R17 holds the value; use the free x0 for large offsets
-        if (off < 4096) a64_add_imm64(&c->em, R16, R16, off);
-        else { a64_mov32_imm(&c->em, R0, off); a64_add_reg64(&c->em, R16, R16, R0); }
+        if (off < 4096) a64_add_imm64(&c->em, R16, R16, (uint32_t)off);
+        else { a64_mov64_imm(&c->em, R0, off); a64_add_reg64(&c->em, R16, R16, R0); }
     }
     uint64_t nat;
     switch (in->opcode) {
@@ -744,8 +757,7 @@ static void emit_call_static(JC *c, EaInstr *in) {
         // JIT path: pop the args into the call transition (entry sp = args_end)
         a64_add_imm64(&c->em, SP, SP, a * SLOT);
         a64_mov_reg64(&c->em, R28, R0);
-        a64_ldr_imm64(&c->em, R25, R28, __builtin_offsetof(EaInstance, jit_mem_base));
-        a64_ldr_imm64(&c->em, R26, R28, __builtin_offsetof(EaInstance, jit_mem_limit));
+        load_mem_regs(&c->em);
         a64_blr(&c->em, R1);
         // callee left sp = entry - R*16 with results at [sp, sp+R*16); skip the bridge
         em_b_label(&c->em, 0);
@@ -769,7 +781,8 @@ static void emit_call_indirect(JC *c, EaInstr *in) {
     uint32_t type_idx = in->imm.pair.a, table_idx = in->imm.pair.b;
     const EaFuncType *t = &c->m->types[type_idx].func;
     uint32_t a = t->n_params, r = t->n_results;
-    pop_w(&c->em, R4); // elem index
+    if (c->m->tables[table_idx].is64) pop_x(&c->em, R4); // i64 table index
+    else pop_w(&c->em, R4);
     a64_mov_reg64(&c->em, R0, R27);
     a64_mov_reg64(&c->em, R1, R28);
     a64_movz32(&c->em, R2, table_idx & 0xFFFF);
@@ -787,8 +800,7 @@ static void emit_call_indirect(JC *c, EaInstr *in) {
         em_bcond_label(&c->em, 0, CC_EQ);
         uint32_t patch_insn = c->em.len - 1;
         a64_mov_reg64(&c->em, R28, R0);
-        a64_ldr_imm64(&c->em, R25, R28, __builtin_offsetof(EaInstance, jit_mem_base));
-        a64_ldr_imm64(&c->em, R26, R28, __builtin_offsetof(EaInstance, jit_mem_limit));
+        load_mem_regs(&c->em);
         a64_blr(&c->em, R1);
         // callee left sp = entry - R*16 with results at [sp, sp+R*16); skip the bridge
         em_b_label(&c->em, 0);
@@ -929,8 +941,7 @@ static bool compile_function(JC *c) {
         a64_str_imm64(e, R28, FP, so);
     }
     // load mem base/limit
-    a64_ldr_imm64(e, R25, R28, __builtin_offsetof(EaInstance, jit_mem_base));
-    a64_ldr_imm64(e, R26, R28, __builtin_offsetof(EaInstance, jit_mem_limit));
+    load_mem_regs(e);
     if (getenv("EA_JIT_TRACE")) {
         a64_mov64_imm(e, R0, 0x1234);
         a64_mov_from_sp(e, R1);
@@ -1207,13 +1218,15 @@ static bool compile_function(JC *c) {
             break;
         case EA_OP_GLOBAL_GET:
             a64_ldr_imm64(e, R16, R28, __builtin_offsetof(EaInstance, jit_globals));
-            a64_ldr_imm64(e, R16, R16, (int64_t)in->imm.u32 * 16);
+            a64_ldr_imm64(e, R16, R16, (int64_t)in->imm.u32 * 8);
+            a64_ldr_imm64(e, R16, R16, 0);
             push_x(e, R16);
             break;
         case EA_OP_GLOBAL_SET:
             pop_x(e, R16);
             a64_ldr_imm64(e, R17, R28, __builtin_offsetof(EaInstance, jit_globals));
-            a64_str_imm64(e, R16, R17, (int64_t)in->imm.u32 * 16);
+            a64_ldr_imm64(e, R17, R17, (int64_t)in->imm.u32 * 8);
+            a64_str_imm64(e, R16, R17, 0);
             break;
         case EA_OP_MEMORY_SIZE:
             emit_helper3(c, ea_h_memory_size, in->imm.u32, 0xFFFFFFFFu);
@@ -1339,7 +1352,8 @@ static void emit_tail_call(JC *c, bool indirect, EaInstr *in) {
         if (bo < 4096) a64_add_imm64(e, R17, R17, (uint32_t)bo);
         else { a64_mov64_imm(e, R0, bo); a64_add_reg64(e, R17, R17, R0); }
     } else {
-        pop_w(e, R4); // elem index
+        if (c->m->tables[in->imm.pair.b].is64) pop_x(e, R4); // i64 table index
+        else pop_w(e, R4);
         a64_mov_reg64(e, R0, R27);
         a64_mov_reg64(e, R1, R28);
         a64_movz32(e, R2, in->imm.pair.b & 0xFFFF);
@@ -1378,8 +1392,7 @@ static void emit_tail_call(JC *c, bool indirect, EaInstr *in) {
     // JIT callee: set its context and tail-jump
     a64_ldr_imm64(e, R0, R17, __builtin_offsetof(EaFuncInst, inst));
     a64_mov_reg64(e, R28, R0);
-    a64_ldr_imm64(e, R25, R28, __builtin_offsetof(EaInstance, jit_mem_base));
-    a64_ldr_imm64(e, R26, R28, __builtin_offsetof(EaInstance, jit_mem_limit));
+    load_mem_regs(e);
     a64_ldr_imm64(e, R1, R17, __builtin_offsetof(EaFuncInst, jit_entry));
     a64_br_reg(e, R1);
     uint32_t join = c->em.len;

@@ -14,6 +14,7 @@ struct JV {
     JType type;
     double num;
     char *str;        // J_STR
+    uint32_t str_len; // J_STR byte length (names may contain NUL)
     JV **items;       // J_ARR / J_OBJ values
     char **keys;      // J_OBJ keys
     uint32_t n;
@@ -22,6 +23,7 @@ struct JV {
 typedef struct {
     const char *p, *end;
     bool failed;
+    size_t str_len;   // length of the last parsed string (may contain NUL)
 } JP;
 
 static void jskip(JP *p) {
@@ -88,6 +90,7 @@ static char *jstring(JP *p) {
         }
     }
     out[oi] = 0;
+    p->str_len = oi;
     p->p++;
     return out;
 }
@@ -147,6 +150,7 @@ static JV *jparse(JP *p) {
     if (c == '"') {
         JV *v = jnew(J_STR);
         v->str = jstring(p);
+        v->str_len = (uint32_t)p->str_len;
         return v;
     }
     if (c == 't') { p->p += 4; JV *v = jnew(J_BOOL); v->num = 1; return v; }
@@ -185,12 +189,19 @@ typedef struct {
 } Named;
 
 typedef struct {
+    char *name;
+    EaModule *mod;
+} ModDef;
+
+typedef struct {
     EaStore *store;
     EaInstance *cur;
     EaModule *cur_mod;
     Named *named;
     uint32_t n_named, cap_named;
     uint32_t module_counter;   // implicit "$N" naming per script
+    EaInstance *last_inst;     // most recent module (for nameless register)
+    ModDef *defs; uint32_t n_defs, cap_defs; // named module definitions
     // stats
     uint32_t passed, failed, skipped_text;
 } Driver;
@@ -223,10 +234,21 @@ static WVal parse_val(JV *jv) {
         if (strcmp(ty, "f64") == 0) memcpy(&v.f64, &bits, 8);
         else v.i64 = bits;
     } else if (strcmp(ty, "externref") == 0) {
+        // ref.extern N is a NON-null host reference: offset by 1 so it never
+        // collides with the null representation; "any" = unspecified non-null
         if (strcmp(val, "null") == 0) v.ref = NULL;
-        else v.ref = (void *)(uintptr_t)parse_u64(val);
+        else if (strcmp(val, "any") == 0) v.ref = (void *)1;
+        else v.ref = (void *)(uintptr_t)(parse_u64(val) + 1);
     } else if (strcmp(ty, "funcref") == 0) {
         v.ref = NULL; // non-null handled at comparison time (needs module context)
+    } else if (strcmp(ty, "anyref") == 0 || strcmp(ty, "eqref") == 0 ||
+               strcmp(ty, "i31ref") == 0 || strcmp(ty, "structref") == 0 ||
+               strcmp(ty, "arrayref") == 0 || strcmp(ty, "nullref") == 0 ||
+               strcmp(ty, "exnref") == 0 || strcmp(ty, "nullfuncref") == 0 ||
+               strcmp(ty, "nullexternref") == 0 || strcmp(ty, "nullexnref") == 0) {
+        // generic refs: null-ness (and host payloads via externref encoding)
+        v.ref = (valj && strcmp(val, "null") != 0)
+                    ? (void *)(uintptr_t)(parse_u64(val) + 1) : NULL;
     } else if (strcmp(ty, "v128") == 0) {
         JV *lanes = jobj(jv, "lane_values");
         if (lanes) {
@@ -377,16 +399,26 @@ static int val_matches(Driver *d, EaInstance *inst, JV *exp, WVal got, int32_t *
     }
     if (strcmp(ty, "funcref") == 0) {
         *out_i32 = 0;
-        if (strcmp(val, "null") == 0) return got.ref == NULL ? 0 : 1;
-        // function index within module
-        uint64_t idx = parse_u64(val);
-        if (!inst || idx >= inst->n_funcs) return 1;
-        return got.ref == (void *)&inst->funcs[idx] ? 0 : 1;
+        // wast2json encodes a folded (ref.func) result as value "0": it cannot
+        // know the function index, so any non-null funcref matches
+        if (!valj || strcmp(val, "null") != 0)
+            return got.ref != NULL ? 0 : 1;
+        return got.ref == NULL ? 0 : 1;
     }
     if (strcmp(ty, "externref") == 0) {
         *out_i32 = 0;
         if (strcmp(val, "null") == 0) return got.ref == NULL ? 0 : 1;
-        return got.ref == (void *)(uintptr_t)parse_u64(val) ? 0 : 1;
+        if (strcmp(val, "any") == 0) return got.ref != NULL ? 0 : 1;
+        return got.ref == (void *)(uintptr_t)(parse_u64(val) + 1) ? 0 : 1;
+    }
+    if (strcmp(ty, "anyref") == 0 || strcmp(ty, "eqref") == 0 ||
+        strcmp(ty, "i31ref") == 0 || strcmp(ty, "structref") == 0 ||
+        strcmp(ty, "arrayref") == 0 || strcmp(ty, "nullref") == 0 ||
+        strcmp(ty, "exnref") == 0 || strcmp(ty, "nullfuncref") == 0 ||
+        strcmp(ty, "nullexternref") == 0 || strcmp(ty, "nullexnref") == 0) {
+        *out_i32 = 0;
+        if (strcmp(val, "null") == 0) return got.ref == NULL ? 0 : 1;
+        return got.ref != NULL ? 0 : 1;
     }
     (void)d;
     return -1;
@@ -399,9 +431,12 @@ static int run_action(Driver *d, JV *action, WVal *args, uint32_t n_args, WVal *
     if (!inst) return -1;
     *used = inst;
     const char *atype = jstr(action, "type");
-    const char *field = jstr(action, "field");
+    uint32_t flen = 0;
+    JV *fj = jobj(action, "field");
+    const char *field = fj && fj->type == J_STR ? fj->str : NULL;
+    if (fj) flen = fj->str_len;
     if (atype && strcmp(atype, "invoke") == 0) {
-        int idx = ea_instance_export(inst, field, EAK_FUNC);
+        int idx = ea_instance_export_n(inst, field, flen, EAK_FUNC);
         if (idx < 0) return -2;
         EaTrap t = TRAP_NONE;
         int rc = ea_instance_invoke(d->store, inst, (uint32_t)idx, args, results, &t);
@@ -409,9 +444,9 @@ static int run_action(Driver *d, JV *action, WVal *args, uint32_t n_args, WVal *
         return rc;
     }
     if (atype && strcmp(atype, "get") == 0) {
-        int idx = ea_instance_export(inst, field, EAK_GLOBAL);
+        int idx = ea_instance_export_n(inst, field, flen, EAK_GLOBAL);
         if (idx < 0) return -2;
-        results[0] = inst->globals[idx];
+        results[0] = *inst->globals[idx];
         if (trap) *trap = TRAP_NONE;
         return 0;
     }
@@ -445,6 +480,13 @@ static void load_module_file(Driver *d, const char *json_path, const char *filen
     fclose(f);
     EaModule *m = (EaModule *)ea_zalloc(sizeof(EaModule));
     *rc = ea_decode_module(m, buf, (size_t)len, err);
+    if (*rc == 0 && getenv("EA_VDBG2")) {
+        fprintf(stderr, "MODULE ntypes=%u:", m->n_types);
+        for (uint32_t ti = 0; ti < m->n_types && ti < 12; ti++)
+            fprintf(stderr, " [%u]k%d p%u r%u", ti, (int)m->types[ti].kind,
+                    m->types[ti].func.n_params, m->types[ti].func.n_results);
+        fprintf(stderr, "\n");
+    }
     if (*rc != 0) {
         *stage = 1;
         ea_module_free(m);
@@ -474,7 +516,11 @@ static void make_spectest(EaStore *store) {
     static EaModule st_mod;
     static EaFuncInst st_funcs[7];
     static EaTableInst st_table;
+    static EaTableInst st_table64;
     static EaMemInst st_mem;
+    static EaMemInst st_mem64;
+    static EaMemInst *st_mems[2] = { &st_mem, &st_mem64 };
+    static EaTableInst st_tables[2];
     static WVal st_globals[4];
     static EaGlobal st_globals_def[4];
     static EaExport st_exports[16];
@@ -513,24 +559,26 @@ static void make_spectest(EaStore *store) {
         st_globals_def[i].mutable_ = false;
     }
     st_globals[0].i32 = 666;
-    st_globals[1].i64 = 66666666666ull;
+    st_globals[1].i64 = 666; // spectest global_i64
     st_globals[2].f32 = 666.6f;
     st_globals[3].f64 = 666.6;
 
     int ne = 0;
-    st_exports[ne++] = (EaExport){"print", EAK_FUNC, 0};
-    st_exports[ne++] = (EaExport){"print_i32", EAK_FUNC, 1};
-    st_exports[ne++] = (EaExport){"print_i64", EAK_FUNC, 2};
-    st_exports[ne++] = (EaExport){"print_f32", EAK_FUNC, 3};
-    st_exports[ne++] = (EaExport){"print_f64", EAK_FUNC, 4};
-    st_exports[ne++] = (EaExport){"print_i32_f32", EAK_FUNC, 5};
-    st_exports[ne++] = (EaExport){"print_f64_f64", EAK_FUNC, 6};
-    st_exports[ne++] = (EaExport){"global_i32", EAK_GLOBAL, 0};
-    st_exports[ne++] = (EaExport){"global_i64", EAK_GLOBAL, 1};
-    st_exports[ne++] = (EaExport){"global_f32", EAK_GLOBAL, 2};
-    st_exports[ne++] = (EaExport){"global_f64", EAK_GLOBAL, 3};
-    st_exports[ne++] = (EaExport){"table", EAK_TABLE, 0};
-    st_exports[ne++] = (EaExport){"memory", EAK_MEMORY, 0};
+    st_exports[ne++] = (EaExport){"print", 0, EAK_FUNC, 0};
+    st_exports[ne++] = (EaExport){"print_i32", 0, EAK_FUNC, 1};
+    st_exports[ne++] = (EaExport){"print_i64", 0, EAK_FUNC, 2};
+    st_exports[ne++] = (EaExport){"print_f32", 0, EAK_FUNC, 3};
+    st_exports[ne++] = (EaExport){"print_f64", 0, EAK_FUNC, 4};
+    st_exports[ne++] = (EaExport){"print_i32_f32", 0, EAK_FUNC, 5};
+    st_exports[ne++] = (EaExport){"print_f64_f64", 0, EAK_FUNC, 6};
+    st_exports[ne++] = (EaExport){"global_i32", 0, EAK_GLOBAL, 0};
+    st_exports[ne++] = (EaExport){"global_i64", 0, EAK_GLOBAL, 1};
+    st_exports[ne++] = (EaExport){"global_f32", 0, EAK_GLOBAL, 2};
+    st_exports[ne++] = (EaExport){"global_f64", 0, EAK_GLOBAL, 3};
+    st_exports[ne++] = (EaExport){"table", 0, EAK_TABLE, 0};
+    st_exports[ne++] = (EaExport){"table64", 0, EAK_TABLE, 1};
+    st_exports[ne++] = (EaExport){"memory", 0, EAK_MEMORY, 0};
+    st_exports[ne++] = (EaExport){"memory64", 0, EAK_MEMORY, 1};
     st_mod.n_exports = ne;
 
     st_table.ref_type = VT_FUNCREF;
@@ -539,6 +587,9 @@ static void make_spectest(EaStore *store) {
     st_table.elems = (WVal *)ea_zalloc(10 * sizeof(WVal));
     st_table.size = 10;
 
+    st_table64 = st_table;
+    st_table64.is64 = true;
+
     st_mem.pages = 1;
     st_mem.max_pages = 2;
     st_mem.has_max = true;
@@ -546,12 +597,19 @@ static void make_spectest(EaStore *store) {
     st_mem.base = alloc_memory_public(1);
     st_mem.owned = true;
 
+    st_mem64 = st_mem;
+    st_mem64.is64 = true;
+
+    st_tables[0] = st_table;
+    st_tables[1] = st_table64;
+
     EaInstance *inst = (EaInstance *)ea_zalloc(sizeof(EaInstance));
     inst->module = &st_mod;
     inst->n_funcs = 7; inst->funcs = st_funcs;
-    inst->n_tables = 1; inst->tables = &st_table;
-    inst->n_memories = 1; inst->memories = &st_mem;
-    inst->n_globals = 4; inst->globals = st_globals;
+    inst->n_tables = 2; inst->tables = st_tables;
+    inst->n_memories = 2; inst->memories = st_mems;
+    static WVal *st_gptrs[4] = { &st_globals[0], &st_globals[1], &st_globals[2], &st_globals[3] };
+    inst->n_globals = 4; inst->globals = st_gptrs;
     inst->start_func = UINT32_MAX;
     made = true;
     ea_register_instance(store, "spectest", inst);
@@ -635,6 +693,23 @@ static int run_wast_inner(const char *json_path, int verbose) {
                 d.cur_mod = prev_mod;
                 continue;
             }
+            const char *isdef = jstr(cmd, "definition");
+            if (isdef && strcmp(isdef, "true") == 0) {
+                // module definition: decode only; register for `instance` commands
+                if (name) {
+                    if (d.n_defs == d.cap_defs) {
+                        d.cap_defs = d.cap_defs ? d.cap_defs * 2 : 8;
+                        d.defs = (ModDef *)ea_realloc(d.defs, d.cap_defs * sizeof(ModDef));
+                    }
+                    const char *nm = name[0] == '$' ? name + 1 : name;
+                    d.defs[d.n_defs].name = ea_strndup(nm, strlen(nm));
+                    d.defs[d.n_defs].mod = d.cur_mod;
+                    d.n_defs++;
+                }
+                d.cur = prev;
+                d.cur_mod = prev_mod;
+                continue;
+            }
             char *err2 = NULL;
             EaTrap trap = TRAP_NONE;
             EaInstance *inst = NULL;
@@ -656,6 +731,7 @@ static int run_wast_inner(const char *json_path, int verbose) {
                     d.cap_named = d.cap_named ? d.cap_named * 2 : 16;
                     d.named = (Named *)ea_realloc(d.named, d.cap_named * sizeof(Named));
                 }
+                d.last_inst = inst;
                 // implicit index name (register/invoke use "$N")
                 d.named[d.n_named].name = ea_strndup(implicit, strlen(implicit));
                 d.named[d.n_named].inst = inst;
@@ -670,10 +746,48 @@ static int run_wast_inner(const char *json_path, int verbose) {
                     d.n_named++;
                 }
             }
+        } else if (strcmp(type, "instance") == 0) {
+            const char *iname = jstr(cmd, "instance");
+            const char *defname = jstr(cmd, "definition");
+            EaModule *mod = NULL;
+            if (defname) {
+                const char *nm = defname[0] == '$' ? defname + 1 : defname;
+                for (uint32_t i = 0; i < d.n_defs; i++)
+                    if (strcmp(d.defs[i].name, nm) == 0) { mod = d.defs[i].mod; break; }
+            }
+            if (!mod) {
+                d.failed++;
+                printf("line %d: instance: unknown definition %s\n", (int)line, defname ? defname : "?");
+                continue;
+            }
+            char *err2 = NULL;
+            EaTrap trap = TRAP_NONE;
+            EaInstance *inst = NULL;
+            int r = ea_store_instantiate(d.store, mod, &inst, &err2, &trap);
+            if (r != 0) {
+                d.failed++;
+                printf("line %d: instance %s instantiation failed (%s): %s\n", (int)line,
+                       iname ? iname : "?", r == 1 ? "unlinkable" : "trap", err2 ? err2 : ea_trap_msg(trap));
+                continue;
+            }
+            if (d.n_named + 2 > d.cap_named) {
+                d.cap_named = d.cap_named ? d.cap_named * 2 : 16;
+                d.named = (Named *)ea_realloc(d.named, d.cap_named * sizeof(Named));
+            }
+            if (iname) {
+                const char *nm = iname[0] == '$' ? iname + 1 : iname;
+                d.named[d.n_named].name = ea_strndup(nm, strlen(nm));
+                d.named[d.n_named].inst = inst;
+                d.named[d.n_named].module = mod;
+                d.n_named++;
+            }
+            d.cur = inst;
+            d.cur_mod = mod;
+            d.last_inst = inst;
         } else if (strcmp(type, "register") == 0) {
             const char *name = jstr(cmd, "name");
             const char *as = jstr(cmd, "as");
-            EaInstance *inst = driver_lookup(&d, name);
+            EaInstance *inst = name ? driver_lookup(&d, name) : d.last_inst;
             if (!inst) {
                 d.failed++;
                 printf("line %d: register: unknown module %s\n", (int)line, name);

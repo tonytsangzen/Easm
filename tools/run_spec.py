@@ -34,11 +34,22 @@ def convert(wast: Path, outdir: Path) -> Path | None:
         old.unlink(missing_ok=True)
     r = subprocess.run(
         ["wast2json", "--enable-threads", "--enable-function-references",
-         str(wast), "-o", str(json_path)],
+         "--enable-gc", str(wast), "-o", str(json_path)],
         capture_output=True, text=True, timeout=120,
     )
     if r.returncode != 0:
-        return None
+        # fall back to the custom converter (GC text syntax etc.)
+        conv = WORK / ".conv" / (wast.stem + ".py.stamp")
+        conv.parent.mkdir(parents=True, exist_ok=True)
+        r2 = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "wast_convert.py"),
+             str(wast), "-o", str(json_path)],
+            capture_output=True, text=True, timeout=300,
+        )
+        if r2.returncode != 0:
+            return None
+        conv.write_text("ok")
+        return json_path
     stamp.write_text("ok")
     return json_path
 

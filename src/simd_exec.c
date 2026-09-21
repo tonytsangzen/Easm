@@ -1,4 +1,5 @@
 // easm SIMD execution (scalar lane loops; correctness first, NEON fast path comes with JIT phase)
+#include <stdio.h>
 #include "easm.h"
 #include "opcodes.h"
 #include <math.h>
@@ -81,7 +82,7 @@ static double simd_fmax64(double a, double b) {
 #define BIN_I(N, T, EXPR) do { \
     LOAD_AB; \
     for (int i = 0; i < (N); i++) { T x = ((T *)(&A))[i], y = ((T *)(&B))[i]; ((T *)(&D))[i] = (T)(EXPR); } \
-    PUT_D; } while (0)
+    PUT_D_DROP; } while (0)
 
 #define UN_I(N, T, EXPR) do { \
     LOAD_A; \
@@ -91,23 +92,23 @@ static double simd_fmax64(double a, double b) {
 #define CMP_I(N, T, EXPR) do { \
     LOAD_AB; \
     for (int i = 0; i < (N); i++) { T x = ((T *)(&A))[i], y = ((T *)(&B))[i]; ((T *)(&D))[i] = (EXPR) ? (T)-1 : 0; } \
-    PUT_D; } while (0)
+    PUT_D_DROP; } while (0)
 
 #define SHIFT_I(N, T, EXPR) do { \
     LOAD_AB; \
     uint32_t cnt = B.w[0]; \
     for (int i = 0; i < (N); i++) { T x = ((T *)(&A))[i]; ((T *)(&D))[i] = (T)(EXPR); } \
-    PUT_D; } while (0)
+    PUT_D_DROP; } while (0)
 
 #define BIN_F32(EXPR) do { \
     LOAD_AB; \
     for (int i = 0; i < 4; i++) { float r = (EXPR); D.w[i] = *(uint32_t *)&r; } \
-    PUT_D; } while (0)
+    PUT_D_DROP; } while (0)
 
 #define BIN_F64(EXPR) do { \
     LOAD_AB; \
     for (int i = 0; i < 2; i++) { double r = (EXPR); D.d[i] = *(uint64_t *)&r; } \
-    PUT_D; } while (0)
+    PUT_D_DROP; } while (0)
 
 #define FCMP_I(N, T, EXPR) do { \
     LOAD_AB; \
@@ -156,15 +157,15 @@ static inline uint16_t avgr_u16(uint16_t a, uint16_t b) {
 // returns 1 handled, 0 unknown, -1 trap
 int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t *spp) {
     uint32_t op = in->opcode;
-    if ((op & 0xFF00) != 0xFD00) return 0;
+    if (op < EA_OPV_BASE) return 0; // simd (incl. relaxed) opcode space
     uint32_t sp = *spp;
     V128U A, B, C, D;
     switch (op) {
     // ================= memory ops =================
     case EA_OP_V128_STORE: {
         // stack: [i32 addr, v128]
-        uint64_t ea = (uint64_t)S[sp - 2].i32 + in->imm.pair.b;
-        EaMemInst *mem = &inst->memories[in->imm.q.c];
+        uint64_t ea = (uint64_t)S[sp - 2].i32 + in->imm.ma.offset;
+        EaMemInst *mem = inst->memories[in->imm.ma.memidx];
         if (16 > mem->size || ea > mem->size - 16) TRAPV(TRAP_OOB_MEMORY);
         memcpy(mem->base + ea, S[sp - 1].v128, 16);
         sp -= 2;
@@ -174,9 +175,9 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
     case EA_OP_V128_STORE8_LANE: case EA_OP_V128_STORE16_LANE:
     case EA_OP_V128_STORE32_LANE: case EA_OP_V128_STORE64_LANE: {
         uint64_t w = 1ull << (op - EA_OP_V128_STORE8_LANE);
-        uint8_t lane = (uint8_t)in->imm.q.d;
-        uint64_t ea = (uint64_t)S[sp - 2].i32 + in->imm.pair.b;
-        EaMemInst *mem = &inst->memories[in->imm.q.c];
+        uint8_t lane = in->lane;
+        uint64_t ea = (uint64_t)S[sp - 2].i32 + in->imm.ma.offset;
+        EaMemInst *mem = inst->memories[in->imm.ma.memidx];
         if (w > mem->size || ea > mem->size - w) TRAPV(TRAP_OOB_MEMORY);
         uint8_t *p = mem->base + ea;
         uint8_t *v = S[sp - 1].v128;
@@ -206,8 +207,8 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
         case EA_OP_V128_LOAD32_SPLAT: case EA_OP_V128_LOAD32_ZERO: w = 4; break;
         case EA_OP_V128_LOAD64_SPLAT: case EA_OP_V128_LOAD64_ZERO: w = 8; break;
         }
-        uint64_t ea = (uint64_t)S[sp - 1].i32 + in->imm.pair.b;
-        EaMemInst *mem = &inst->memories[in->imm.q.c];
+        uint64_t ea = (uint64_t)S[sp - 1].i32 + in->imm.ma.offset;
+        EaMemInst *mem = inst->memories[in->imm.ma.memidx];
         if (w > mem->size || ea > mem->size - w) TRAPV(TRAP_OOB_MEMORY);
         uint8_t *p = mem->base + ea;
         memset(&D, 0, 16);
@@ -273,12 +274,14 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
     case EA_OP_V128_LOAD32_LANE: case EA_OP_V128_LOAD64_LANE: {
         // stack: [i32 addr, v128 vec] -> v128
         uint64_t w = 1ull << (op - EA_OP_V128_LOAD8_LANE);
-        uint8_t lane = (uint8_t)in->imm.q.d;
-        uint64_t ea = (uint64_t)S[sp - 2].i32 + in->imm.pair.b;
-        EaMemInst *mem = &inst->memories[in->imm.q.c];
+        uint8_t lane = in->lane;
+        uint64_t ea = (uint64_t)S[sp - 2].i32 + in->imm.ma.offset;
+        EaMemInst *mem = inst->memories[in->imm.ma.memidx];
         if (w > mem->size || ea > mem->size - w) TRAPV(TRAP_OOB_MEMORY);
         uint8_t *p = mem->base + ea;
-        uint8_t *v = S[sp - 1].v128;
+        // result replaces the pair: copy vec into the addr slot, update lane, drop one slot
+        uint8_t *v = S[sp - 2].v128;
+        memmove(v, S[sp - 1].v128, 16);
         switch (w) {
         case 1: v[lane] = p[0]; break;
         case 2: memcpy(v + 2 * lane, p, 2); break;
@@ -303,7 +306,7 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
             uint8_t k = idx[i];
             D.b[i] = k < 16 ? A.b[k] : B.b[k - 16];
         }
-        PUT_D;
+        PUT_D_DROP;
     }
     case EA_OP_I8X16_SWIZZLE: {
         LOAD_AB;
@@ -311,7 +314,7 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
             uint8_t k = B.b[i];
             D.b[i] = k < 16 ? A.b[k] : 0;
         }
-        PUT_D;
+        PUT_D_DROP;
     }
     case EA_OP_I8X16_SPLAT: { uint8_t v = (uint8_t)S[--sp].i32; memset(&D, v, 16); S[sp] = (WVal){0}; memcpy(S[sp].v128, &D, 16); sp++; *spp = sp; return 1; }
     case EA_OP_I16X8_SPLAT: { uint16_t v = (uint16_t)S[--sp].i32; for (int i = 0; i < 8; i++) D.h[i] = v; S[sp] = (WVal){0}; memcpy(S[sp].v128, &D, 16); sp++; *spp = sp; return 1; }
@@ -348,7 +351,7 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
         const uint64_t *x = (const uint64_t *)&A, *y = (const uint64_t *)&B;
         p[0] = x[0] & y[0];
         p[1] = x[1] & y[1];
-        PUT_D;
+        PUT_D_DROP;
     }
     case EA_OP_V128_ANDNOT: {
         LOAD_AB;
@@ -356,7 +359,7 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
         const uint64_t *x = (const uint64_t *)&A, *y = (const uint64_t *)&B;
         p[0] = x[0] & ~y[0];
         p[1] = x[1] & ~y[1];
-        PUT_D;
+        PUT_D_DROP;
     }
     case EA_OP_V128_OR: {
         LOAD_AB;
@@ -364,7 +367,7 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
         const uint64_t *x = (const uint64_t *)&A, *y = (const uint64_t *)&B;
         p[0] = x[0] | y[0];
         p[1] = x[1] | y[1];
-        PUT_D;
+        PUT_D_DROP;
     }
     case EA_OP_V128_XOR: {
         LOAD_AB;
@@ -372,7 +375,7 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
         const uint64_t *x = (const uint64_t *)&A, *y = (const uint64_t *)&B;
         p[0] = x[0] ^ y[0];
         p[1] = x[1] ^ y[1];
-        PUT_D;
+        PUT_D_DROP;
     }
     case EA_OP_V128_BITSELECT: case EA_OP_I8X16_RELAXED_LANESELECT:
     case EA_OP_I16X8_RELAXED_LANESELECT: case EA_OP_I32X4_RELAXED_LANESELECT:
@@ -453,29 +456,29 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
             int32_t r = ((int32_t)A.sh[i] * B.sh[i] + 0x4000) >> 15;
             D.sh[i] = (int16_t)(r > 32767 ? 32767 : (r < -32768 ? -32768 : r));
         }
-        PUT_D;
+        PUT_D_DROP;
     }
     case EA_OP_I16X8_SHL: SHIFT_I(8, uint16_t, (uint16_t)(x << (cnt & 15)));
     case EA_OP_I16X8_SHR_S: SHIFT_I(8, int16_t, (int16_t)(x >> (cnt & 15)));
     case EA_OP_I16X8_SHR_U: SHIFT_I(8, uint16_t, (uint16_t)(x >> (cnt & 15)));
     case EA_OP_I16X8_EXTMUL_LOW_I8X16_S: {
         LOAD_AB;
-        for (int i = 0; i < 4; i++) D.sw[i] = (int32_t)A.sh[i] * (int32_t)B.sh[i];
+        for (int i = 0; i < 8; i++) D.sh[i] = (int16_t)(A.sb[i] * B.sb[i]);
         PUT_D_DROP;
     }
     case EA_OP_I16X8_EXTMUL_HIGH_I8X16_S: {
         LOAD_AB;
-        for (int i = 0; i < 4; i++) D.sw[i] = (int32_t)A.sh[4 + i] * (int32_t)B.sh[4 + i];
+        for (int i = 0; i < 8; i++) D.sh[i] = (int16_t)(A.sb[8 + i] * B.sb[8 + i]);
         PUT_D_DROP;
     }
     case EA_OP_I16X8_EXTMUL_LOW_I8X16_U: {
         LOAD_AB;
-        for (int i = 0; i < 4; i++) D.sw[i] = (int32_t)A.h[i] * (int32_t)B.h[i];
+        for (int i = 0; i < 8; i++) D.h[i] = (uint16_t)(A.b[i] * B.b[i]);
         PUT_D_DROP;
     }
     case EA_OP_I16X8_EXTMUL_HIGH_I8X16_U: {
         LOAD_AB;
-        for (int i = 0; i < 4; i++) D.sw[i] = (int32_t)A.h[4 + i] * (int32_t)B.h[4 + i];
+        for (int i = 0; i < 8; i++) D.h[i] = (uint16_t)(A.b[8 + i] * B.b[8 + i]);
         PUT_D_DROP;
     }
     case EA_OP_I16X8_EXTADD_PAIRWISE_I8X16_S: {
@@ -499,7 +502,7 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
             int32_t v = B.sh[i];
             D.sb[8 + i] = (int8_t)(v > 127 ? 127 : (v < -128 ? -128 : v));
         }
-        PUT_D;
+        PUT_D_DROP;
     }
     case EA_OP_I8X16_NARROW_I16X8_U: {
         LOAD_AB;
@@ -511,7 +514,7 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
             int32_t v = B.sh[i];
             D.b[8 + i] = (uint8_t)(v > 255 ? 255 : (v < 0 ? 0 : v));
         }
-        PUT_D;
+        PUT_D_DROP;
     }
     case EA_OP_I16X8_NARROW_I32X4_S: {
         LOAD_AB;
@@ -523,7 +526,7 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
             int32_t v = B.sw[i];
             D.sh[4 + i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
         }
-        PUT_D;
+        PUT_D_DROP;
     }
     case EA_OP_I16X8_NARROW_I32X4_U: {
         LOAD_AB;
@@ -535,7 +538,7 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
             int32_t v = B.sw[i];
             D.h[4 + i] = (uint16_t)(v > 65535 ? 65535 : (v < 0 ? 0 : v));
         }
-        PUT_D;
+        PUT_D_DROP;
     }
     // extends
     case EA_OP_I16X8_EXTEND_LOW_I8X16_S: { LOAD_A; for (int i = 0; i < 8; i++) D.sh[i] = A.sb[i]; PUT_D; }
@@ -573,22 +576,22 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
     }
     case EA_OP_I32X4_EXTMUL_LOW_I16X8_S: {
         LOAD_AB;
-        for (int i = 0; i < 2; i++) D.sd[i] = (int64_t)A.sw[i] * (int64_t)B.sw[i];
+        for (int i = 0; i < 4; i++) D.sw[i] = (int32_t)A.sh[i] * (int32_t)B.sh[i];
         PUT_D_DROP;
     }
     case EA_OP_I32X4_EXTMUL_HIGH_I16X8_S: {
         LOAD_AB;
-        for (int i = 0; i < 2; i++) D.sd[i] = (int64_t)A.sw[2 + i] * (int64_t)B.sw[2 + i];
+        for (int i = 0; i < 4; i++) D.sw[i] = (int32_t)A.sh[4 + i] * (int32_t)B.sh[4 + i];
         PUT_D_DROP;
     }
     case EA_OP_I32X4_EXTMUL_LOW_I16X8_U: {
         LOAD_AB;
-        for (int i = 0; i < 2; i++) D.sd[i] = (int64_t)((uint64_t)A.w[i] * B.w[i]);
+        for (int i = 0; i < 4; i++) D.w[i] = (uint32_t)A.h[i] * (uint32_t)B.h[i];
         PUT_D_DROP;
     }
     case EA_OP_I32X4_EXTMUL_HIGH_I16X8_U: {
         LOAD_AB;
-        for (int i = 0; i < 2; i++) D.sd[i] = (int64_t)((uint64_t)A.w[2 + i] * B.w[2 + i]);
+        for (int i = 0; i < 4; i++) D.w[i] = (uint32_t)A.h[4 + i] * (uint32_t)B.h[4 + i];
         PUT_D_DROP;
     }
     case EA_OP_I32X4_EXTADD_PAIRWISE_I16X8_S: {
@@ -613,6 +616,7 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
     case EA_OP_I64X2_LE_S: CMP_I(2, int64_t, x <= y);
     case EA_OP_I64X2_GE_S: CMP_I(2, int64_t, x >= y);
     case EA_OP_I64X2_ADD: BIN_I(2, uint64_t, x + y);
+    case EA_OP_I64X2_SUB: BIN_I(2, uint64_t, x - y);
     case EA_OP_I64X2_MUL: BIN_I(2, uint64_t, x * y);
     case EA_OP_I64X2_ABS: UN_I(2, int64_t, x < 0 ? -x : x);
     case EA_OP_I64X2_NEG: UN_I(2, int64_t, (int64_t)(0 - x));
@@ -742,18 +746,38 @@ int exec_simd(EaExec *ex, EaInstance *inst, const EaInstr *in, WVal *S, uint32_t
     case EA_OP_F32X4_RELAXED_MAX: BIN_F32(simd_fmax32(A.f[i], B.f[i]));
     case EA_OP_F64X2_RELAXED_MIN: BIN_F64(simd_fmin64(A.g[i], B.g[i]));
     case EA_OP_F64X2_RELAXED_MAX: BIN_F64(simd_fmax64(A.g[i], B.g[i]));
+    case EA_OP_I32X4_RELAXED_TRUNC_F64X2_S_ZERO: {
+        LOAD_A;
+        for (int i = 0; i < 2; i++) {
+            double v = A.g[i];
+            D.sw[i] = v != v ? 0 : (v >= 2147483648.0 ? INT32_MAX : (v < -2147483648.0 ? INT32_MIN : (int32_t)v));
+        }
+        D.sw[2] = D.sw[3] = 0;
+        PUT_D;
+    }
+    case EA_OP_I32X4_RELAXED_TRUNC_F64X2_U_ZERO: {
+        LOAD_A;
+        for (int i = 0; i < 2; i++) {
+            double v = A.g[i];
+            D.w[i] = v != v ? 0 : (v >= 4294967296.0 ? 0xFFFFFFFFu : (v <= -1.0 ? 0 : (uint32_t)v));
+        }
+        D.w[2] = D.w[3] = 0;
+        PUT_D;
+    }
     case EA_OP_I8X16_RELAXED_SWIZZLE: {
         LOAD_AB;
         for (int i = 0; i < 16; i++) {
             uint8_t k = B.b[i];
             D.b[i] = k < 16 ? A.b[k] : 0;
         }
-        PUT_D;
+        PUT_D_DROP;
     }
     case EA_OP_I16X8_RELAXED_DOT_I8X16_I7X16_S: {
         LOAD_AB;
-        for (int i = 0; i < 8; i++)
-            D.sw[i] = (int32_t)A.sb[2 * i] * B.sb[2 * i] + (int32_t)A.sb[2 * i + 1] * B.sb[2 * i + 1];
+        for (int i = 0; i < 8; i++) {
+            int32_t sum = (int32_t)A.sb[2 * i] * B.sb[2 * i] + (int32_t)A.sb[2 * i + 1] * B.sb[2 * i + 1];
+            D.sh[i] = (int16_t)(sum > 32767 ? 32767 : sum < -32768 ? -32768 : sum);
+        }
         PUT_D_DROP;
     }
     case EA_OP_I32X4_RELAXED_DOT_I8X16_I7X16_ADD_S: {

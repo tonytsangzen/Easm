@@ -34,8 +34,44 @@ typedef enum {
     VT_BOTTOM = 8,       // validation-only bottom type
 } EaValType;
 
+// typed function references: (ref null $t) / (ref $t) carry the type index
+#define EA_VT_TREFN(idx) ((EaValType)(0x40000000u | ((uint32_t)(idx) << 1)))
+#define EA_VT_TREF(idx)  ((EaValType)(0x40000000u | ((uint32_t)(idx) << 1) | 1u))
+// abstract refs: the low bits carry the abstract heap kind; bit0 = non-null
+// (EA_VT_ABSREF). Nullable abstract kinds (eq/i31/struct/array/none/...) use
+// the same space with bit0=0 (EA_VT_ABSN). The plain enums VT_FUNCREF etc.
+// remain the nullable shorthands for func/extern/any.
+#define EA_VT_ABSREF(kind) ((EaValType)(0x3E000000u | ((uint32_t)(kind) << 1) | 1u))
+#define EA_VT_ABSN(kind)   ((EaValType)(0x3E000000u | ((uint32_t)(kind) << 1)))
+#define EA_ABS_FUNC 1u
+#define EA_ABS_EXTERN 2u
+#define EA_ABS_ANY 3u
+#define EA_ABS_EQ 4u
+#define EA_ABS_I31 5u
+#define EA_ABS_STRUCT 6u
+#define EA_ABS_ARRAY 7u
+#define EA_ABS_NONE 8u
+#define EA_ABS_NOFUNC 9u
+#define EA_ABS_NOEXTERN 10u
+#define EA_ABS_EXN 11u
+static inline bool ea_is_absref(EaValType t) {
+    return ((uint32_t)t & 0xFE000000u) == 0x3E000000u;
+}
+static inline uint32_t ea_abs_kind(EaValType t) { return ((uint32_t)t >> 1) & 0xFu; }
+static inline bool ea_is_typedref(EaValType t) {
+    uint32_t u = (uint32_t)t;
+    return (u & 0xC0000000u) == 0x40000000u || ea_is_absref(u);
+}
+// a typed ref with a REAL type index (not an abstract-heap marker)
+static inline bool ea_tref_real(EaValType t) { return ((uint32_t)t & 0xC0000000u) == 0x40000000u; }
+static inline bool ea_tref_nullable(EaValType t) {
+    if (t == VT_FUNCREF || t == VT_EXTERNREF || t == VT_ANYREF) return true;
+    return ((uint32_t)t & 1u) == 0;
+}
+static inline uint32_t ea_tref_idx(EaValType t) { return ((uint32_t)t >> 1) & 0x1FFFFFFFu; }
+
 static inline bool ea_is_ref(EaValType t) {
-    return t == VT_FUNCREF || t == VT_EXTERNREF || t == VT_ANYREF;
+    return t == VT_FUNCREF || t == VT_EXTERNREF || t == VT_ANYREF || ea_is_typedref(t);
 }
 static inline bool ea_is_num(EaValType t) {
     return t <= VT_V128;
@@ -53,11 +89,14 @@ typedef enum {
     TRAP_OOB_TABLE,
     TRAP_UNDEF_ELEM,     // call_indirect out of table bounds
     TRAP_UNINIT_ELEM,    // call_indirect on null
+    TRAP_NULL_REF,       // null reference (ref.as_non_null)
+    TRAP_NULL_FUNC_REF,  // null function reference (call_ref)
     TRAP_INDIRECT_TYPE,  // call_indirect signature mismatch
     TRAP_NULL_DEREF,     // ref.as_non_null / call_ref on null
     TRAP_STACK_EXHAUSTED,
     TRAP_INDIRECT_CALL,  // generic indirect call failure
     TRAP_HOST,           // host import signalled an error
+    TRAP_CAST,           // illegal cast (ref.cast)
 } EaTrap;
 
 const char *ea_trap_msg(EaTrap t); // spec-style message text
@@ -87,18 +126,38 @@ typedef struct {
 typedef enum { CT_FUNC = 0, CT_STRUCT, CT_ARRAY } EaCompKind;
 
 typedef struct {
+    EaValType vt;   // storage type (packed i8/i16 represented as VT_I32 + packed flag)
+    uint8_t mut;
+    uint8_t packed_; // 0: valtype, 1: i8, 2: i16
+} EaFieldType;
+
+typedef struct {
     EaCompKind kind;
     EaFuncType func;   // valid when kind == CT_FUNC
+    EaFieldType *fields; // CT_STRUCT: n_fields; CT_ARRAY: 1 entry
+    uint32_t n_fields;
+    uint32_t sup[2];   // declared supertypes (sub typing, validation only)
+    uint8_t n_sup;
+    uint8_t is_final;
+    uint32_t rec_pos;   // position within its rec group
+    uint32_t rec_size;  // rec group size (1 for plain type entries)
 } EaType;            // module type space entry
 
 // blocktype immediate
 typedef struct {
     uint8_t kind;      // 0: empty, 1: single valtype, 2: type index
-    uint8_t vt;        // valtype when kind==1
+    EaValType vt;      // valtype when kind==1 (may be a typed ref)
     uint32_t type_idx; // when kind==2
 } EaBlockType;
 
 // ---------------------------------------------------------------- module structs
+// try_table catch clause
+typedef struct {
+    uint8_t kind;       // 0 catch, 1 catch_ref, 2 catch_all, 3 catch_all_ref
+    uint32_t tag;       // tagidx (kinds 0/1)
+    uint32_t label;     // branch label (relative to the try_table)
+} EaCatch;
+
 // pre-decoded instruction
 typedef struct {
     uint32_t opcode;      // unified EA_OP_*
@@ -108,11 +167,15 @@ typedef struct {
         uint64_t u64;
         struct { uint32_t a, b; } pair;      // call_indirect (type,table), memarg, table.copy...
         struct { uint32_t a, b, c, d; } q;   // memarg lane / extra (memidx in c)
+        struct { uint32_t align, memidx; uint64_t offset; } ma; // memarg (offset up to u64)
         uint8_t bytes[16];                   // v128.const / i8x16.shuffle payload
         float f32;
         double f64;
         EaBlockType bt;
     } imm;
+    uint8_t lane;         // simd lane immediate (kept out of imm: ma.offset spans 8 bytes)
+    uint32_t n_catches;   // try_table catch clauses (kept out of imm: bt shares the union)
+    EaCatch *catches;
     // control metadata (structured ops; filled during decode/validate)
     uint32_t end_idx;     // matching `end` instruction index (block/loop/if)
     uint32_t else_idx;    // matching `else` (if), or UINT32_MAX
@@ -133,6 +196,7 @@ typedef struct {
 
 typedef struct {
     char *name;
+    uint32_t name_len;   // names may contain NUL bytes
     uint8_t kind;
     uint32_t idx;
 } EaExport;
@@ -180,6 +244,7 @@ typedef struct {
     EaValType ref_type;
     uint32_t *func_idx;      // item is a plain func index (MVP encoding)
     InsList *items;          // per-item exprs (when func_idx == NULL)
+    WVal *cache;             // expr items evaluated once at instantiation
 } EaElem;
 
 typedef struct {
@@ -263,10 +328,42 @@ int ea_eval_const_expr(struct EaInstance *inst, EaModule *m,
                        const InsList *code, WVal *out, EaValType expect);
 
 // ---------------------------------------------------------------- instance
+// GC heap object (struct/array instances; i31 is tagged, see EA_TAG_I31)
+#define EA_HEAP_MAGIC 0x47434242u // "GCBB"
+enum {
+    EA_HK_STRUCT = 1,
+    EA_HK_ARRAY,
+};
+#define EA_TAG_I31 2u // pointer bit pattern (v << 2) | 2 marks an i31 value
+typedef struct EaHeapObj {
+    uint32_t magic;   // distinguishes from EaFuncInst* (real pointers never match)
+    uint32_t kind;    // EA_HK_*
+    uint32_t type_idx;
+    uint32_t length;  // array length (struct: n_fields)
+    WVal data[];      // fields / elements
+} EaHeapObj;
+
+static inline bool ea_is_i31(void *p) { return ((uintptr_t)p & 3u) == EA_TAG_I31; }
+static inline void *ea_mk_i31(int32_t v) { return (void *)((uintptr_t)((uint32_t)v & 0x7FFFFFFFu) << 2 | EA_TAG_I31); }
+static inline uint32_t ea_i31_uval(void *p) { return (uint32_t)((uintptr_t)p >> 2); }
+static inline int32_t ea_i31_sval(void *p) { uint32_t u = ea_i31_uval(p); return (int32_t)(u ^ 0x40000000u) - 0x40000000; }
+
+EaHeapObj *ea_gc_alloc(EaModule *m, uint32_t type_idx, uint32_t n);
+bool ea_type_sub(EaModule *m, uint32_t g, uint32_t e, int depth);
+bool ea_type_sub_mm(EaModule *mg, uint32_t g, EaModule *me, uint32_t e, int depth);
+bool ea_type_canon_eq(EaModule *ma, uint32_t a, EaModule *mb, uint32_t b);
+bool ea_type_canon_eq1(EaModule *m, uint32_t a, uint32_t b);
+bool ea_vt_sub(EaModule *m, EaValType a, EaValType b, int depth);
+bool ea_vt_canon_eq(EaModule *m, EaValType a, EaValType b);
+bool ea_gc_is_heap(void *p);
+#define EA_GC_PACK(v, packed) (packed) == 1 ? (WVal){.i32 = (uint32_t)(int8_t)(v).i32} \
+                              : (packed) == 2 ? (WVal){.i32 = (uint32_t)(int16_t)(v).i32} : (v)
+
 typedef struct EaFuncInst {
     EaFuncType *type;
     struct EaInstance *inst; // owning instance (NULL for host functions)
     uint32_t func_idx;       // index within owning module
+    uint32_t type_idx;       // type index within owning module (indirect subtyping)
     // interpreted functions: code points to EaFunc of inst->module
     void *code;
     // jit entry (aarch64) when is_jit
@@ -298,14 +395,24 @@ typedef struct EaMemInst {
 
 typedef struct EaTagInst {
     EaFuncType *type;
+    EaModule *module;   // tag identity (module + type index)
+    uint32_t tag_idx;
+    struct EaTagInst *ident; // unique identity: the OWNING instance's slot
 } EaTagInst;
+
+// exception instance (exnref target)
+typedef struct EaExnInst {
+    EaTagInst *tag;     // identity
+    uint32_t n_vals;
+    WVal vals[];
+} EaExnInst;
 
 typedef struct EaInstance {
     EaModule *module;
     uint32_t n_funcs; EaFuncInst *funcs;
     uint32_t n_tables; EaTableInst *tables;
-    uint32_t n_memories; EaMemInst *memories;
-    uint32_t n_globals; WVal *globals;
+    uint32_t n_memories; EaMemInst **memories; // imported memories alias the source storage
+    uint32_t n_globals; WVal **globals; // per-global storage pointer (imports alias)
     uint32_t n_tags; EaTagInst *tags;
     uint32_t start_func; // absolute func index, UINT32_MAX if none
     // passive segment state
@@ -313,9 +420,8 @@ typedef struct EaInstance {
     uint8_t *elem_alive;   // per elem segment
     struct EaStore *store;
     // JIT fast-path fields (maintained by the runtime)
-    uint8_t *jit_mem_base;
-    uint64_t jit_mem_limit;   // bytes
-    WVal *jit_globals;
+    EaMemInst *jit_mem0;      // shared memories[0] (dummy when none): growth through any alias is visible
+    WVal **jit_globals;
 } EaInstance;
 
 // ---------------------------------------------------------------- interpreter
@@ -327,6 +433,7 @@ typedef struct EaExec {
     EaTrap trap;               // pending trap code
     char trap_msg[96];         // optional detailed message
     void *jb;                  // jmp_buf* of the active entry (trap target)
+    struct EaExnInst *pending_exn; // uncaught exception in flight
 } EaExec;
 
 // interpreter entry: execute function whose args are already pushed on ex->stack.
@@ -363,6 +470,7 @@ int ea_instance_invoke(EaStore *s, EaInstance *inst, uint32_t func_idx,
                        const WVal *args, WVal *results, EaTrap *trap);
 // find export index by name/kind; returns -1 when missing
 int ea_instance_export(EaInstance *inst, const char *name, uint8_t kind);
+int ea_instance_export_n(EaInstance *inst, const char *name, uint32_t name_len, uint8_t kind);
 
 #ifdef __cplusplus
 }

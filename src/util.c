@@ -53,9 +53,11 @@ const char *ea_trap_msg(EaTrap t) {
     case TRAP_UNDEF_ELEM: return "undefined element";
     case TRAP_UNINIT_ELEM: return "uninitialized element";
     case TRAP_INDIRECT_TYPE: return "indirect call type mismatch";
-    case TRAP_NULL_DEREF: return "null function or reference";
+    case TRAP_NULL_DEREF: return "null reference";
+    case TRAP_NULL_FUNC_REF: return "null function reference";
     case TRAP_STACK_EXHAUSTED: return "call stack exhausted";
     case TRAP_INDIRECT_CALL: return "indirect call";
+    case TRAP_CAST: return "cast failure";
     default: return "trap";
     }
 }

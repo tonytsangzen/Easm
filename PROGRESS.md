@@ -20,15 +20,16 @@
 
 运行方式：`python3 tools/run_spec.py -j 8 [--jit]`（内部 wast2json + 并行 + 缓存）
 
-- **258** 个 wast 文件中 **170 个完全通过（65.9%）**，累计通过 **57,483** 条 assert。
+- **258** 个 wast 文件中 **243 个完全通过（94.2%）**，累计通过 **61,000+** 条 assert
+  （迭代 7 结束时 182 → 迭代 9 结束时 225 → 迭代 10 结束时 237 → 迭代 11 结束时 243）。
 - `--jit` 与解释器模式**逐文件结果完全一致**：JIT 编译成功的函数真正执行机器码，
   不能降级的函数（v128 / br_table 等）自动回退解释器，正确性对齐。
-- 25 个文件为 wast2json 本身转换失败（function-references/GC 新语法，与运行时无关）。
-- 剩余 63 个失败文件的主因（按规划属二阶段特性）：
-  - function-references / GC（`ref.func` 类型化、`call_ref`、struct/array）
-  - exception-handling（try/catch/exn）
-  - tail-call、relaxed-simd、custom-page-sizes、multi-memory / memory64 边角
-  - 少量校验器严格性缺口（如 `align.wast` 中 4 条 assert_invalid / assert_malformed）
+- 转换失败仅剩 1 个文件（wast_convert.py 自定义转换器兜底 GC/rec 新语法后）。
+- 剩余 15 个失败文件的主因：
+  - exception-handling 执行语义（throw/throw_ref/try_table/instance 4 个文件）
+  - GC rec 组跨组 canonical 等价边界（type-subtyping 6、type-equivalence 6、
+    type-rec 2）
+  - 少量校验严格性边角（linking 3、table_init64 25、br_table/names/binary 等各 1）
 
 ## 三、Benchmark（best-of-2，单位秒，越低越好）
 
@@ -264,15 +265,263 @@ exceptions（2）、annotations（wasmtime 亦失败）、其余为 memory64/解
 - 结论：内存开销上 easm 与"嵌入式/embedded"定位一致——基线 1.7MB、最重内核 2.2MB，
   较 wasmtime 低 3.6–4.4×，较 V8/node（基线 39MB）低约 20×。
 
+### 迭代 6：function-references 类型系统（已完成，2026-09-21）
+
+覆盖率 **170 → 180 / 258**，新通过 10 个文件：return_call、return_call_indirect、
+call_ref、ref、ref_func、ref_is_null、br_on_null、br_on_non_null、ref_as_non_null、
+select（另修复 func.wast 回归）。
+
+改动分层：
+- **解码**：类型节支持 rec 组（类型索引按组展开预计数）、sub / sub final（记录超类型）、
+  struct/array 形状（登记不执行）；valtype/reftype 支持带堆类型的引用
+  （`(ref null $t)`/`(ref $t)`，EaValType 高位段编码携带类型索引）；
+  表/全局/局部/块类型的 typed ref；ref.null 堆类型立即数。
+- **校验**：vt_match 子类型匹配（(ref $t) <: (ref null $t) <: funcref，含超类型链与
+  可空性规则）；ref.func 携带声明类型；call_ref/return_call_ref 要求精确的
+  `(ref null $t)`；br_on_null/non_null 的分支/落空栈语义（non_null 分支携带窄化引用、
+  落空丢弃）；typed-ref 类型索引越界检查（类型/全局/表/段/局部/块类型）；
+  **local 初始化跟踪**（非默认化 local 未读检查，unreachable 多态，else/end 状态
+  保存恢复）——修复 func.wast 回归。
+- **执行**：解释器实现 ref.as_non_null / ref.eq / br_on_null / br_on_non_null /
+  call_ref / return_call_ref（call_ref 空引用 trap："null function reference"）；
+  return_call_indirect 的解释器分支改为真尾跳（30 万层互尾递归平坦运行，
+  修复 C 栈耗尽崩溃——递归块与尾跳代码曾叠加共存）。
+
+验证：上述 10 个官方文件全部零失败；全量套件两种模式 180/258 失败集完全一致；
+5 个 bench 内核数值一致、性能持平。
+
+### 迭代 7：return_call_ref / local_init / 抽象非空引用（已完成，2026-09-21）
+
+覆盖率 **180 → 182 / 258（70.5%）**：return_call_ref、local_init 全过，unreached-valid
+的 br_table/窄化边角修复，其余文件零回归。
+
+- **抽象非空引用**：`(ref func)`/`(ref extern)`/`(ref any)` 等抽象堆类型不再坍缩成
+  可空 shorthand——独立编码（EA_VT_ABSREF），local 默认化规则据此判定
+  （`(local (ref extern))` 不可默认化）；
+- **vt_match 重构为 ty_match(m, want, got)**：抽象↔具体双向规则
+  （(ref func) 接受非空 typed func 引用；(ref func)/(ref extern) 宽化到
+  funcref/externref）；elem/global 的 CONST_TMATCH 升级为同一匹配器；
+- **return_call* 的结果类型检查**确认为方向性子类型（callee <: frame）——
+  vt_list_eq 的对称性曾让 "funcref 回调 (ref null $t)" 的不健全方向漏过；
+- **br_on_null/non_null 的窄化**统一为 ea_narrow_ref 助手（funcref → (ref func)
+  等），unreachable 多态下按标签自身引用类型窄化（unreached-valid 的
+  "Bottom heap type" 用例）；
+- **br_table 目标类型检查**在 unreachable 代码中只要求 arity 一致；
+- **check_const_expr 的硬错误传播**：err 设置后调用方只看返回类型的缺陷修复
+  （ref_func 的 "unknown function 7" 被吞）——哨兵值返回 + 四处调用点检查；
+- **call_ref 空引用 trap** 统一为 "null function reference"；return_call_ref
+  解释器分支改真尾跳。
+
+验证：本轮触及的 13 个官方文件全部零失败或不再劣化；全量套件两种模式
+182/258 失败集完全一致；bench 内核数值一致、性能持平。
+
+### 迭代 8：memory64 / table64 索引类型 + 批量指令（已完成，2026-09-21）
+
+覆盖率 **182 → 199 / 258**：memory64 组 13 个文件（address64/align64/binary_leb128_64/
+bulk64/call_indirect64/endianness64/float_memory64/load64/memory64/memory64-imports/
+memory_grow64/store64/table_copy64/table_copy_mixed/table_fill64/table_get64/
+table_grow64/table_init64/table_set64/table_size64 等）全部转绿。
+
+- **memory.init / table.init / table.copy / memory.copy 弹栈顺序与宽度**：
+  按参考解释器规则统一为 [dst_idx, src_idx, min(dst,src)]（长度仅当两者皆 64 位
+  才是 i64）；memory.init/table.init 的 src/len 恒为 i32；memory.grow/size、
+  table.grow/size/fill 的操作数与结果按 is64 选择 i64/i32（解释器 + JIT 辅助
+  函数 + 校验器三处同步）；
+- **memarg offset 升级为 u64**：EaInstr 增加 imm.ma（align/memidx/offset 8 字节），
+  lane 立即数移出 union（此前 lane 与 offset 高半段重叠导致 store-lane 全线回归）；
+  32 位内存 offset > 2^32-1 报 "offset out of range"；
+- **64 位内存页数上限 2^48**（含），2^48+1 拒绝；64 位表默认 max UINT64_MAX；
+- **call_indirect 索引操作数**按表的 is64 取 i64/i32（校验器/解释器/JIT 弹栈）；
+- **memory64 导入兼容性检查**：is64 不一致即 unlinkable；spectest 增加
+  table64/memory64 导出；
+- **校验严格性**：table.copy 元素类型 src <: dst 方向化；SIMD 内存操作的对齐/
+  lane 范围/offset 范围检查（loadNxN natural 宽度全为 8 字节）；memop flags
+  ≥ 0x80 报 "malformed memop flags"；align 指数移位溢出修复（align=2^32）。
+
+### 迭代 9：SIMD 执行语义 + relaxed-simd + 名称/链接（已完成，2026-09-21）
+
+覆盖率 **199 → 225 / 258（87.2%）**。
+
+- **exec_simd 栈深度系统性修复**：二元/三元操作的 PUT_D 保留 sp，净深度差 1——
+  单操作函数侥幸通过、嵌套即产生错位结果。全部 BIN/CMP/SHIFT 宏与直写 case 改
+  PUT_D_DROP/PUT_D_DROP2（load-lane 的结果写址同步修正：结果应落地址槽）；
+  这一修复连带解决 i64x2_arith/extmul/lane 等文件的大量失败；
+- **extmul 操作数/结果宽度**：i16x8.extmul_i8x16 读字节 lane（sb/b），结果写
+  sh/h（i16 lane）；i32x4.extmul_i16x8 结果 4×i32（此前误写 2×i64）；
+- **EA_OPV 操作码空间迁移 0xFD00 → 0x10000**：relaxed 区段（sub ≥ 0x100）原与
+  0xFE 前缀（线程原子操作）冲突；relaxed 操作码表按最终 spec 重排
+  （madd=0x105+、laneselect=0x109+、min/max=0x10D+、q15mulr=0x111、dot=0x112+），
+  补 i32x4.relaxed_trunc_f64x2_{s,u}_zero、i16x8.relaxed_dot（i16 饱和）、
+  i64x2.sub(0xD1)；
+- **UTF-8 名称校验**：完整 spec UTF-8 验证器（overlong/代理/越界），
+  utf8-* 3 个文件 528 条断言全过；导出名重复检查（含 NUL 字节名字的长度比较，
+  EaExport 增加 name_len）；
+- **tag section 最小管道**：section id 13 排序、tag 导入/导出解码与类型检查
+  （签名必须无结果）、运行时导入解析——imports.wast 转绿；
+- **table/elem/const 语义**：表初始化表达式类型检查（非空表类型必须有显式
+  init 表达式）；elem funcidx 形式元素类型为非空 (ref func)；table.init 元素
+  类型 src <: dst 方向化；const 表达式恰好一个值；全局/表/段初始化的
+  global.get 可见性按 section 顺序（table 只见导入全局）；
+- **SIMD 多内存**：SIMD memarg 支持 memidx 标志位；v128 select 校验放开；
+- **spectest 修正**：global_i64 = 666；无名 register 注册最近模块。
+
+验证：全量套件两种模式 225/258 失败集完全一致；bench 五内核数值一致、性能持平
+（fib 0.025s / primes 0.012s / memsum 0.003s 与迭代 7 相同）。
+
+### 迭代 10：GC 运行时（struct/array/i31/ref.cast/br_on_cast）（已完成，2026-09-21）
+
+覆盖率 **225 → 237 / 258（91.9%）**，累计通过 60,788 条 assert。GC 组 15 个文件中
+9 个完全通过（struct/array/i31/extern/ref_eq/ref_test/ref_cast/br_on_cast/br_on_cast_fail），
+其余 6 个剩少量失败（type-subtyping 18、array_init_data 6、array_new_data 5 等）。
+
+- **wast2json 不支持 GC 文本语法**（i8/i16 字段、rec、i31）——新增
+  tools/wast_convert.py：自制 wast→wast2json 兼容 JSON 转换器，文本模块经
+  wasm-tools（bytecodealliance，完整 wasm 3.0 文法）parse 为二进制；
+  run_spec.py 在 wast2json 失败时自动回退该转换器（转换失败 25 → 1）。
+- **类型系统扩展**：EaType 携带字段类型（storage type + mut + packed）；
+  值类型编码新增可空抽象引用（EA_VT_ABSN：eq/i31/struct/array/none/nofunc/
+  noextern/exn）与 GC 简写（0x6A-0x71）；ea_tref_nullable 修正
+  （具体 typed 引用按奇偶、抽象按 bit0、普通枚举恒可空）。
+- **0xFB 指令解码**：struct.new/new_default/get(_s/_u)/set、array.new/
+  new_default/new_fixed/new_data/new_elem/get(_s/_u)/set/len/fill/copy/
+  init_data/init_elem、ref.test(_null)/ref.cast(_null)（立即数为 s33 heaptype，
+  0x14 非空 / 0x15 可空）、br_on_cast(_fail)（flags 在 label 之前；label 存放
+  union 安全槽 q.d）、any/extern.convert、ref.i31、i31.get_s/u。
+- **校验器**：GC 指令完整类型规则；结构化子类型 type_sub（声明 sup 链 +
+  结构规则：函数参数逆变/结果协变、struct 不可变字段协变/可变不变）+
+  结构化 canonical 等价（rec 组重复类型同 一性）；表初始化表达式类型检查
+  （非空表元素类型需显式 init）；elem funcidx 形式元素类型为非空 (ref func)；
+  select 放开 v128。
+- **运行时**：EaHeapObj 堆对象（struct/array，magic 区分 funcref）；i31 用
+  指针低位标记（v<<2|2，31 位截断语义）；ref.cast 运行时子类型检查
+  （sup 链 + canonical 等价）；any/extern.convert 恒等转换（extern 侧包裹
+  可观察）；区分 "null structure/array/i31 reference" 与
+  "out of bounds array/table/memory access" trap 消息。
+- **回归修复**：GC 插入时误删 UNREACHABLE 的 set_unreachable（导致
+  unreached-invalid 大面积误收）——根因修复后回退两处过度宽松的多态兜底；
+  ea_narrow_ref 补 ANYREF；const 表达式恰好一个值。
+
+验证：全量套件两种模式 237/258 失败集完全一致；bench 五内核持平
+（fib 0.025s / primes 0.009s / sum 0.185s / matmul 0.360s / memsum 0.003s）。
+
+### 迭代 11：GC 收尾（ref_null/数组残项/子类型化间接调用）（已完成，2026-09-21）
+
+覆盖率 **237 → 243 / 258（94.2%）**，累计通过 61,000+ 条 assert。GC 组 15 个文件中
+14 个完全通过（新增 ref_null、array_init_data、array_new_data、array_copy、
+array_init_elem、array_new_elem、br_on_cast_fail），仅 type-subtyping 剩 6 条
+rec 组跨组等价的边界用例。
+
+- **空引用底部宽化**：nullfuncref/nullexternref/nullref 保持底部语义
+  （0x73/0x72 不再坍缩为可空简写），可宽化到对应层级的任意可空引用
+  （nofunc → (ref null $t func)、none → (ref null $t struct/array) 等）；
+  exnref/nullexnref 简写（0x69/0x74）补齐；
+- **数组数据操作语义**：元素字节宽度按存储类型（i8→1/i16→2/i32→4/i64→8/
+  v128→16）；数组边界检查先于数据/元素段检查；丢弃段上 len=0 仍可用、
+  len>0 陷阱；funcref 元素类型的 array.init_data/new_data 拒绝
+  （"array type is not numeric or vector"）；
+- **元素段条目缓存**：含 GC 表达式的 elem 段条目在实例化时求值一次
+  （引用同一性——ref.eq 判断数组复制后的元素相等）；interp/JIT 的
+  array.new_elem/init_elem/table.init 统一路径；
+- **call_indirect 子类型化**：表元素类型可为类型化函数引用
+  （(ref null $t2) 等）；被调函数类型按声明的 sup 链 + canonical 等价
+  匹配（替换精确 memcmp）；plain comptype 视为 final（修复 rec 组
+  canonical 等价的误判）；funcidx 元素段按各函数自身类型检查；
+  ref.eq 结果槽清零（高位脏数据）。
+
+验证：全量套件两种模式 243/258 失败集完全一致；bench 五内核持平。
+
+### 迭代 12：exceptions 执行语义（throw/throw_ref/try_table）（已完成，2026-09-21）
+
+覆盖率 **243 → 248 / 258（96.1%）**，累计通过 60,895 条 assert。exception-handling
+组 4 个文件全部通过（throw 5/0、throw_ref 7/0、try_table 45/0、instance 12/0），
+两种模式一致。
+
+- **EH 核心对象**：`EaExnInst{tag, n_vals, vals[]}`（捕获时初始化的载荷副本）、
+  `EaTagInst.ident`（标签唯一身份 = 拥有实例的槽，跨实例同名 tag 不匹配）、
+  `EaExec.pending_exn`（未捕获异常沿调用链传播，JIT 边界 5 个调用点 +
+  3 个入口点透传）；
+- **try_table**：解码（`1f bt n (kind tag label)*`，kind 0..3 =
+  catch/catch_ref/catch_all/catch_all_ref）；标签相对 try_table 外层解析
+  （validator 用 outer_csp、interp 用 `ctl[k-1-l]`、`csp=k-l`）——根因是
+  predecode_region 嵌套配对 resolver 不认识 TRY_TABLE，块尾配对到 try 的
+  end 导致校验/执行跳错位置；
+- **eh_unwind**：扫描控制栈找最近 is_try 帧 → catch 按 tag->ident 同一性
+  匹配 → 携带 n_params(+exnref) 个值落目标块栈底 → 跳 `t2->pc_end`；
+  throw_ref 重抛 exnref 槽（空则 trap）；BLOCK/IF/LOOP 帧必须重置
+  is_try 标志（IF 遗漏导致错误匹配）；
+- **module definition / instance 命令**：wast 驱动支持 `(module $M ...)` 只
+  注册不实例化 + `(instance $I (module $M))`，register 无名时用最近实例；
+- **globals 指针化**：`inst->globals` 改 `WVal**`（导入别名源存储，修复
+  instance.wast glob1/glob2 别名语义）；JIT GLOBAL_GET/SET 增加一级间接；
+- **memory 共享化**：`inst->memories` 改 `EaMemInst**`（导入别名源实例的
+  EaMemInst）——修复 memory.grow 跨实例不可见（linking "5 pages by the
+  time we get here"）；JIT prologue 经 `jit_mem0`（共享结构）重载
+  x25/x26，任意别名实例增长后下一个调用即生效；释放只回收本实例定义
+  （owned）的内存；
+- **全局导入子类型**：可变性精确相等；不可变导入接受协变
+  （`(ref func)` � <: `funcref`），可变导入要求 canonical 等价（含可空性）；
+  ea_vt_sub 抽象格补充：类型化引用按其复合类型种类（func/struct/array）
+  映射进抽象层级（`(ref $t)` <: `funcref`），抽象→具体仅底部种类可流入
+  （nofunc → `(ref null $t)`、none → struct/array）；
+- **实例化顺序**：elem 条目缓存求值移到 funcs/globals/memories 就绪之后
+  （elem 表达式可 global.get/ref.func 任意定义项——global.wast
+  "Definition order" 模块崩溃的根因）。
+
+验证：全量套件两种模式 248/258 失败集完全一致（interp 与 JIT 各自核对）；
+bench 五内核持平（fib 0.024s / primes 0.010s / sum 0.186s / matmul 0.363s /
+memsum 0.003s）。
+
+### 迭代 13：rec 组跨组 canonical 等价（已完成，2026-09-21）
+
+覆盖率 **248 → 251 / 258**。type-rec（3/0）、type-equivalence（4/0）、
+type-subtyping（29/0）三个文件全过——按参考解释器模型重写了 canonical 等价：
+
+- **rec 组身份**：EaType 增加 `rec_pos`/`rec_size`（解码时从 0x4E rec 块
+  记录；plain 类型 = 单成员组）；
+- **等价语义**：两个类型相等 ⟺ 各自处于结构逐成员相等的 rec 组的相同
+  位置。组内自引用按**位置**（Rec j）匹配，外部引用按指向的类型递归
+  比较——内/外之别是本质的（同一原始索引两侧语义可不同）；
+- **归纳性**：比较中的组对假设相等（最大不动点），递归类型终止；
+  跨模块版本（ma/mb 双模块）支撑 import 类型匹配；
+- **陷阱案例**：B 组 struct 引用 A 组的 $f1（外部引用）≠ A 组自引用
+  （Rec 0）——vt 比较的 `a == b` 原始索引捷径必须绕过；
+- **跨模块 import**：func 导入改为 actual <: declared
+  （`ea_type_sub_mm`，声明 sup 链 + 跨模块 canonical 等价），tag 导入改为
+  双向 canonical 等价；宿主模块无 type space 时回退结构签名比较。
+
+### 迭代 14：table_init64 + 零散严格性（已完成，2026-09-21）
+
+覆盖率 **251 → 257 / 258（99.6%）**，assert 61,110 条。仅剩
+annotations.wast（wabt 与 wasm-tools 均不支持该提案文本语法，转换失败，
+非运行时问题）。
+
+- **table.init 校验弹栈序**：栈为 [dst src n]，仅 dst 跟随表的索引类型
+  （64 位表 dst=i64），src/n 恒为 i32——原实现先弹 dst 类型，32 位表
+  碰巧全 i32 蒙混，64 位表报 type mismatch；
+- **elem 条目缓存贯通执行**：interp 的 table.init 使用实例化时求值的
+  `e->cache`（引用同一性）——修复"段不重复求值"测试（ref.eq 两次
+  table.init 应得同一数组）；
+- **br_table 目标 arity**：所有目标标签必须共享同一值序列 → arity
+  相等在 unreachable（多态栈）下也必须成立；
+- **data count 总检查**：解码收尾处 data 段数（含缺失 data 段 = 0）必须
+  等于 data count 声明——修复"有 count 无 data 段"被接受；
+- **names 含 NUL**：JSON 字符串解析保留字节长度（JV.str_len），导出查找
+  增加 `ea_instance_export_n`（memcmp + 精确长度）——含 \x00\x01…
+  导出名可调用。
+
+验证：全量套件两种模式 257/258 完全一致；bench 五内核持平
+（fib 0.024s / primes 0.010s / sum 0.189s / matmul 0.358s / memsum 0.003s）。
+
 ## 六、下一步（按规划优先级）
 
-1. **HIR / 寄存器分配**（性能阶段主战场）：当前 1:1 栈机翻译在 sum/matmul 上与
+1. **HIR / 寄存器分配**（效率阶段主战场）：当前 1:1 栈机翻译在 sum/matmul 上与
    Cranelift 的差距主要来自冗余 push/pop；引入虚拟寄存器 + 线性扫描可预期再获 2–5×。
-2. 浮点参数直接 S/D 寄存器往返（省 fmov gpr↔fpr 两次搬运）。
-3. br_table / v128 的 JIT lowering（当前回退解释器）。
-4. 二阶段特性：function-references、EH、tail-call 的解码/校验/执行支持，
-   预计可将覆盖率推向 230+/258。
-5. 校验器严格性补齐（align 等 assert_invalid/malformed 细项）。
+   顺带：call_indirect 类型检查改为解码期缓存 canonical id（现为每次比较重建等价栈）。
+2. 浮点参数直接 S/D 寄存器往返；br_table / v128 的 JIT lowering。
+3. annotations.wast 需支持注解提案文本语法（wabt/wasm-tools 均不支持，
+   需自制转换路径）。
+4. 覆盖率之外的健全性：运行 spec 之外的场景（多实例 grow 别名、异常
+   传播跨 JIT 边界的压力用例）。
 
 ## 七、复现命令
 

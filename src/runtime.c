@@ -57,6 +57,17 @@ int ea_instance_export(EaInstance *inst, const char *name, uint8_t kind) {
     return -1;
 }
 
+// length-aware lookup: export names may contain NUL bytes
+int ea_instance_export_n(EaInstance *inst, const char *name, uint32_t name_len, uint8_t kind) {
+    if (!name) return -1;
+    for (uint32_t i = 0; i < inst->module->n_exports; i++) {
+        EaExport *ex = &inst->module->exports[i];
+        if (ex->kind == kind && ex->name_len == name_len &&
+            memcmp(ex->name, name, name_len) == 0) return (int)ex->idx;
+    }
+    return -1;
+}
+
 // ---------------------------------------------------------------- trap plumbing
 const char *ea_store_last_trap_msg(EaStore *s) {
     return s->exec.trap_msg[0] ? s->exec.trap_msg : ea_trap_msg(s->exec.trap);
@@ -79,6 +90,7 @@ int ea_eval_const_expr(EaInstance *inst, EaModule *m, const InsList *code, WVal 
     uint32_t sp = 0;
     for (uint32_t pc = 0; pc < code->n; pc++) {
         EaInstr *in = &code->v[pc];
+        uint32_t op = in->opcode;
         switch (in->opcode) {
         case EA_OP_I32_CONST: stack[sp++].i32 = in->imm.u32; break;
         case EA_OP_I64_CONST: stack[sp++].i64 = in->imm.u64; break;
@@ -90,7 +102,7 @@ int ea_eval_const_expr(EaInstance *inst, EaModule *m, const InsList *code, WVal 
         case EA_OP_GLOBAL_GET: {
             uint32_t gi = in->imm.u32;
             if (!inst || gi >= inst->n_globals) return -1;
-            stack[sp++] = inst->globals[gi];
+            stack[sp++] = *inst->globals[gi];
             break;
         }
         case EA_OP_REF_NULL:
@@ -107,6 +119,79 @@ int ea_eval_const_expr(EaInstance *inst, EaModule *m, const InsList *code, WVal 
         case EA_OP_I64_ADD: sp--; stack[sp - 1].i64 += stack[sp].i64; break;
         case EA_OP_I64_SUB: sp--; stack[sp - 1].i64 -= stack[sp].i64; break;
         case EA_OP_I64_MUL: sp--; stack[sp - 1].i64 *= stack[sp].i64; break;
+        case EA_OP_STRUCT_NEW: case EA_OP_STRUCT_NEW_DEFAULT: {
+            uint32_t ti = in->imm.u32;
+            EaType *t = &m->types[ti];
+            EaHeapObj *o = ea_gc_alloc(m, ti, t->n_fields);
+            if (op == EA_OP_STRUCT_NEW)
+                for (uint32_t i = t->n_fields; i > 0; i--)
+                    o->data[i - 1] = EA_GC_PACK(stack[--sp], t->fields[i - 1].packed_);
+            stack[sp++].ref = o;
+            break;
+        }
+        case EA_OP_ARRAY_NEW: case EA_OP_ARRAY_NEW_DEFAULT: {
+            uint32_t ti = in->imm.u32;
+            uint32_t len = (uint32_t)stack[--sp].i32;
+            EaHeapObj *o = ea_gc_alloc(m, ti, len);
+            if (op == EA_OP_ARRAY_NEW) {
+                WVal init = stack[--sp];
+                for (uint32_t i = 0; i < len; i++)
+                    o->data[i] = EA_GC_PACK(init, m->types[ti].fields[0].packed_);
+            }
+            stack[sp++].ref = o;
+            break;
+        }
+        case EA_OP_ARRAY_NEW_DATA: {
+            uint32_t ti = in->imm.pair.a, di = in->imm.pair.b;
+            uint32_t len = (uint32_t)stack[--sp].i32;
+            uint32_t off = (uint32_t)stack[--sp].i32;
+            if (!inst->data_alive[di]) return -1;
+            EaData *d = &m->datas[di];
+            EaFieldType *aelf = &m->types[ti].fields[0];
+            uint32_t width = aelf->packed_ == 1 ? 1 : aelf->packed_ == 2 ? 2
+                           : aelf->vt == VT_I64 || aelf->vt == VT_F64 ? 8
+                           : aelf->vt == VT_V128 ? 16 : 4;
+            uint64_t dlen = d->data_len;
+            if ((uint64_t)off + len * width > dlen) return -1;
+            EaHeapObj *o = ea_gc_alloc(m, ti, len);
+            const uint8_t *p = m->owned_bytes + d->data_off + off;
+            for (uint32_t i = 0; i < len; i++) {
+                uint64_t x = 0;
+                memcpy(&x, p + i * width, width < 8 ? width : 8);
+                o->data[i].i32 = x;
+            }
+            stack[sp++].ref = o;
+            break;
+        }
+        case EA_OP_ARRAY_NEW_FIXED: {
+            uint32_t ti = in->imm.pair.a, n = in->imm.pair.b;
+            EaHeapObj *o = ea_gc_alloc(m, ti, n);
+            for (uint32_t i = n; i > 0; i--)
+                o->data[i - 1] = EA_GC_PACK(stack[--sp], m->types[ti].fields[0].packed_);
+            stack[sp++].ref = o;
+            break;
+        }
+        case EA_OP_REF_I31:
+            stack[sp - 1].ref = ea_mk_i31((int32_t)stack[sp - 1].i32);
+            break;
+        case EA_OP_ANY_CONVERT_EXTERN: case EA_OP_EXTERN_CONVERT_ANY: {
+            void *r = stack[--sp].ref;
+            if (op == EA_OP_EXTERN_CONVERT_ANY && r != NULL &&
+                (uintptr_t)r >= 4096 && !ea_is_i31(r)) {
+                EaHeapObj *o = (EaHeapObj *)ea_malloc(sizeof(EaHeapObj) + sizeof(WVal));
+                o->magic = EA_HEAP_MAGIC;
+                o->kind = 4;
+                o->type_idx = UINT32_MAX;
+                o->length = 1;
+                o->data[0].ref = r;
+                r = o;
+            } else if (op == EA_OP_ANY_CONVERT_EXTERN && r != NULL &&
+                       ea_gc_is_heap(r) && ((EaHeapObj *)r)->kind == 4) {
+                r = ((EaHeapObj *)r)->data[0].ref;
+            }
+            stack[sp++].ref = r;
+            break;
+        }
         default:
             return -1;
         }
@@ -140,7 +225,7 @@ uint8_t *alloc_memory(uint64_t pages) {
 bool ea_grow_memory(EaMemInst *mi, uint64_t delta, uint64_t *old) {
     *old = mi->pages;
     if (mi->pages + delta > mi->max_pages) return false;
-    if (mi->pages + delta > 65536) return false;
+    if (!mi->is64 && mi->pages + delta > 65536) return false; // 32-bit spec limit
     if (mprotect(mi->base, (size_t)((mi->pages + delta) << 16),
                  PROT_READ | PROT_WRITE) != 0)
         return false;
@@ -152,9 +237,15 @@ bool ea_grow_memory(EaMemInst *mi, uint64_t delta, uint64_t *old) {
 void ea_instance_free(EaInstance *inst) {
     if (!inst) return;
     for (uint32_t i = 0; i < inst->n_tables; i++) free(inst->tables[i].elems);
-    for (uint32_t i = 0; i < inst->n_memories; i++)
-        if (inst->memories[i].owned && inst->memories[i].base)
-            munmap(inst->memories[i].base, EA_MEM_RESERVE);
+    for (uint32_t i = 0; i < inst->n_memories; i++) {
+        // imported memories alias the source instance's storage; only
+        // defined (owned) ones belong to this instance
+        if (i >= inst->module->n_imp_memories && inst->memories[i] &&
+            inst->memories[i]->owned) {
+            if (inst->memories[i]->base) munmap(inst->memories[i]->base, EA_MEM_RESERVE);
+            free(inst->memories[i]);
+        }
+    }
     free(inst->funcs);
     free(inst->tables);
     free(inst->memories);
@@ -191,11 +282,11 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
     inst->n_tags = n_tags;
     inst->funcs = (EaFuncInst *)ea_zalloc((n_funcs ? n_funcs : 1) * sizeof(EaFuncInst));
     inst->tables = (EaTableInst *)ea_zalloc((n_tables ? n_tables : 1) * sizeof(EaTableInst));
-    inst->memories = (EaMemInst *)ea_zalloc((n_mems ? n_mems : 1) * sizeof(EaMemInst));
-    inst->globals = (WVal *)ea_zalloc((n_globals ? n_globals : 1) * sizeof(WVal));
+    inst->memories = (EaMemInst **)ea_zalloc((n_mems ? n_mems : 1) * sizeof(EaMemInst *));
+    inst->globals = (WVal **)ea_zalloc((n_globals ? n_globals : 1) * sizeof(WVal *));
     inst->tags = (EaTagInst *)ea_zalloc((n_tags ? n_tags : 1) * sizeof(EaTagInst));
 
-    uint32_t ifunc = 0, itable = 0, imem = 0, iglob = 0;
+    uint32_t ifunc = 0, itable = 0, imem = 0, iglob = 0, itag = 0;
     for (uint32_t i = 0; i < m->n_imports; i++) {
         EaImport *im = &m->imports[i];
         EaInstance *src = ea_lookup_instance(s, im->module);
@@ -209,7 +300,16 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
             int idx = ea_instance_export(src, im->name, EAK_FUNC);
             if (idx < 0) { fail = "unknown import"; goto unlinkable; }
             EaFuncInst *fi = &src->funcs[idx];
-            if (!type_matches(fi->type, &m->types[im->idx].func)) {
+            // the actual func must be a subtype of the declared import type,
+            // with canonical equivalence resolved across both modules; host
+            // modules may lack a type space, so fall back to a structural
+            // signature comparison there
+            bool fok;
+            if (fi->type_idx < src->module->n_types && im->idx < m->n_types)
+                fok = ea_type_sub_mm(src->module, fi->type_idx, m, im->idx, 0);
+            else
+                fok = type_matches(fi->type, &m->types[im->idx].func);
+            if (!fok) {
                 if (getenv("EA_IDBG")) fprintf(stderr, "FAIL func import %s.%s\n", im->module, im->name);
                 fail = "incompatible import type";
                 goto unlinkable;
@@ -221,7 +321,7 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
             int idx = ea_instance_export(src, im->name, EAK_TABLE);
             if (idx < 0) { fail = "unknown import"; goto unlinkable; }
             EaTableInst *ti = &src->tables[idx];
-            if (ti->ref_type != im->table.ref_type) {
+            if (ti->ref_type != im->table.ref_type || ti->is64 != im->table.is64) {
                 if (getenv("EA_IDBG")) fprintf(stderr, "FAIL table import reftype\n");
                 fail = "incompatible import type"; goto unlinkable;
             }
@@ -238,11 +338,13 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
         case EAK_MEMORY: {
             int idx = ea_instance_export(src, im->name, EAK_MEMORY);
             if (idx < 0) { fail = "unknown import"; goto unlinkable; }
-            EaMemInst *mi = &src->memories[idx];
+            EaMemInst *mi = src->memories[idx];
+            if (mi->is64 != im->memory.is64) { fail = "incompatible import type"; goto unlinkable; }
             if (mi->pages < im->memory.min) { fail = "incompatible import type"; goto unlinkable; }
             if (im->memory.has_max) {
-                uint64_t src_max = mi->has_max ? mi->max_pages : 65536;
-                if (!mi->has_max && im->memory.max < 65536) {
+                uint64_t no_max_limit = mi->is64 ? (1ull << 48) : 65536;
+                uint64_t src_max = mi->has_max ? mi->max_pages : no_max_limit;
+                if (!mi->has_max && im->memory.max < no_max_limit) {
                     fail = "incompatible import type";
                     goto unlinkable;
                 }
@@ -251,22 +353,42 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
                     goto unlinkable;
                 }
             }
-            inst->memories[imem++] = *mi;
+            inst->memories[imem++] = mi; // alias the source storage (shared growth)
+            break;
+        }
+        case EAK_TAG: {
+            int idx = ea_instance_export(src, im->name, EAK_TAG);
+            if (idx < 0) { fail = "unknown import"; goto unlinkable; }
+            // tag types must be canonically equivalent (both directions),
+            // resolved across the two modules
+            EaTag *want = &m->tags[im->idx];
+            EaTag *got = &src->module->tags[idx];
+            if (!ea_type_canon_eq(m, want->type_idx, src->module, got->type_idx)) {
+                fail = "incompatible import type";
+                goto unlinkable;
+            }
+            inst->tags[itag++] = src->tags[idx]; // identity (module+tag_idx) preserved
             break;
         }
         case EAK_GLOBAL: {
             int idx = ea_instance_export(src, im->name, EAK_GLOBAL);
             if (idx < 0) { fail = "unknown import"; goto unlinkable; }
-            if (src->module->globals_def[idx].type != im->global.type ||
-                src->module->globals_def[idx].mutable_ != im->global.mutable_) {
-                if (getenv("EA_IDBG")) fprintf(stderr, "FAIL global: src.type=%d want=%d src.mut=%d want.mut=%d idx=%d n=%u\n",
-                                               src->module->globals_def[idx].type, im->global.type,
-                                               src->module->globals_def[idx].mutable_, im->global.mutable_,
+            EaValType st = src->module->globals_def[idx].type;
+            bool smut = src->module->globals_def[idx].mutable_;
+            // mutability must match exactly; immutable imports accept any
+            // subtype (covariance), mutable ones require canonical equality
+            bool tok = smut == im->global.mutable_ &&
+                       (smut ? ea_vt_canon_eq(m, st, im->global.type)
+                             : ea_vt_sub(m, st, im->global.type, 0));
+            if (!tok) {
+                if (getenv("EA_IDBG")) fprintf(stderr, "FAIL global: %s.%s src.type=%d want=%d src.mut=%d want.mut=%d idx=%d n=%u\n",
+                                               im->module, im->name, st, im->global.type,
+                                               smut, im->global.mutable_,
                                                idx, src->module->n_globals_def);
                 fail = "incompatible import type";
                 goto unlinkable;
             }
-            inst->globals[iglob++] = src->globals[idx];
+            inst->globals[iglob++] = src->globals[idx]; // alias the source storage
             if (getenv("EA_IDBG")) fprintf(stderr, "IMP global %s.%s ok type=%d mut=%d\n",
                                            im->module, im->name, im->global.type, im->global.mutable_);
             break;
@@ -274,10 +396,25 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
         }
     }
 
+    // ---- defined tags: identity
+    for (uint32_t i = m->n_imp_tags; i < n_tags; i++) {
+        inst->tags[i].type = &m->types[m->tags[i].type_idx].func;
+        inst->tags[i].module = m;
+        inst->tags[i].tag_idx = i;
+        inst->tags[i].ident = &inst->tags[i];
+    }
+    // imported tags without a source identity (spectest-style host tags)
+    for (uint32_t i = 0; i < m->n_imp_tags; i++) {
+        if (inst->tags[i].module == NULL) {
+            inst->tags[i].module = m;
+            inst->tags[i].tag_idx = i;
+        }
+    }
     // ---- defined functions
     for (uint32_t i = m->n_imp_funcs; i < n_funcs; i++) {
         EaFuncInst *fi = &inst->funcs[i];
         fi->type = &m->types[m->funcs[i].type_idx].func;
+        fi->type_idx = m->funcs[i].type_idx;
         fi->inst = inst;
         fi->func_idx = i;
         fi->code = &m->funcs[i];
@@ -286,6 +423,8 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
     }
 
     // ---- globals (imports first, then defined, in order)
+    for (uint32_t i = m->n_imp_globals; i < n_globals; i++)
+        inst->globals[i] = (WVal *)ea_zalloc(sizeof(WVal));
     for (uint32_t i = m->n_imp_globals; i < n_globals; i++) {
         EaGlobal *g = &m->globals_def[i];
         WVal v;
@@ -293,7 +432,7 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
             fail = "invalid global initializer";
             goto uninstantiable;
         }
-        inst->globals[i] = v;
+        *inst->globals[i] = v;
     }
 
     // ---- tables
@@ -301,7 +440,8 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
         EaTable *t = &m->tables[i];
         EaTableInst *ti = &inst->tables[i];
         ti->ref_type = t->ref_type;
-        ti->max = t->has_max ? t->max : UINT32_MAX;
+        ti->is64 = t->is64;
+        ti->max = t->has_max ? t->max : (t->is64 ? UINT64_MAX : UINT32_MAX);
         ti->has_max = t->has_max;
         ti->elems = (WVal *)ea_zalloc((t->min ? t->min : 1) * sizeof(WVal));
         ti->size = t->min;
@@ -317,7 +457,8 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
     // ---- memories
     for (uint32_t i = m->n_imp_memories; i < n_mems; i++) {
         EaMemory *mm = &m->memories[i];
-        EaMemInst *mi = &inst->memories[i];
+        EaMemInst *mi = (EaMemInst *)ea_zalloc(sizeof(EaMemInst));
+        inst->memories[i] = mi;
         mi->base = alloc_memory(mm->min);
         if (!mi->base) { fail = "out of memory"; goto uninstantiable; }
         mi->pages = mm->min;
@@ -330,6 +471,21 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
 
     inst->elem_alive = (uint8_t *)ea_zalloc(m->n_elems ? m->n_elems : 1);
     inst->data_alive = (uint8_t *)ea_zalloc(m->n_datas ? m->n_datas : 1);
+
+    // ---- element segment item cache (evaluate exprs once for ref identity);
+    // runs after funcs/globals/memories exist because item exprs may
+    // reference any of them via global.get / ref.func
+    for (uint32_t i = 0; i < m->n_elems; i++) {
+        EaElem *e = &m->elems[i];
+        if (!e->items || e->cache) continue;
+        e->cache = (WVal *)ea_zalloc((e->n_items ? e->n_items : 1) * sizeof(WVal));
+        for (uint32_t j = 0; j < e->n_items; j++) {
+            WVal v;
+            if (ea_eval_const_expr(inst, m, &e->items[j], &v, e->ref_type) != 0)
+                v = (WVal){0};
+            e->cache[j] = v;
+        }
+    }
 
     // ---- element segments
     for (uint32_t i = 0; i < m->n_elems; i++) {
@@ -383,7 +539,7 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
             goto uninstantiable;
         }
         uint64_t off = (uint32_t)offv.i32;
-        EaMemInst *mi = &inst->memories[d->mem_idx];
+        EaMemInst *mi = inst->memories[d->mem_idx];
         if (d->data_len > mi->size || off > mi->size - d->data_len) {
             fail = "out of bounds memory access";
             goto uninstantiable;
@@ -392,9 +548,9 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
     }
 
     // JIT fast-path fields
-    if (n_mems) {
-        inst->jit_mem_base = inst->memories[0].base;
-        inst->jit_mem_limit = inst->memories[0].size;
+    {
+        static EaMemInst g_dummy_mem; // base=NULL,size=0: any access traps
+        inst->jit_mem0 = n_mems ? inst->memories[0] : &g_dummy_mem;
     }
     inst->jit_globals = inst->globals;
     *out = inst;
