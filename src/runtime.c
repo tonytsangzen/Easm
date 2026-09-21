@@ -206,6 +206,56 @@ int ea_eval_const_expr(EaInstance *inst, EaModule *m, const InsList *code, WVal 
 // ---------------------------------------------------------------- memory alloc
 #define EA_MEM_RESERVE ((size_t)(12ull << 30)) // 12 GiB VA per memory
 
+// ---- signal-based out-of-bounds detection
+// every memory reserves 12 GiB of PROT_NONE address space, so any i32
+// address (or i32 address + validated offset, both < 2^33) that escapes the
+// committed pages faults INSIDE the reservation.  The SIGSEGV/SIGBUS handler
+// converts such faults into wasm OOB traps; anything else is a real crash.
+#include <signal.h>
+
+typedef struct { uint8_t *base, *end; } EaMemRange;
+static EaMemRange *g_mem_ranges;
+static uint32_t g_n_mem_ranges, g_cap_mem_ranges;
+static _Thread_local EaExec *g_fault_exec; // exec owning the active invoke
+
+static void ea_segv_handler(int sig, siginfo_t *si, void *uc) {
+    (void)uc;
+    uintptr_t addr = (uintptr_t)si->si_addr;
+    EaExec *ex = g_fault_exec;
+    if (getenv("EA_FDBG")) fprintf(stderr, "[F] fault addr=%p ranges=%u\n", si->si_addr, g_n_mem_ranges);
+    if (ex && ex->jb) {
+        for (uint32_t i = 0; i < g_n_mem_ranges; i++) {
+            if (getenv("EA_FDBG")) fprintf(stderr, "[F] range[%u] [%p,%p)\n", i, g_mem_ranges[i].base, g_mem_ranges[i].end);
+            if (addr >= (uintptr_t)g_mem_ranges[i].base &&
+                addr < (uintptr_t)g_mem_ranges[i].end) {
+                ex->trap = TRAP_OOB_MEMORY;
+                snprintf(ex->trap_msg, sizeof(ex->trap_msg), "%s",
+                         ea_trap_msg(TRAP_OOB_MEMORY));
+                sigset_t set; // the fault stays blocked inside the handler
+                sigemptyset(&set);
+                sigaddset(&set, SIGSEGV);
+                sigaddset(&set, SIGBUS);
+                sigprocmask(SIG_UNBLOCK, &set, NULL);
+                longjmp(*(jmp_buf *)ex->jb, 1);
+            }
+        }
+    }
+    signal(sig, SIG_DFL); // not a wasm memory fault: crash for real
+    raise(sig);
+}
+
+static void ea_install_fault_handler(void) {
+    static bool installed = false;
+    if (installed) return;
+    installed = true;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = ea_segv_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+
 uint8_t *alloc_memory(uint64_t pages);
 uint8_t *alloc_memory_public(uint64_t pages) {
     return alloc_memory(pages);
@@ -220,6 +270,15 @@ uint8_t *alloc_memory(uint64_t pages) {
             return NULL;
         }
     }
+    if (g_n_mem_ranges == g_cap_mem_ranges) {
+        g_cap_mem_ranges = g_cap_mem_ranges ? g_cap_mem_ranges * 2 : 16;
+        g_mem_ranges = (EaMemRange *)realloc(g_mem_ranges,
+                        g_cap_mem_ranges * sizeof(EaMemRange));
+    }
+    g_mem_ranges[g_n_mem_ranges].base = (uint8_t *)p;
+    g_mem_ranges[g_n_mem_ranges].end = (uint8_t *)p + EA_MEM_RESERVE;
+    g_n_mem_ranges++;
+    ea_install_fault_handler();
     return (uint8_t *)p;
 }
 bool ea_grow_memory(EaMemInst *mi, uint64_t delta, uint64_t *old) {
@@ -242,7 +301,15 @@ void ea_instance_free(EaInstance *inst) {
         // defined (owned) ones belong to this instance
         if (i >= inst->module->n_imp_memories && inst->memories[i] &&
             inst->memories[i]->owned) {
-            if (inst->memories[i]->base) munmap(inst->memories[i]->base, EA_MEM_RESERVE);
+            if (inst->memories[i]->base) {
+                for (uint32_t r = 0; r < g_n_mem_ranges; r++) {
+                    if (g_mem_ranges[r].base == inst->memories[i]->base) {
+                        g_mem_ranges[r] = g_mem_ranges[--g_n_mem_ranges];
+                        break;
+                    }
+                }
+                munmap(inst->memories[i]->base, EA_MEM_RESERVE);
+            }
             free(inst->memories[i]);
         }
     }
@@ -582,6 +649,8 @@ int ea_instance_invoke(EaStore *s, EaInstance *inst, uint32_t func_idx,
     EaExec *ex = &s->exec;
     if (func_idx >= inst->n_funcs) return -1;
     EaFuncInst *fi = &inst->funcs[func_idx];
+    EaExec *saved_fault_exec = g_fault_exec;
+    g_fault_exec = ex; // in-bounds faults during this invoke become traps
     ex->trap = TRAP_NONE;
     jmp_buf jb;
     jmp_buf *saved = (jmp_buf *)ex->jb;
@@ -592,6 +661,7 @@ int ea_instance_invoke(EaStore *s, EaInstance *inst, uint32_t func_idx,
         uint32_t n_params = fi->type->n_params;
         if (interp_ensure(ex, n_params + 64) != 0) {
             ex->jb = saved;
+            g_fault_exec = saved_fault_exec;
             if (trap) *trap = TRAP_STACK_EXHAUSTED;
             return 2;
         }
@@ -634,6 +704,7 @@ int ea_instance_invoke(EaStore *s, EaInstance *inst, uint32_t func_idx,
         if (trap) *trap = ex->trap;
         ret = 1;
     }
+    g_fault_exec = saved_fault_exec;
     return ret;
 }
 

@@ -577,16 +577,43 @@ annotations.wast（wabt 与 wasm-tools 均不支持该提案文本语法，转�
 
 验证：全量套件两种模式 257/258 零回归；bench 数值逐项与解释器一致。
 
-剩余差距来源（下一步方向）：wasmtime 用信号式 OOB 检测（无逐访问
-cmp/branch，本实现每次访存 3 条检查指令）；跨语句值生命周期
-（fmul 结果与 fadd 之间隔着 local.get 时无法驻留）→ HIR/寄存器分配。
+### 迭代 17：信号式 OOB 检测（guard page + SIGSEGV handler）（已完成，2026-09-22）
+
+wasmtime 同款机制：JIT 内存访问去掉逐访存的 sub/cmp/branch 三条边界
+检查，越界访问落入 PROT_NONE 保留区由信号处理器转换为 wasm trap。
+
+- **既有布局即条件**：每块线性内存本就以 12GiB PROT_NONE 预留
+  （MAP_NORESERVE）+ mprotect 按需提交——32 位内存的任何越界地址
+  （有效地址 < 2^33，校验器已强制 offset ≤ UINT32_MAX）必然落在预留区内；
+- **处理器**：SIGSEGV/SIGBUS handler 按故障地址查已注册内存区间
+  （alloc_memory 注册、实例释放注销），命中则置 TRAP_OOB_MEMORY 并
+  longjmp 回 invoke 的 setjmp 点（先 sigprocmask 解阻塞，防信号掩码
+  残留）；未命中则恢复默认处置重新 raise（真实段错误照常崩溃）；
+  `_Thread_local` 的 g_fault_exec 由 ea_instance_invoke 进出维护；
+- **JIT 侧**：32 位内存的 load/store 不再发射检查（matmul 函数
+  372→316 条，-15%）；64 位内存无预留上界，保留显式检查；
+- **连带修复两个既有 bug**：
+  1. **32 位地址高位垃圾**：push_w 只写 4 字节而地址 pop 用 64 位
+     ldr 读 8 字节——陈旧高位曾让旧边界检查误判（潜在误 trap），去掉
+     检查后变成野写崩溃。修复：32 位内存的地址 pop/驻留消费一律
+     32 位形式（zero-extend）；
+  2. **trap 桩参数交换**：桩以 w0=code、x1=ex 调用
+     ea_jit_trap_now(ex, code)——参数序相反，一旦执行必崩。
+     此前未被纯 JIT 代码触达而潜伏，本轮修正。
+
+bench 五内核持平（fib 0.022 / primes 0.006 / sum 0.108 / matmul 0.159 /
+memsum 0.003）：这批内核为访存带宽受限，省下的 ALU 指令本就隐藏在
+访存延迟阴影中；收益在指令数（-15%）与机制对齐（wasmtime 同款）。
+验证：全量套件两种模式 257/258 零回归（memory.wast 75 条 OOB trap 经
+信号路径全部正确上报）。
 
 ## 六、下一步（按规划优先级）
 
-1. **HIR / 寄存器分配**（效率阶段主战场）：迭代 15/16 的窗口融合已把
-   matmul 与 wasmtime 的差距从 11× 收敛到 5.3×、primes 追平；剩余差距
-   来自 (a) 逐访存的显式边界检查（wasmtime 用信号式 OOB，每次访存省
-   3 条指令）、(b) 跨语句值生命周期（操作数间隔其他 producer 时无法
+1. **HIR / 寄存器分配**（效率阶段主战场）：迭代 15-17 已把 matmul 与
+   wasmtime 的差距从 11× 收敛到 5.2×、primes 追平；剩余差距来自跨语句
+   值生命周期（操作数间隔其他 producer 时无法驻留，如 fmul; local.get;
+   fadd），需要虚拟寄存器 + 线性扫描。信号式 OOB 已就位（迭代 17），
+   寄存器分配后无需再为检查指令留窗口。
    驻留）。(a) 可独立先行：guard page + SIGSEGV handler 方案。
 2. call_indirect 类型检查改为解码期缓存 canonical id（现为每次比较重建等价栈）。
 3. br_table / v128 的 JIT lowering；浮点参数直接 S/D 寄存器往返。

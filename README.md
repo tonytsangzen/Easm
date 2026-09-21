@@ -22,6 +22,9 @@ baseline JIT** 为主执行引擎，不能降级的指令形态自动回退解�
 - **运行时**：模块实例化、跨模块链接（`spectest` 内置）、多实例共享内存
   （任一别名实例 `memory.grow` 全局可见）、导入全局/内存别名共享存储、
   12GiB 地址空间预留的线性内存、1:1 翻译的 trap 传播
+- **信号式 OOB**：32 位线性内存的 JIT 访存零边界检查指令——越界落入
+  PROT_NONE 保留区，由 SIGSEGV/SIGBUS handler 转换为 wasm trap
+  （wasmtime 同款机制）；64 位内存保留显式检查
 
 ## 目录结构
 
@@ -107,7 +110,7 @@ python3 tools/run_bench.py all          # JIT / 解释器 / wasmtime / node 对�
 
 - primes **追平 wasmtime**，memsum 快于 wasmtime；fib/primes 快于 node
 - JIT 相对解释器加速 **17–48×**；计算密集内核剩余差距来自逐访存边界检查
-  与跨语句值生命周期（→ 信号式 OOB + HIR/寄存器分配阶段的收益空间）
+  与跨语句值生命周期（→ HIR/寄存器分配阶段的收益空间；信号式 OOB 已就位）
 
 **内存**（峰值 RSS）：easm 基线 1.7MB、负载峰值 2.2MB，约为 wasmtime 的 1/3.6、
 V8/node 的 1/20；磁盘足迹 ~240KB vs wasmtime 48.5MB。

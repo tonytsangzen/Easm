@@ -735,13 +735,16 @@ static void reload_ctx(JC *c) {
 }
 
 static void emit_load(JC *c, EaInstr *in) {
+    bool m64 = c->m->memories[in->imm.ma.memidx].is64;
     if (c->def_count == 1 && c->def_kind1 == 1) {
         // address parked in x17 by the preceding integer op
         c->def_count = 0;
-        a64_mov_reg64(&c->em, R16, R17);
+        if (m64) a64_mov_reg64(&c->em, R16, R17);
+        else a64_mov_reg32(&c->em, R16, R17); // i32 address: zero-extend
     } else {
         if (c->def_count) flush_deferred(c); // e.g. a parked (const,local) pair
-        pop_x(&c->em, R16);
+        if (m64) pop_x(&c->em, R16);
+        else pop_w(&c->em, R16); // 32-bit slots only carry 4 clean bytes
     }
     uint64_t off = in->imm.ma.offset;
     if (off) {
@@ -758,9 +761,14 @@ static void emit_load(JC *c, EaInstr *in) {
     case EA_OP_I64_LOAD32_S: case EA_OP_I64_LOAD32_U: nat = 4; break;
     default: nat = 8; break;
     }
-    a64_sub_imm64(&c->em, R17, R26, (uint32_t)nat);
-    a64_cmp_reg64(&c->em, R16, R17);
-    trap_if(c, TRAP_OOB_MEMORY, CC_HI);
+    // 32-bit memories: out-of-bounds accesses fault inside the 12 GiB
+    // PROT_NONE reservation and the signal handler raises the trap, so no
+    // explicit check is needed.  64-bit memories have no such bound.
+    if (c->m->memories[in->imm.ma.memidx].is64) {
+        a64_sub_imm64(&c->em, R17, R26, (uint32_t)nat);
+        a64_cmp_reg64(&c->em, R16, R17);
+        trap_if(c, TRAP_OOB_MEMORY, CC_HI);
+    }
     if (in->opcode == EA_OP_F32_LOAD || in->opcode == EA_OP_F64_LOAD) {
         int b = in->opcode == EA_OP_F64_LOAD ? 8 : 4;
         a64_ldr_reg_fpr(&c->em, V0, R25, R16, b);
@@ -797,20 +805,24 @@ static void emit_store(JC *c, EaInstr *in) {
         if (vsrc == V0) {
             if (b == 8) pop_d(&c->em, V0); else pop_s(&c->em, V0); // value
         }
-        pop_x(&c->em, R16);                                    // address
+        if (c->m->memories[in->imm.ma.memidx].is64) pop_x(&c->em, R16); // address
+        else pop_w(&c->em, R16); // i32 address: zero-extend
         uint64_t foff = in->imm.ma.offset;
         if (foff) {
             if (foff < 4096) a64_add_imm64(&c->em, R16, R16, (uint32_t)foff);
             else { a64_mov64_imm(&c->em, R17, foff); a64_add_reg64(&c->em, R16, R16, R17); }
         }
-        a64_sub_imm64(&c->em, R17, R26, (uint32_t)b);
-        a64_cmp_reg64(&c->em, R16, R17);
-        trap_if(c, TRAP_OOB_MEMORY, CC_HI);
+        if (c->m->memories[in->imm.ma.memidx].is64) {
+            a64_sub_imm64(&c->em, R17, R26, (uint32_t)b);
+            a64_cmp_reg64(&c->em, R16, R17);
+            trap_if(c, TRAP_OOB_MEMORY, CC_HI);
+        }
         a64_str_reg_fpr(&c->em, vsrc, R25, R16, b);
         return;
     }
     pop_x(&c->em, R17); // value
-    pop_x(&c->em, R16); // address
+    if (c->m->memories[in->imm.ma.memidx].is64) pop_x(&c->em, R16); // address
+    else pop_w(&c->em, R16); // i32 address: 32-bit slots only have 4 clean bytes
     uint64_t off = in->imm.ma.offset;
     if (off) {
         // R17 holds the value; use the free x0 for large offsets
@@ -824,12 +836,14 @@ static void emit_store(JC *c, EaInstr *in) {
     case EA_OP_I32_STORE: case EA_OP_F32_STORE: case EA_OP_I64_STORE32: nat = 4; break;
     default: nat = 8; break;
     }
-    // keep the value; recompute in a free scratch (x0 is free here)
-    a64_mov_reg64(&c->em, R0, R17);
-    a64_sub_imm64(&c->em, R17, R26, (uint32_t)nat);
-    a64_cmp_reg64(&c->em, R16, R17);
-    trap_if(c, TRAP_OOB_MEMORY, CC_HI);
-    a64_mov_reg64(&c->em, R17, R0);
+    if (c->m->memories[in->imm.ma.memidx].is64) {
+        // keep the value; recompute in a free scratch (x0 is free here)
+        a64_mov_reg64(&c->em, R0, R17);
+        a64_sub_imm64(&c->em, R17, R26, (uint32_t)nat);
+        a64_cmp_reg64(&c->em, R16, R17);
+        trap_if(c, TRAP_OOB_MEMORY, CC_HI);
+        a64_mov_reg64(&c->em, R17, R0);
+    }
     switch (in->opcode) {
     case EA_OP_I32_STORE: case EA_OP_F32_STORE: case EA_OP_I64_STORE32:
         a64_str_reg32(&c->em, R17, R25, R16);
@@ -1996,9 +2010,9 @@ static bool compile_one_function(JC *c) {
     }
     for (uint32_t j = 0; j < n_used; j++) {
         c->trap_stub_at[j] = c->em.len;
-        a64_movz32(&c->em, R0, used[j] & 0xFFFF);
-        if (used[j] > 0xFFFF) a64_movk32(&c->em, R0, used[j] >> 16);
-        a64_mov_reg64(&c->em, R1, R27);
+        a64_mov_reg64(&c->em, R0, R27);
+        a64_movz32(&c->em, R1, used[j] & 0xFFFF);
+        if (used[j] > 0xFFFF) a64_movk32(&c->em, R1, used[j] >> 16);
         a64_mov64_imm(&c->em, R16, (uint64_t)ea_jit_trap_now);
         a64_blr(&c->em, R16);
         a64_brk(&c->em, 0);
