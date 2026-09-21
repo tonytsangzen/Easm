@@ -521,7 +521,7 @@ static void pop_w(JC *c, uint32_t rt) { a64_ldr_post32(&c->em, rt, SP, 16); }
 // and the very next instruction consumes it from the register instead of the
 // stack slot.  Safe because we only defer when no branch can target the
 // consumer (is_target pre-scan) and flush at every other instruction.
-static bool def_consumes(uint32_t op) {
+static bool int_consumes(uint32_t op) {
     switch (op) {
     case EA_OP_I32_ADD: case EA_OP_I32_SUB: case EA_OP_I32_MUL:
     case EA_OP_I32_AND: case EA_OP_I32_OR: case EA_OP_I32_XOR:
@@ -538,6 +538,22 @@ static bool def_consumes(uint32_t op) {
         return true;
     }
     return false;
+}
+static bool float_consumes(uint32_t op) {
+    switch (op) {
+    case EA_OP_F32_ADD: case EA_OP_F32_SUB: case EA_OP_F32_MUL: case EA_OP_F32_DIV:
+    case EA_OP_F64_ADD: case EA_OP_F64_SUB: case EA_OP_F64_MUL: case EA_OP_F64_DIV:
+        return true;
+    }
+    return false;
+}
+// memory loads consume a parked address operand
+static bool load_consumes(uint32_t op) {
+    return op >= EA_OP_I32_LOAD && op <= EA_OP_I64_LOAD32_U;
+}
+static bool def_consumes(uint32_t op) {
+    return int_consumes(op) || float_consumes(op) || load_consumes(op) ||
+           op == EA_OP_F32_STORE || op == EA_OP_F64_STORE;
 }
 static bool is_def_producer(uint32_t op) {
     return op == EA_OP_I32_CONST || op == EA_OP_I64_CONST || op == EA_OP_LOCAL_GET;
@@ -624,7 +640,13 @@ static void push_result_w(JC *c) {
             c->skip_next = 1;
             return;
         }
-        if (def_consumes(nop)) {
+        if (nop == EA_OP_LOCAL_TEE) {
+            a64_str_imm64(&c->em, R16, FP, local_off(c, c->f->code.v[nx].imm.u32));
+            push_x(&c->em, R16);
+            c->skip_next = 1; // the tee itself is fully fused
+            return;
+        }
+        if (int_consumes(nop) || load_consumes(nop)) {
             a64_mov_reg64(&c->em, R17, R16);
             c->def_kind1 = 1; c->def_count = 1; c->def_first = 0;
             return;
@@ -641,7 +663,13 @@ static void push_result_x(JC *c) {
             c->skip_next = 1;
             return;
         }
-        if (def_consumes(nop)) {
+        if (nop == EA_OP_LOCAL_TEE) {
+            a64_str_imm64(&c->em, R16, FP, local_off(c, c->f->code.v[nx].imm.u32));
+            push_x(&c->em, R16);
+            c->skip_next = 1; // the tee itself is fully fused
+            return;
+        }
+        if (int_consumes(nop) || load_consumes(nop)) {
             a64_mov_reg64(&c->em, R17, R16);
             c->def_kind1 = 1; c->def_count = 1; c->def_first = 0;
             return;
@@ -655,10 +683,6 @@ static void push_result_f(JC *c, int b) {
     uint32_t nx = c->cur_pc + 1;
     if (nx < (uint32_t)c->f->code.n && !c->is_target[nx]) {
         uint32_t nop = c->f->code.v[nx].opcode;
-        bool fbin = b == 4 ? (nop == EA_OP_F32_ADD || nop == EA_OP_F32_SUB ||
-                              nop == EA_OP_F32_MUL || nop == EA_OP_F32_DIV)
-                           : (nop == EA_OP_F64_ADD || nop == EA_OP_F64_SUB ||
-                              nop == EA_OP_F64_MUL || nop == EA_OP_F64_DIV);
         if (nop == EA_OP_LOCAL_SET) {
             // frame slots sit at negative offsets: round-trip the value
             // through a gpr for the FP-relative store
@@ -667,7 +691,8 @@ static void push_result_f(JC *c, int b) {
             c->skip_next = 1;
             return;
         }
-        if (fbin) {
+        bool store = b == 4 ? nop == EA_OP_F32_STORE : nop == EA_OP_F64_STORE;
+        if (float_consumes(nop) || store) {
             a64_fmov_reg(&c->em, V1, V0, b);
             c->def_kind1 = (uint8_t)(b == 4 ? 2 : 3);
             c->def_count = 1; c->def_first = 0;
@@ -710,7 +735,14 @@ static void reload_ctx(JC *c) {
 }
 
 static void emit_load(JC *c, EaInstr *in) {
-    pop_x(&c->em, R16);
+    if (c->def_count == 1 && c->def_kind1 == 1) {
+        // address parked in x17 by the preceding integer op
+        c->def_count = 0;
+        a64_mov_reg64(&c->em, R16, R17);
+    } else {
+        if (c->def_count) flush_deferred(c); // e.g. a parked (const,local) pair
+        pop_x(&c->em, R16);
+    }
     uint64_t off = in->imm.ma.offset;
     if (off) {
         if (off < 4096) a64_add_imm64(&c->em, R16, R16, (uint32_t)off);
@@ -732,7 +764,7 @@ static void emit_load(JC *c, EaInstr *in) {
     if (in->opcode == EA_OP_F32_LOAD || in->opcode == EA_OP_F64_LOAD) {
         int b = in->opcode == EA_OP_F64_LOAD ? 8 : 4;
         a64_ldr_reg_fpr(&c->em, V0, R25, R16, b);
-        if (b == 8) push_d(c, V0); else push_s(c, V0);
+        push_result_f(c, b);
         return;
     }
     switch (in->opcode) {
@@ -750,12 +782,21 @@ static void emit_load(JC *c, EaInstr *in) {
     case EA_OP_I64_LOAD32_U: a64_ldr_reg32(&c->em, R16, R25, R16); break;
     default: a64_ldr_reg64(&c->em, R16, R25, R16); break;
     }
-    push_x(&c->em, R16);
+    push_result_w(c);
 }
 static void emit_store(JC *c, EaInstr *in) {
     if (in->opcode == EA_OP_F32_STORE || in->opcode == EA_OP_F64_STORE) {
         int b = in->opcode == EA_OP_F64_STORE ? 8 : 4;
-        if (b == 8) pop_d(&c->em, V0); else pop_s(&c->em, V0); // value
+        uint32_t vsrc = V0;
+        if (c->def_count == 1 && c->def_kind1 == (uint8_t)(b == 4 ? 2 : 3)) {
+            c->def_count = 0;
+            vsrc = V1; // value parked in v1 by the preceding float op
+        } else if (c->def_count) {
+            flush_deferred(c); // e.g. a parked (const,local) pair
+        }
+        if (vsrc == V0) {
+            if (b == 8) pop_d(&c->em, V0); else pop_s(&c->em, V0); // value
+        }
         pop_x(&c->em, R16);                                    // address
         uint64_t foff = in->imm.ma.offset;
         if (foff) {
@@ -765,7 +806,7 @@ static void emit_store(JC *c, EaInstr *in) {
         a64_sub_imm64(&c->em, R17, R26, (uint32_t)b);
         a64_cmp_reg64(&c->em, R16, R17);
         trap_if(c, TRAP_OOB_MEMORY, CC_HI);
-        a64_str_reg_fpr(&c->em, V0, R25, R16, b);
+        a64_str_reg_fpr(&c->em, vsrc, R25, R16, b);
         return;
     }
     pop_x(&c->em, R17); // value

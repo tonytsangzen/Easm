@@ -545,13 +545,49 @@ annotations.wast（wabt 与 wasm-tools 均不支持该提案文本语法，转�
 验证：全量套件两种模式 257/258（JIT 融合路径由 if/br_if/f32/GC 等套件
 高频覆盖），bench 数值逐项与解释器一致。
 
+### 迭代 16：load/store 驻留 + 地址算术融合（已完成，2026-09-22）
+
+承接迭代 15，消除 matmul 内核 load→fmul→fadd→store 链的剩余栈往返。
+覆盖率 257/258 双模式零回归。
+
+机器码审计发现的三类冗余与修复：
+
+1. **地址算术 → load**：`i32.add` 算出的地址 push 后被 load pop——
+   新增 `load_consumes` 谓词（全部内存加载 0x28–0x35），整数 binop/
+   local.get/const 结果可驻留 x17 作为地址（emit_load 直接从 x17 搬入
+   x16，省 pop；驻留的 32 位结果由 32 位指令零扩展保证有效）；
+2. **f32/f64 load 结果直通**：load 结果复用 `push_result_f`——下一条是
+   浮点二元运算时驻留 v1，`ldr s0 → fmov s1 → fmul` 三条全寄存器化；
+3. **浮点 store 值驻留**：fadd/fmul 结果直接从 v1 进 `str [x25, x16]`
+   （def_consumes 纳入 F32/F64_STORE 作 keep 条件；emit_store/emit_load
+   对不匹配的 def 状态先 flush，防御 const/local 对偶误入）；
+4. **local.tee 融合**：`add → tee` 原为 push + peek + store 三次访存，
+   融合为 store-to-local + push 两次（并 skip 掉 tee 本身——漏设
+   skip_next 导致 tee 双重执行的 bug 由反汇编审计抓出）。
+
+效果（JIT 秒，wasmtime 参照；matmul 三步累计 0.358 → 0.157，**-56%**）：
+
+| kernel | 迭代 15 后 | 迭代 16 后 | wasmtime | 差距 |
+|---|---|---|---|---|
+| fib | 0.022 | 0.023 | 0.009 | 2.6× |
+| primes | 0.006 | 0.006（持平） | 0.006 | **1×** |
+| sum | 0.109 | 0.108 | 0.021 | 5.1× |
+| matmul | 0.340 | **0.157（-54%）** | 0.031 | 5.1× |
+| memsum | 0.003 | 0.003（保持领先） | 0.005 | 0.6× |
+
+验证：全量套件两种模式 257/258 零回归；bench 数值逐项与解释器一致。
+
+剩余差距来源（下一步方向）：wasmtime 用信号式 OOB 检测（无逐访问
+cmp/branch，本实现每次访存 3 条检查指令）；跨语句值生命周期
+（fmul 结果与 fadd 之间隔着 local.get 时无法驻留）→ HIR/寄存器分配。
+
 ## 六、下一步（按规划优先级）
 
-1. **HIR / 寄存器分配**（效率阶段主战场）：迭代 15 的窗口融合消除了三类
-   局部冗余（sum -42%、primes 追平 wasmtime），但 sum 剩余 5×、matmul
-   11× 的差距来自跨语句的值生命周期（地址算术、循环归纳变量、f32
-   load/store 链），需要虚拟寄存器 + 线性扫描。顺带：load 结果驻留
-   （f32 load → fmul 直通 v 寄存器）、地址模式寻址。
+1. **HIR / 寄存器分配**（效率阶段主战场）：迭代 15/16 的窗口融合已把
+   matmul 与 wasmtime 的差距从 11× 收敛到 5.3×、primes 追平；剩余差距
+   来自 (a) 逐访存的显式边界检查（wasmtime 用信号式 OOB，每次访存省
+   3 条指令）、(b) 跨语句值生命周期（操作数间隔其他 producer 时无法
+   驻留）。(a) 可独立先行：guard page + SIGSEGV handler 方案。
 2. call_indirect 类型检查改为解码期缓存 canonical id（现为每次比较重建等价栈）。
 3. br_table / v128 的 JIT lowering；浮点参数直接 S/D 寄存器往返。
 4. annotations.wast 需支持注解提案文本语法（wabt/wasm-tools 均不支持，
