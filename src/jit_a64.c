@@ -60,6 +60,11 @@ static void ea_jit_call_interp(EaExec *ex, EaFuncInst *fi, WVal *args) {
 }
 
 uint64_t ea_h_popcnt64(uint64_t x) { return __builtin_popcountll(x); }
+void ea_h_wdump6(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+    fprintf(stderr, "[R] %llu %llu %llu %llu %llu %llu\n",
+            (unsigned long long)a, (unsigned long long)b, (unsigned long long)c,
+            (unsigned long long)d, (unsigned long long)e, (unsigned long long)f);
+}
 
 EaFuncInst *ea_jit_callee_lookup(EaExec *ex, EaInstance *inst, uint32_t table_idx,
                                  uint32_t type_idx, uint32_t elem_idx) {
@@ -1412,6 +1417,11 @@ static bool compile_function(JC *c) {
                         c->cache_map[i] = c->wl_want[i];
                     }
                     c->cache_dirty = 0;
+                    if (getenv("EA_WDBG2")) {
+                        for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++)
+                            a64_mov_reg64(e, R0 + i, ea_cache_reg[i]);
+                        call_helper(c, (const void *)ea_h_wdump6);
+                    }
                     EaInstr *lin = &code->v[c->wl_loop_pc];
                     c->ctrl[c->csp].height = lin->height;
                     c->ctrl[c->csp].arity = lin->arity_out;
@@ -1427,6 +1437,11 @@ static bool compile_function(JC *c) {
                     c->skip_depth = -1;
                     pc = c->wl_head_pc - 1; // pc++ lands on the head
                     break;
+                }
+                if (c->wl_pass == 2 && getenv("EA_WDBG2")) {
+                    for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++)
+                        a64_mov_reg64(e, R0 + i, ea_cache_reg[i]);
+                    call_helper(c, (const void *)ea_h_wdump6);
                 }
                 c->wl_pass = 0;
             }
