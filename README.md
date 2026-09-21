@@ -99,14 +99,15 @@ python3 tools/run_bench.py all          # JIT / 解释器 / wasmtime / node 对�
 
 | kernel | easm-jit | easm-int | wasmtime | node |
 |---|---|---|---|---|
-| fib（10M 迭代） | 0.024 | 0.460 | 0.009 | 0.031 |
-| primes（500K 筛） | 0.010 | 0.318 | 0.006 | 0.029 |
-| sum（100M i64） | 0.189 | 9.225 | 0.021 | 0.084 |
-| matmul（30×128³） | 0.358 | 17.493 | 0.032 | 0.091 |
+| fib（10M 迭代） | 0.022 | 0.459 | 0.009 | 0.031 |
+| primes（500K 筛） | **0.006** | 0.318 | 0.006 | 0.028 |
+| sum（100M i64） | 0.109 | 9.221 | 0.021 | 0.080 |
+| matmul（30×128³） | 0.340 | 17.416 | 0.031 | 0.091 |
 | memsum（2M load） | **0.003** | 0.007 | 0.005 | 0.026 |
 
-- JIT 相对解释器加速 **17–48×**；fib/primes 快于 node，memsum 快于 wasmtime
-- 计算密集内核与 wasmtime 差 8–10×（Cranelift 寄存器分配/向量化 → HIR 阶段收益空间）
+- primes **追平 wasmtime**，memsum 快于 wasmtime；fib/primes 快于 node
+- JIT 相对解释器加速 **17–48×**；计算密集内核剩余差距来自跨语句值生命周期
+  （地址算术、f32 load/store 链）→ HIR/寄存器分配阶段的收益空间
 
 **内存**（峰值 RSS）：easm 基线 1.7MB、负载峰值 2.2MB，约为 wasmtime 的 1/3.6、
 V8/node 的 1/20；磁盘足迹 ~240KB vs wasmtime 48.5MB。

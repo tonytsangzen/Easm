@@ -512,13 +512,49 @@ annotations.wast（wabt 与 wasm-tools 均不支持该提案文本语法，转�
 验证：全量套件两种模式 257/258 完全一致；bench 五内核持平
 （fib 0.024s / primes 0.010s / sum 0.189s / matmul 0.358s / memsum 0.003s）。
 
+### 迭代 15：JIT 融合三连（比较→br_if / 结果驻留 / local.set 直存）（已完成，2026-09-21）
+
+以 wasmtime 为参照的性能优化第一步：在不引入完整寄存器分配的前提下，
+把 1:1 翻译的三类最高频冗余在局部窗口内消除。覆盖率 257/258 双模式零回归。
+
+机器码审计（EA_JIT_DUMP + llvm-mc 反汇编 sum 热点循环）发现的三类浪费：
+
+1. **比较 → br_if 六条变两条**：`cset → push → pop → cmp #0 → b.cond`
+   塌缩为 `cmp → b.cond`（flags 直接跨指令存活，bool 永不落栈）。
+   前置条件：比较与 br_if 均非分支目标。AArch64 全部条件码可反转
+   （含浮点 MI/PL、VS/VC）。深度簿记：fused 时 `depth -= 1 + vpops`
+   （bool + 从寄存器消费的驻留操作数都从未占槽——栈上漂移 bug 的根因，
+   大循环下 sp 逐渐越界，靠 spec 全量回归抓出）。
+2. **binop 结果驻留**：结果不再 push，若下一条是消费型二元/比较指令则
+   驻留 x17（复用现有 pop_pair 的 def 机制）；表达式链每环节省一对
+   store/load。f32/f64 结果驻留 v1（def_kind1=2/3，flush 走 fpr）。
+3. **local.set 直存**：binop 结果直接 `str [FP, off]` 进局部槽，跳过
+   push/pop 往返（主循环以 skip_next 跳过被融合的 local.set）。f32/f64
+   经 gpr 中转（帧槽为负偏移，FP scaled imm 无法编码）。
+
+效果（JIT 秒，wasmtime 参照）：
+
+| kernel | 优化前 | 优化后 | wasmtime |
+|---|---|---|---|
+| fib | 0.024 | 0.022（-9%） | 0.009 |
+| primes | 0.010 | 0.006（**追平 wasmtime**） | 0.006 |
+| sum | 0.189 | 0.109（**-42%**） | 0.021 |
+| matmul | 0.358 | 0.340（-5%） | 0.031 |
+| memsum | 0.003 | 0.003（保持快于 wasmtime） | 0.005 |
+
+验证：全量套件两种模式 257/258（JIT 融合路径由 if/br_if/f32/GC 等套件
+高频覆盖），bench 数值逐项与解释器一致。
+
 ## 六、下一步（按规划优先级）
 
-1. **HIR / 寄存器分配**（效率阶段主战场）：当前 1:1 栈机翻译在 sum/matmul 上与
-   Cranelift 的差距主要来自冗余 push/pop；引入虚拟寄存器 + 线性扫描可预期再获 2–5×。
-   顺带：call_indirect 类型检查改为解码期缓存 canonical id（现为每次比较重建等价栈）。
-2. 浮点参数直接 S/D 寄存器往返；br_table / v128 的 JIT lowering。
-3. annotations.wast 需支持注解提案文本语法（wabt/wasm-tools 均不支持，
+1. **HIR / 寄存器分配**（效率阶段主战场）：迭代 15 的窗口融合消除了三类
+   局部冗余（sum -42%、primes 追平 wasmtime），但 sum 剩余 5×、matmul
+   11× 的差距来自跨语句的值生命周期（地址算术、循环归纳变量、f32
+   load/store 链），需要虚拟寄存器 + 线性扫描。顺带：load 结果驻留
+   （f32 load → fmul 直通 v 寄存器）、地址模式寻址。
+2. call_indirect 类型检查改为解码期缓存 canonical id（现为每次比较重建等价栈）。
+3. br_table / v128 的 JIT lowering；浮点参数直接 S/D 寄存器往返。
+4. annotations.wast 需支持注解提案文本语法（wabt/wasm-tools 均不支持，
    需自制转换路径）。
 4. 覆盖率之外的健全性：运行 spec 之外的场景（多实例 grow 别名、异常
    传播跨 JIT 边界的压力用例）。

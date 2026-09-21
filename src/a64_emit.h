@@ -634,6 +634,10 @@ static inline void a64_ldr_fpr_imm(Em *e, uint32_t vt, uint32_t rn, int64_t off,
     uint32_t sc = (uint32_t)((b == 8 ? off >> 3 : off >> 2) & 0xFFF);
     em_word(e, (b == 8 ? 0xFD400000u : 0xBD400000u) | (sc << 10) | (rn << 5) | vt);
 }
+static inline void a64_str_fpr_imm(Em *e, uint32_t vt, uint32_t rn, int64_t off, int b) { // scaled imm
+    uint32_t sc = (uint32_t)((b == 8 ? off >> 3 : off >> 2) & 0xFFF);
+    em_word(e, (b == 8 ? 0xFD000000u : 0xBD000000u) | (sc << 10) | (rn << 5) | vt);
+}
 static inline void a64_str_reg_fpr(Em *e, uint32_t vt, uint32_t rn, uint32_t rm, int b) {
     em_word(e, (b == 8 ? 0xFC206800u : 0xBC206800u) | (rm << 16) | (rn << 5) | vt);
 }

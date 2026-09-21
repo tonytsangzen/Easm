@@ -388,6 +388,10 @@ int ea_jit_call(EaExec *ex, EaFuncInst *fi) {
 // ---------------------------------------------------------------- codegen
 #define SLOT 16
 
+// float values move directly through S/D registers (no gpr<->fpr round-trip)
+#define V0 0
+#define V1 1
+
 typedef struct {
     Em em;
     EaModule *m;
@@ -412,11 +416,16 @@ typedef struct {
     bool reachable;
     int32_t skip_depth;
     uint8_t def_count;      // deferred-operand fusion window (0, 1 or 2 values)
-    uint8_t def_kind0;      // width of the deeper deferred value (0 = i32, 1 = 8-byte)
+    uint8_t def_kind0;      // width of the deeper deferred value (0 = i32, 1 = 8-byte,
+                            // 2 = f32 in v1, 3 = f64 in v1)
     uint8_t def_kind1;      // width of the top deferred value
     uint8_t def_first;      // count==1: value sits in x16 as the first of a pair
     uint32_t cur_pc;
     uint8_t *is_target;     // per-pc: something may branch here
+    int8_t fused_cc;        // a comparison set the flags; the next BR_IF must
+                            // branch on them (-1 = none)
+    uint8_t vpops;          // operands the last pop_pair took from registers
+    uint8_t skip_next;      // the next pc (a LOCAL_SET) was fused: skip it
     char why[80];
     bool failed;
 } JC;
@@ -548,25 +557,125 @@ static void flush_deferred(JC *c) {
         else a64_str_pre64(&c->em, R16, SP, -16);
     }
     if (c->def_kind1 == 0) a64_str_pre32(&c->em, R17, SP, -16);
-    else a64_str_pre64(&c->em, R17, SP, -16);
+    else if (c->def_kind1 == 1) a64_str_pre64(&c->em, R17, SP, -16);
+    else if (c->def_kind1 == 2) a64_str_pre_fpr(&c->em, V1, SP, -16, 4);
+    else a64_str_pre_fpr(&c->em, V1, SP, -16, 8);
     c->def_count = 0;
     c->def_first = 0;
+    c->fused_cc = -1;
+    c->skip_next = 0;
 }
 // fetch both operands of a binary op; with deferred values they are already
 // in x16 (first operand) / x17 (second), so nothing is emitted
 static void pop_pair_w(JC *c) {
-    if (c->def_count == 2) { c->def_count = 0; return; }               // a in x16, b in x17
-    if (c->def_count == 1) { c->def_count = 0; pop_w(c, R16); return; } // b in x17; pop a
+    c->vpops = 0;
+    if (c->def_count == 2) { c->def_count = 0; c->vpops = 2; return; }               // a in x16, b in x17
+    if (c->def_count == 1) { c->def_count = 0; c->vpops = 1; pop_w(c, R16); return; } // b in x17; pop a
     pop_w(c, R17); pop_w(c, R16);
 }
 static void pop_pair_x(JC *c) {
-    if (c->def_count == 2) { c->def_count = 0; return; }
-    if (c->def_count == 1) { c->def_count = 0; pop_x(c, R16); return; }
+    c->vpops = 0;
+    if (c->def_count == 2) { c->def_count = 0; c->vpops = 2; return; }
+    if (c->def_count == 1) { c->def_count = 0; c->vpops = 1; pop_x(c, R16); return; }
     pop_x(c, R17); pop_x(c, R16);
 }
-// float values move directly through S/D registers (no gpr<->fpr round-trip)
-#define V0 0
-#define V1 1
+static int32_t local_off(JC *c, uint32_t k);
+static void push_s(JC *c, uint32_t vt);
+static void push_d(JC *c, uint32_t vt);
+static uint32_t cc_invert(uint32_t cc) {
+    switch (cc) {
+    case CC_EQ: return CC_NE; case CC_NE: return CC_EQ;
+    case CC_MI: return CC_PL; case CC_PL: return CC_MI;
+    case CC_VS: return CC_VC; case CC_VC: return CC_VS;
+    case CC_HI: return CC_LS; case CC_LS: return CC_HI;
+    case CC_GE: return CC_LT; case CC_LT: return CC_GE;
+    case CC_GT: return CC_LE; case CC_LE: return CC_GT;
+    case CC_LO: return CC_HS; case CC_HS: return CC_LO;
+    }
+    return CC_NE;
+}
+// the next instruction fuses with a comparison result when it is a BR_IF
+// that nothing branches into (flags stay valid, no bool ever hits the stack)
+static bool brif_next(JC *c) {
+    uint32_t nx = c->cur_pc + 1;
+    return nx < (uint32_t)c->f->code.n && !c->is_target[nx] && !c->is_target[c->cur_pc] &&
+           c->f->code.v[nx].opcode == EA_OP_BR_IF;
+}
+// comparison flags live; hand them to the following br_if, else materialize
+static void cmp_result_w(JC *c, uint32_t cc) {
+    if (brif_next(c)) {
+        c->fused_cc = (int8_t)cc;
+        // neither the bool nor register-consumed operands occupy a slot
+        c->depth -= 1 + c->vpops;
+        return;
+    }
+    a64_cset32(&c->em, R16, cc);
+    push_w(&c->em, R16);
+}
+// binop result in R16: fuse with an adjacent consumer instead of a stack
+// round-trip — LOCAL_SET stores straight to the local slot, a following
+// binary/comparison op takes the value from x17
+static void push_result_w(JC *c) {
+    uint32_t nx = c->cur_pc + 1;
+    if (nx < (uint32_t)c->f->code.n && !c->is_target[nx]) {
+        uint32_t nop = c->f->code.v[nx].opcode;
+        if (nop == EA_OP_LOCAL_SET) {
+            a64_str_imm64(&c->em, R16, FP, local_off(c, c->f->code.v[nx].imm.u32));
+            c->skip_next = 1;
+            return;
+        }
+        if (def_consumes(nop)) {
+            a64_mov_reg64(&c->em, R17, R16);
+            c->def_kind1 = 1; c->def_count = 1; c->def_first = 0;
+            return;
+        }
+    }
+    push_w(&c->em, R16);
+}
+static void push_result_x(JC *c) {
+    uint32_t nx = c->cur_pc + 1;
+    if (nx < (uint32_t)c->f->code.n && !c->is_target[nx]) {
+        uint32_t nop = c->f->code.v[nx].opcode;
+        if (nop == EA_OP_LOCAL_SET) {
+            a64_str_imm64(&c->em, R16, FP, local_off(c, c->f->code.v[nx].imm.u32));
+            c->skip_next = 1;
+            return;
+        }
+        if (def_consumes(nop)) {
+            a64_mov_reg64(&c->em, R17, R16);
+            c->def_kind1 = 1; c->def_count = 1; c->def_first = 0;
+            return;
+        }
+    }
+    push_x(&c->em, R16);
+}
+// f32/f64 binop result in v0: park in v1 for a following float op, or store
+// straight to a local slot
+static void push_result_f(JC *c, int b) {
+    uint32_t nx = c->cur_pc + 1;
+    if (nx < (uint32_t)c->f->code.n && !c->is_target[nx]) {
+        uint32_t nop = c->f->code.v[nx].opcode;
+        bool fbin = b == 4 ? (nop == EA_OP_F32_ADD || nop == EA_OP_F32_SUB ||
+                              nop == EA_OP_F32_MUL || nop == EA_OP_F32_DIV)
+                           : (nop == EA_OP_F64_ADD || nop == EA_OP_F64_SUB ||
+                              nop == EA_OP_F64_MUL || nop == EA_OP_F64_DIV);
+        if (nop == EA_OP_LOCAL_SET) {
+            // frame slots sit at negative offsets: round-trip the value
+            // through a gpr for the FP-relative store
+            fmov_to_gpr(c, R16, V0, b);
+            a64_str_imm64(&c->em, R16, FP, local_off(c, c->f->code.v[nx].imm.u32));
+            c->skip_next = 1;
+            return;
+        }
+        if (fbin) {
+            a64_fmov_reg(&c->em, V1, V0, b);
+            c->def_kind1 = (uint8_t)(b == 4 ? 2 : 3);
+            c->def_count = 1; c->def_first = 0;
+            return;
+        }
+    }
+    if (b == 4) push_s(&c->em, V0); else push_d(&c->em, V0);
+}
 static void push_s(JC *c, uint32_t vt) { a64_str_pre_fpr(&c->em, vt, SP, -16, 4); }
 static void pop_s(JC *c, uint32_t vt) { a64_ldr_post_fpr(&c->em, vt, SP, 16, 4); }
 static void push_d(JC *c, uint32_t vt) { a64_str_pre_fpr(&c->em, vt, SP, -16, 8); }
@@ -833,8 +942,7 @@ static void emit_fcmp32(JC *c, uint32_t cond, bool use_nan_true) {
     default: fcond = CC_GE; break;
     }
     if (use_nan_true && cond == CC_NE) fcond = CC_NE;
-    a64_cset32(&c->em, R16, fcond);
-    push_w(&c->em, R16);
+    cmp_result_w(c, fcond);
 }
 static void emit_fcmp64(JC *c, uint32_t cond) {
     pop_d(&c->em, V1);
@@ -910,6 +1018,8 @@ static bool compile_function(JC *c) {
     c->skip_depth = -1;
     c->def_count = 0;
     c->def_first = 0;
+    c->fused_cc = -1;
+    c->skip_next = 0;
     c->is_target = (uint8_t *)calloc(n + 2, 1);
     if (c->is_target)
         for (uint32_t i = 0; i < n; i++) {
@@ -959,6 +1069,11 @@ static bool compile_function(JC *c) {
 
     uint32_t pc = 0;
     while (pc < n) {
+        if (c->skip_next) { // result stored straight to a local slot
+            c->skip_next = 0;
+            pc++;
+            continue;
+        }
         c->insn_at[pc] = e->len;
         c->depth = c->f->depths[pc];
         c->cur_pc = pc;
@@ -1087,10 +1202,19 @@ static bool compile_function(JC *c) {
             break;
         }
         case EA_OP_BR_IF: {
-            pop_w(e, R16); // cond
-            a64_cmp_imm32(e, R16, 0);
-            em_bcond_label(e, 0, CC_EQ);
-            fix_cond_to_pc(c, pc + 1, CC_EQ); // fallthrough when zero
+            uint32_t cc;
+            if (c->fused_cc >= 0) {
+                // comparison set the flags directly: branch on them, the bool
+                // was never materialized
+                cc = cc_invert((uint32_t)c->fused_cc);
+                c->fused_cc = -1; // depth was corrected by the comparison
+            } else {
+                pop_w(e, R16); // cond
+                a64_cmp_imm32(e, R16, 0);
+                cc = CC_EQ;
+            }
+            em_bcond_label(e, 0, cc);
+            fix_cond_to_pc(c, pc + 1, cc); // fallthrough when zero/false
             uint32_t l = in->imm.u32;
             uint32_t theight, tarity, tpc;
             bool tloop;
@@ -1413,31 +1537,34 @@ static bool compile_scalar_op(JC *c, EaInstr *in) {
     uint32_t op = in->opcode;
     switch (op) {
     // ---- i32 comparisons
+    // ---- i32 comparisons
+    // cmp_result_w: flags are already set — branch directly to a following
+    // br_if when possible instead of materializing the bool
     case EA_OP_I32_EQZ:
-        pop_w(e, R16); a64_cmp_imm32(e, R16, 0); a64_cset32(e, R16, CC_EQ); push_w(e, R16); return true;
-    case EA_OP_I32_EQ: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); a64_cset32(e, R16, CC_EQ); push_w(e, R16); return true;
-    case EA_OP_I32_NE: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); a64_cset32(e, R16, CC_NE); push_w(e, R16); return true;
-    case EA_OP_I32_LT_S: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); a64_cset32(e, R16, CC_LT); push_w(e, R16); return true;
-    case EA_OP_I32_LT_U: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); a64_cset32(e, R16, CC_LO); push_w(e, R16); return true;
-    case EA_OP_I32_GT_S: pop_pair_w(c); a64_cmp_reg32(e, R17, R16); a64_cset32(e, R16, CC_LT); push_w(e, R16); return true;
-    case EA_OP_I32_GT_U: pop_pair_w(c); a64_cmp_reg32(e, R17, R16); a64_cset32(e, R16, CC_LO); push_w(e, R16); return true;
-    case EA_OP_I32_LE_S: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); a64_cset32(e, R16, CC_LE); push_w(e, R16); return true;
-    case EA_OP_I32_LE_U: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); a64_cset32(e, R16, CC_LS); push_w(e, R16); return true;
-    case EA_OP_I32_GE_S: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); a64_cset32(e, R16, CC_GE); push_w(e, R16); return true;
-    case EA_OP_I32_GE_U: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); a64_cset32(e, R16, CC_HS); push_w(e, R16); return true;
+        pop_w(e, R16); a64_cmp_imm32(e, R16, 0); cmp_result_w(c, CC_EQ); return true;
+    case EA_OP_I32_EQ: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_EQ); return true;
+    case EA_OP_I32_NE: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_NE); return true;
+    case EA_OP_I32_LT_S: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_LT); return true;
+    case EA_OP_I32_LT_U: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_LO); return true;
+    case EA_OP_I32_GT_S: pop_pair_w(c); a64_cmp_reg32(e, R17, R16); cmp_result_w(c, CC_LT); return true;
+    case EA_OP_I32_GT_U: pop_pair_w(c); a64_cmp_reg32(e, R17, R16); cmp_result_w(c, CC_LO); return true;
+    case EA_OP_I32_LE_S: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_LE); return true;
+    case EA_OP_I32_LE_U: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_LS); return true;
+    case EA_OP_I32_GE_S: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_GE); return true;
+    case EA_OP_I32_GE_U: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_HS); return true;
     // ---- i64 comparisons (result i32)
     case EA_OP_I64_EQZ:
-        pop_x(e, R16); a64_cmp_reg64(e, R16, 31); a64_cset32(e, R16, CC_EQ); push_w(e, R16); return true;
-    case EA_OP_I64_EQ: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); a64_cset32(e, R16, CC_EQ); push_w(e, R16); return true;
-    case EA_OP_I64_NE: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); a64_cset32(e, R16, CC_NE); push_w(e, R16); return true;
-    case EA_OP_I64_LT_S: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); a64_cset32(e, R16, CC_LT); push_w(e, R16); return true;
-    case EA_OP_I64_LT_U: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); a64_cset32(e, R16, CC_LO); push_w(e, R16); return true;
-    case EA_OP_I64_GT_S: pop_pair_x(c); a64_cmp_reg64(e, R17, R16); a64_cset32(e, R16, CC_LT); push_w(e, R16); return true;
-    case EA_OP_I64_GT_U: pop_pair_x(c); a64_cmp_reg64(e, R17, R16); a64_cset32(e, R16, CC_LO); push_w(e, R16); return true;
-    case EA_OP_I64_LE_S: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); a64_cset32(e, R16, CC_LE); push_w(e, R16); return true;
-    case EA_OP_I64_LE_U: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); a64_cset32(e, R16, CC_LS); push_w(e, R16); return true;
-    case EA_OP_I64_GE_S: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); a64_cset32(e, R16, CC_GE); push_w(e, R16); return true;
-    case EA_OP_I64_GE_U: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); a64_cset32(e, R16, CC_HS); push_w(e, R16); return true;
+        pop_x(e, R16); a64_cmp_reg64(e, R16, 31); cmp_result_w(c, CC_EQ); return true;
+    case EA_OP_I64_EQ: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_EQ); return true;
+    case EA_OP_I64_NE: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_NE); return true;
+    case EA_OP_I64_LT_S: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_LT); return true;
+    case EA_OP_I64_LT_U: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_LO); return true;
+    case EA_OP_I64_GT_S: pop_pair_x(c); a64_cmp_reg64(e, R17, R16); cmp_result_w(c, CC_LT); return true;
+    case EA_OP_I64_GT_U: pop_pair_x(c); a64_cmp_reg64(e, R17, R16); cmp_result_w(c, CC_LO); return true;
+    case EA_OP_I64_LE_S: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_LE); return true;
+    case EA_OP_I64_LE_U: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_LS); return true;
+    case EA_OP_I64_GE_S: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_GE); return true;
+    case EA_OP_I64_GE_U: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_HS); return true;
     // ---- f32/f64 comparisons
     case EA_OP_F32_EQ: emit_fcmp32(c, CC_EQ, false); return true;
     case EA_OP_F32_NE: emit_fcmp32(c, CC_NE, true); return true;
@@ -1452,12 +1579,12 @@ static bool compile_scalar_op(JC *c, EaInstr *in) {
     case EA_OP_F64_LE: emit_fcmp64(c, CC_LE); return true;
     case EA_OP_F64_GE: emit_fcmp64(c, CC_GE); return true;
     // ---- i32 arithmetic
-    case EA_OP_I32_ADD: pop_pair_w(c); a64_add_reg32(e, R16, R16, R17); push_w(e, R16); return true;
-    case EA_OP_I32_SUB: pop_pair_w(c); a64_sub_reg32(e, R16, R16, R17); push_w(e, R16); return true;
-    case EA_OP_I32_MUL: pop_pair_w(c); a64_madd32(e, R16, R16, R17, 31); push_w(e, R16); return true;
-    case EA_OP_I32_AND: pop_pair_w(c); a64_and_reg32(e, R16, R16, R17); push_w(e, R16); return true;
-    case EA_OP_I32_OR: pop_pair_w(c); a64_orr_reg32(e, R16, R16, R17); push_w(e, R16); return true;
-    case EA_OP_I32_XOR: pop_pair_w(c); a64_eor_reg32(e, R16, R16, R17); push_w(e, R16); return true;
+    case EA_OP_I32_ADD: pop_pair_w(c); a64_add_reg32(e, R16, R16, R17); push_result_w(c); return true;
+    case EA_OP_I32_SUB: pop_pair_w(c); a64_sub_reg32(e, R16, R16, R17); push_result_w(c); return true;
+    case EA_OP_I32_MUL: pop_pair_w(c); a64_madd32(e, R16, R16, R17, 31); push_result_w(c); return true;
+    case EA_OP_I32_AND: pop_pair_w(c); a64_and_reg32(e, R16, R16, R17); push_result_w(c); return true;
+    case EA_OP_I32_OR: pop_pair_w(c); a64_orr_reg32(e, R16, R16, R17); push_result_w(c); return true;
+    case EA_OP_I32_XOR: pop_pair_w(c); a64_eor_reg32(e, R16, R16, R17); push_result_w(c); return true;
     case EA_OP_I32_SHL: pop_pair_w(c); a64_lslv32(e, R16, R16, R17); push_w(e, R16); return true;
     case EA_OP_I32_SHR_S: pop_pair_w(c); a64_asrv32(e, R16, R16, R17); push_w(e, R16); return true;
     case EA_OP_I32_SHR_U: pop_pair_w(c); a64_lsrv32(e, R16, R16, R17); push_w(e, R16); return true;
@@ -1479,12 +1606,12 @@ static bool compile_scalar_op(JC *c, EaInstr *in) {
         a64_mov_reg32(e, R16, R0);
     } push_w(e, R16); return true;
     // ---- i64 arithmetic
-    case EA_OP_I64_ADD: pop_pair_x(c); a64_add_reg64(e, R16, R16, R17); push_x(e, R16); return true;
-    case EA_OP_I64_SUB: pop_pair_x(c); a64_sub_reg64(e, R16, R16, R17); push_x(e, R16); return true;
-    case EA_OP_I64_MUL: pop_pair_x(c); a64_madd64(e, R16, R16, R17, 31); push_x(e, R16); return true;
-    case EA_OP_I64_AND: pop_pair_x(c); a64_and_reg64(e, R16, R16, R17); push_x(e, R16); return true;
-    case EA_OP_I64_OR: pop_pair_x(c); a64_orr_reg64(e, R16, R16, R17); push_x(e, R16); return true;
-    case EA_OP_I64_XOR: pop_pair_x(c); a64_eor_reg64(e, R16, R16, R17); push_x(e, R16); return true;
+    case EA_OP_I64_ADD: pop_pair_x(c); a64_add_reg64(e, R16, R16, R17); push_result_x(c); return true;
+    case EA_OP_I64_SUB: pop_pair_x(c); a64_sub_reg64(e, R16, R16, R17); push_result_x(c); return true;
+    case EA_OP_I64_MUL: pop_pair_x(c); a64_madd64(e, R16, R16, R17, 31); push_result_x(c); return true;
+    case EA_OP_I64_AND: pop_pair_x(c); a64_and_reg64(e, R16, R16, R17); push_result_x(c); return true;
+    case EA_OP_I64_OR: pop_pair_x(c); a64_orr_reg64(e, R16, R16, R17); push_result_x(c); return true;
+    case EA_OP_I64_XOR: pop_pair_x(c); a64_eor_reg64(e, R16, R16, R17); push_result_x(c); return true;
     case EA_OP_I64_SHL: pop_pair_x(c); a64_lslv64(e, R16, R16, R17); push_x(e, R16); return true;
     case EA_OP_I64_SHR_S: pop_pair_x(c); a64_asrv64(e, R16, R16, R17); push_x(e, R16); return true;
     case EA_OP_I64_SHR_U: pop_pair_x(c); a64_lsrv64(e, R16, R16, R17); push_x(e, R16); return true;
@@ -1657,24 +1784,34 @@ static void fmov_to_fpr(JC *c, uint32_t vd, uint32_t gpr, int b) { a64_fmov_gpr_
 static void fmov_to_gpr(JC *c, uint32_t gpr, uint32_t vs, int b) { a64_fmov_gpr_fpr(&c->em, gpr, vs, 0, b); }
 
 static void emit_f32_bin(JC *c, uint32_t opc) {
-    pop_s(&c->em, V1); pop_s(&c->em, V0);
+    if (c->def_count == 1 && c->def_kind1 == 2) { // rhs parked in v1
+        c->def_count = 0;
+        pop_s(&c->em, V0);
+    } else {
+        pop_s(&c->em, V1); pop_s(&c->em, V0);
+    }
     switch (opc) {
     case 0x0200: a64_fadd(&c->em, V0, V0, V1, 4); break;
     case 0x0300: a64_fsub(&c->em, V0, V0, V1, 4); break;
     case 0x0100: a64_fmul(&c->em, V0, V0, V1, 4); break;
     case 0x0180: a64_fdiv(&c->em, V0, V0, V1, 4); break;
     }
-    push_s(&c->em, V0);
+    push_result_f(c, 4);
 }
 static void emit_f64_bin(JC *c, uint32_t opc) {
-    pop_d(&c->em, V1); pop_d(&c->em, V0);
+    if (c->def_count == 1 && c->def_kind1 == 3) { // rhs parked in v1
+        c->def_count = 0;
+        pop_d(&c->em, V0);
+    } else {
+        pop_d(&c->em, V1); pop_d(&c->em, V0);
+    }
     switch (opc) {
     case 0x0200: a64_fadd(&c->em, V0, V0, V1, 8); break;
     case 0x0300: a64_fsub(&c->em, V0, V0, V1, 8); break;
     case 0x0100: a64_fmul(&c->em, V0, V0, V1, 8); break;
     case 0x0180: a64_fdiv(&c->em, V0, V0, V1, 8); break;
     }
-    push_d(&c->em, V0);
+    push_result_f(c, 8);
 }
 
 // trapping float->int truncation via helper (NaN/range checks in C)
