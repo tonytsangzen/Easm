@@ -1,0 +1,240 @@
+import socket
+import threading
+from typing import Any
+from pathlib import Path
+from unittest.mock import ANY, MagicMock, Mock, patch, mock_open
+
+import wasi_test_runner.test_suite as ts
+import wasi_test_runner.test_case as tc
+import wasi_test_runner.test_suite_runner as tsr
+from wasi_test_runner.runtime_adapter import RuntimeMeta
+
+
+def get_mock_open() -> Mock:
+    def open_mock(filename: str, *_args: Any, **_kwargs: Any) -> Any:
+        file_content = {
+            "my-path/manifest.json": '{"name": "test-suite"}',
+            "my-path/test1.json": '{"root": "deep/dir"}',
+            "my-path/test2.json": '{"exit_code": 1, "args": ["a", "b"]}',
+            "my-path/test3.json": '{"stdout": "output", "env": {"x": "1"}}',
+            "my-path/test4.json": (
+                '{"operations": [{"type": "run"}, {"type": "wait", "exit_code": 1}], '
+                '"proposals": [], '
+                '"world": "wasi:http/service"}'
+            ),
+        }
+        if filename in file_content:
+            return mock_open(read_data=file_content[filename]).return_value
+
+        raise FileNotFoundError(f"(mock) Unable to open {filename}")
+
+    return MagicMock(side_effect=open_mock)
+
+
+def test_join_http_url_preserves_single_root_slash() -> None:
+    assert tsr.join_http_url("http://127.0.0.1:1234/", "/") == "http://127.0.0.1:1234/"
+
+
+def test_join_http_url_joins_paths() -> None:
+    assert tsr.join_http_url("http://127.0.0.1:1234/", "/foo") == "http://127.0.0.1:1234/foo"
+    assert tsr.join_http_url("http://127.0.0.1:1234", "foo") == "http://127.0.0.1:1234/foo"
+
+
+# pylint: disable-msg=too-many-locals
+@patch("builtins.open", get_mock_open())
+@patch("os.path.exists", Mock(return_value=True))
+@patch("pathlib.Path.exists", Mock(return_value=True))
+def test_runner_end_to_end() -> None:
+    test_suite_dir = "my-path"
+    test_suite_name = "test-suite"
+    test_files = ["test1.wasm", "test2.wasm", "test3.wasm", "test4.wasm"]
+    test_paths = [Path(test_suite_dir) / f for f in test_files]
+
+    test_root = "deep/dir"
+    runtime_name = "rt1"
+
+    expected_argv = [runtime_name, "<test>"]
+    expected_results = [
+        tc.Result(True, []),
+        tc.Result(True, [ANY]),
+        tc.Result(True, [ANY, ANY]),
+        tc.Result(True, [ANY])
+    ]
+    expected_config = [
+        tc.Config(
+            operations=[
+                tc.Run(root=Path(test_suite_dir) / test_root),
+                tc.Wait(exit_code=0)
+            ],
+            proposals=[],
+            world=tc.WasiWorld.CLI_COMMAND
+        ),
+        tc.Config(
+            operations=[tc.Run(args=["a", "b"]), tc.Wait(exit_code=1)],
+            proposals=[],
+            world=tc.WasiWorld.CLI_COMMAND
+        ),
+        tc.Config(
+            operations=[tc.Run(env={"x": "1"}), tc.Read(id="stdout", payload="output"), tc.Wait(exit_code=0)],
+            proposals=[],
+            world=tc.WasiWorld.CLI_COMMAND
+        ),
+        tc.Config(
+            operations=[tc.Run(), tc.Wait(exit_code=1)],
+            proposals=[],
+            world=tc.WasiWorld.HTTP_SERVICE
+        ),
+    ]
+
+    runtime_version_str = "4.2"
+    the_runtime_wasi_version = tc.WasiVersion.WASM32_WASIP1
+    runtime_wasi_versions = frozenset([the_runtime_wasi_version])
+    runtime_wasi_worlds = frozenset([tc.WasiWorld.CLI_COMMAND])
+    runtime_meta = RuntimeMeta(runtime_name, runtime_version_str,
+                               runtime_wasi_versions,
+                               runtime_wasi_worlds)
+
+    expected_test_suite_meta = ts.TestSuiteMeta(test_suite_name,
+                                                the_runtime_wasi_version,
+                                                runtime_meta)
+
+    expected_outcomes = [tc.Outcome.PASS, tc.Outcome.FAIL, tc.Outcome.FAIL, tc.Outcome.FAIL]
+    expected_test_cases = [
+        tc.TestCase(test_name, expected_argv, config, result, ANY, outcome)
+        for config, test_name, result, outcome in zip(
+            expected_config, ["test1", "test2", "test3", "test4"],
+            expected_results, expected_outcomes
+        )
+    ]
+
+    runtime = Mock()
+    runtime.get_name.return_value = runtime_name
+    runtime.get_meta.return_value = runtime_meta
+    runtime.compute_argv.return_value = expected_argv
+
+    reporters = [Mock(), Mock()]
+
+    filt = Mock()
+    filt.should_skip.return_value = (False, None)
+    filt.expected_to_fail.return_value = False
+    filters = [filt]
+
+    process = Mock()
+    process.stdin = mock_open().return_value
+    process.stdout = mock_open(read_data='').return_value
+    process.stderr = mock_open(read_data='').return_value
+    process.returncode = 0
+    process.communicate.return_value = ('', '')
+
+    with (patch("glob.glob", return_value=[str(p) for p in test_paths]),
+          patch("wasi_test_runner.test_suite_runner._cleanup_test_output"),
+          patch("subprocess.Popen", return_value=process)):
+        suite = tsr.run_tests_from_test_suite(test_suite_dir, runtime,
+                                              reporters,   # type: ignore
+                                              filters)     # type: ignore
+
+    # Assert manifest was read correctly
+    assert suite.meta == expected_test_suite_meta
+
+    # Assert test cases
+    assert suite.test_count == 4
+    assert suite.test_cases == expected_test_cases
+
+    # Assert test runner calls
+    assert process.communicate.call_count == 4
+
+    # Assert reporters calls
+    for reporter in reporters:
+        assert reporter.report_test.call_count == 4
+        for test_case in expected_test_cases:
+            reporter.report_test.assert_any_call(expected_test_suite_meta,
+                                                 test_case)
+
+    # Assert filter calls
+    for filt in filters:
+        assert filt.should_skip.call_count == 4
+        for test_case in expected_test_cases:
+            filt.should_skip.assert_any_call(expected_test_suite_meta,
+                                             test_case.name,
+                                             test_case.config)
+
+
+@patch("os.path.exists", Mock(return_value=False))
+def test_runner_should_use_path_for_name_if_manifest_does_not_exist() -> None:
+    suite = tsr.run_tests_from_test_suite("my-path", Mock(), [], [])
+
+    assert suite.meta.name == "my-path"
+
+
+def _serve_one_request(endpoint: tc.Endpoint, request: bytes) -> bytes:
+    # The endpoint server is private to the runner; these tests drive it over a
+    # real socket because its parsing is the thing under test.
+    # pylint: disable-msg=protected-access
+    server = tsr._EndpointServer(("127.0.0.1", 0), tsr._EndpointRequestHandler)
+    server.routes[(endpoint.method, endpoint.path)] = endpoint
+    host, port = server.server_address
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with socket.create_connection((host, port)) as sock:
+            sock.sendall(request)
+            sock.shutdown(socket.SHUT_WR)
+            received = b""
+            while chunk := sock.recv(4096):
+                received += chunk
+        return received
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_endpoint_server_reads_chunked_body_and_trailers() -> None:
+    endpoint = tc.Endpoint.from_config(
+        {"method": "POST", "path": "/echo", "mode": "echo-headers"})
+    response = _serve_one_request(endpoint, (
+        b"POST /echo HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"4\r\nping\r\n"
+        b"5;ext=1\r\n-pong\r\n"
+        b"0\r\n"
+        b"x-checksum: abc123\r\n"
+        b"\r\n"
+    )).decode("utf-8")
+
+    assert "x-trailer-x-checksum: abc123" in response
+    assert "x-echo-transfer-encoding: chunked" in response
+
+
+def test_endpoint_server_echoes_chunked_body() -> None:
+    endpoint = tc.Endpoint.from_config(
+        {"method": "POST", "path": "/echo", "mode": "echo-body"})
+    response = _serve_one_request(endpoint, (
+        b"POST /echo HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"4\r\nping\r\n"
+        b"5\r\n-pong\r\n"
+        b"0\r\n"
+        b"\r\n"
+    )).decode("utf-8")
+
+    assert response.endswith("ping-pong")
+
+
+def test_endpoint_server_sends_chunked_response_with_trailers() -> None:
+    endpoint = tc.Endpoint.from_config({
+        "method": "GET", "path": "/chunked",
+        "response": {"status": 200, "chunks": ["one", "two"],
+                     "trailers": {"x-checksum": "abc"}},
+    })
+    response = _serve_one_request(endpoint, (
+        b"GET /chunked HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    )).decode("utf-8")
+
+    assert "Transfer-Encoding: chunked" in response
+    assert "Trailer: x-checksum" in response
+    assert "Content-Length" not in response
+    # Two chunks, the terminating chunk, then the trailer section.
+    assert "3\r\none\r\n3\r\ntwo\r\n0\r\nx-checksum: abc\r\n\r\n" in response

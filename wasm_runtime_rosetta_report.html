@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>参考 Rosetta 思路自研高效 WASM 运行时 · 技术评估报告</title>
+<style>
+  :root{
+    --ink:#1f2329; --ink-2:#3b4252; --muted:#6b7280;
+    --line:#e5e7eb; --bg:#ffffff; --bg-soft:#f7f8fa;
+    --accent:#1f4e79; --accent-soft:#eaf1f8;
+    --warn:#9a3412; --good:#0f5132;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;color:var(--ink);background:#fafbfc;line-height:1.65;font-size:15.5px}
+  .wrap{max-width:1100px;margin:0 auto;padding:48px 56px;background:var(--bg);box-shadow:0 0 24px rgba(0,0,0,.04)}
+  header.masthead{border-bottom:3px solid var(--accent);padding-bottom:20px;margin-bottom:28px}
+  header.masthead h1{margin:0 0 8px;font-size:28px;color:var(--accent);letter-spacing:.5px}
+  header.masthead .meta{color:var(--muted);font-size:13.5px}
+  h2{font-size:21px;color:var(--accent);border-left:4px solid var(--accent);padding-left:10px;margin-top:42px}
+  h3{font-size:17px;color:var(--ink-2);margin-top:26px}
+  h4{font-size:15.5px;color:var(--ink-2);margin-top:18px;margin-bottom:6px}
+  p{margin:10px 0}
+  sup.ref{color:var(--accent);font-weight:600;font-size:11px;padding:0 1px;cursor:help}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.8px}
+  th,td{border:1px solid var(--line);padding:8px 10px;vertical-align:top;text-align:left}
+  th{background:var(--accent-soft);color:var(--accent);font-weight:600}
+  tr:nth-child(even) td{background:#fbfcfe}
+  code{background:#f1f3f5;padding:1px 5px;border-radius:3px;font-family:"SF Mono",Menlo,Consolas,monospace;font-size:13px;color:#b03060}
+  .callout{background:var(--bg-soft);border-left:3px solid var(--accent);padding:12px 16px;margin:14px 0;border-radius:0 6px 6px 0}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;font-weight:600}
+  .tag.yes{background:#dcfce7;color:#166534}
+  .tag.no{background:#fee2e2;color:#991b1b}
+  .tag.part{background:#fef3c7;color:#92400e}
+  figure{margin:18px 0;text-align:center}
+  figcaption{color:var(--muted);font-size:13px;margin-top:6px}
+  .refs{font-size:12.5px;line-height:1.55}
+  .refs ol{padding-left:22px}
+  .refs li{margin-bottom:3px;word-break:break-all}
+  .toc{background:var(--bg-soft);border:1px solid var(--line);padding:14px 22px;border-radius:6px;font-size:14px}
+  .toc ol{margin:6px 0;padding-left:22px}
+  .toc a{color:var(--ink-2);text-decoration:none}
+  .toc a:hover{color:var(--accent)}
+  ul,ol{padding-left:24px}
+  li{margin:3px 0}
+  .footer{margin-top:48px;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="masthead">
+  <h1>参考 Rosetta 2 思路自研高效 WASM 运行时</h1>
+  <div class="meta">技术评估与架构方案报告 · 2026-09-21 · 面向内部技术评审</div>
+</header>
+
+<nav class="toc">
+<b>目录</b>
+<ol>
+  <li><a href="#s1">背景与目标</a></li>
+  <li><a href="#s2">WASM 运行时全景与对比</a></li>
+  <li><a href="#s3">WASM 语义与提案现状</a></li>
+  <li><a href="#s4">Rosetta 2 技术拆解</a></li>
+  <li><a href="#s5">DBT 经典：QEMU / Dynamo / Transmeta</a></li>
+  <li><a href="#s6">Rosetta → WASM 可迁移手法清单</a></li>
+  <li><a href="#s7">自研运行时架构方案</a></li>
+  <li><a href="#s8">关键技术难点与对策</a></li>
+  <li><a href="#s9">里程碑与人力预估</a></li>
+  <li><a href="#s10">风险与未决问题</a></li>
+  <li><a href="#s11">参考资料</a></li>
+</ol>
+</nav>
+
+<h2 id="s1">1. 背景与目标</h2>
+<p>Wasm 3.0 已于 2025-09-17 完成标准化<sup class="ref">[5]</sup>，GC / Tail Call / Typed Funcref / Multimemory / Relaxed SIMD / Memory64 / EH 一并固化<sup class="ref">[6]</sup>。Wasm 已经从"浏览器里的 C++ 加速沙箱"演进为可承载 serverless、多租户插件、嵌入式与 TEE 的通用部署单元。但在自研产品线中直接引入 V8 / Wasmtime / WAMR，仍有三类不匹配：</p>
+<ul>
+  <li><b>V8</b>：全量约 50MB+<sup class="ref">[36]</sup>，授权 BSD-3 但工程体量大，与浏览器强绑定；</li>
+  <li><b>Wasmtime + Cranelift</b>：Rust 编写、server-side 标杆<sup class="ref">[37][38]</sup>，但 Winch 仍在补全、WasmGC 路线图未完成，对我们关心的 warmup 与嵌入尺寸控制不如 WAMR；</li>
+  <li><b>WAMR</b>：极致小体积（AOT VMCore 50K、hello-world 16K DRAM<sup class="ref">[45][46]</sup>），但峰值优化靠外部 LLVM，自家中控能力弱。</li>
+</ul>
+<p>本报告要回答的工程问题：<b>能否借鉴 Apple Rosetta 2 在 2020 年用"近似一对一翻译 + AOT 落盘 + 硬件红利"把跨 ISA 翻译做到接近原生的思路，自研一个"小体积 + 快 warmup + 可控 tier-up + 可嵌入自家产品"的 Wasm 运行时？哪些 Rosetta 手法可以直接搬，哪些必须用软件等价物替代？</b></p>
+
+<h2 id="s2">2. WASM 运行时全景与对比</h2>
+
+<h3>2.1 二进制格式与校验</h3>
+<p>Wasm 模块由类型段、导入段、函数、表、内存、全局、导出等 section 组成，section 以单字节 ID + LEB128 长度编码<sup class="ref">[1]</sup>。函数体是栈式字节码——这一形态决定了所有后端的输入：Liftoff 维护虚拟操作数栈镜像，Cranelift 直接 SSA lowering<sup class="ref">[36][37]</sup>。校验器以类型化栈机逐条指令检查，所有越界访问与类型混淆在校验期拒绝，运行时只剩 bounds check 一类 trap<sup class="ref">[2][104]</sup>。</p>
+
+<h3>2.2 分层编译范式</h3>
+<p>工业界收敛为四层：解释器（零编译、慢 10~50×）→ baseline JIT（单趟、线性时间）→ 优化 JIT（SSA / sea-of-nodes）→ AOT（部署期完成编译）<sup class="ref">[36][37]</sup>。最成熟方案是组合：V8 = Liftoff + TurboFan/Turboshaft；Wasmtime = Winch + Cranelift；WAMR = fast-interpreter / AOT + Fast-JIT + LLVM-JIT<sup class="ref">[43]</sup>；JSC = IPInt + BBQ + OMG/B3<sup class="ref">[51][53]</sup>。</p>
+
+<figure>
+<svg viewBox="0 0 960 260" width="100%" style="max-width:960px">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f4e79"/>
+    </marker>
+  </defs>
+  <!-- axis -->
+  <line x1="60" y1="220" x2="920" y2="220" stroke="#999" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="920" y="240" font-size="12" fill="#666">时间 / warmup →</text>
+  <line x1="60" y1="220" x2="60" y2="30" stroke="#999" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="20" y="40" font-size="12" fill="#666" transform="rotate(-90 20,130)">吞吐</text>
+
+  <!-- interpreter line -->
+  <line x1="70" y1="180" x2="900" y2="180" stroke="#9a3412" stroke-width="2" stroke-dasharray="6,3"/>
+  <text x="80" y="175" font-size="12" fill="#9a3412">纯解释器（恒定低吞吐）</text>
+
+  <!-- baseline -->
+  <path d="M70,200 L200,200 L230,150 L900,150" stroke="#1f4e79" stroke-width="2.2" fill="none"/>
+  <text x="240" y="145" font-size="12" fill="#1f4e79">Baseline JIT（Liftoff / Winch / Fast JIT）</text>
+
+  <!-- optimizing -->
+  <path d="M70,200 L300,200 L360,80 L900,80" stroke="#0f5132" stroke-width="2.2" fill="none"/>
+  <text x="400" y="75" font-size="12" fill="#0f5132">Optimizing JIT（TurboFan / Cranelift / LLVM-JIT）</text>
+
+  <!-- AOT -->
+  <line x1="70" y1="95" x2="900" y2="95" stroke="#7c3aed" stroke-width="2" stroke-dasharray="2,3"/>
+  <text x="750" y="90" font-size="12" fill="#7c3aed">AOT（首次即近峰值）</text>
+
+  <!-- markers -->
+  <circle cx="230" cy="150" r="4" fill="#1f4e79"/>
+  <text x="200" y="215" font-size="11" fill="#666">~几十 ms</text>
+  <circle cx="360" cy="80" r="4" fill="#0f5132"/>
+  <text x="320" y="215" font-size="11" fill="#666">~百 ms ~秒级</text>
+</svg>
+<figcaption>图 2-1　四层编译范式的 warmup 与吞吐曲线（示意，非实测）</figcaption>
+</figure>
+
+<h3>2.3 主流引擎逐一拆解</h3>
+<ul>
+  <li><b>V8 Liftoff + TurboFan/Turboshaft</b>：Liftoff 出码比 TurboFan 快约 10×、代码慢约 4×，70MB 模块启动压到 1~2 秒<sup class="ref">[36][63]</sup>。Wasm 管线已整体迁移到 Turboshaft（CFG-based、phase pipeline），取代历史上的 Sea-of-Nodes<sup class="ref">[60][62]</sup>。</li>
+  <li><b>Wasmtime + Cranelift + Winch</b>：Cranelift 是 Rust 写的"快到够用"后端，输出比 V8 TurboFan 慢约 2%、比 LLVM 慢约 14%<sup class="ref">[38]</sup>。指令选择用声明式 DSL <b>ISLE</b>，寄存器分配用 regalloc2<sup class="ref">[61][69]</sup>。2023 年 CVE 后把 ISLE 用作可验证指令选择基础<sup class="ref">[68]</sup>。Winch 是单趟 baseline<sup class="ref">[37]</sup>，Pulley 是不支持 JIT 平台的解释器后端<sup class="ref">[102]</sup>。</li>
+  <li><b>WAMR</b>：C 编写，四后端可组合（classic / fast interpreter / Fast JIT / LLVM JIT），wamrc 产 .aot 包，VMCore 50K(AOT) / 80K(解释器)，hello-world 低至 16K DRAM<sup class="ref">[43][44][45]</sup>。</li>
+  <li><b>Wasmer 三后端</b>：Singlepass 单趟无优化（qjs.wasm 102ms）、Cranelift（295ms）、LLVM（近原生、比另两者快约 50%）<sup class="ref">[47][49][48]</sup>。Singlepass 同时抗 JIT-bomb，适合区块链。</li>
+  <li><b>JSC BBQ + OMG / B3</b>：BBQ 是 baseline、OMG 是优化层、B3 是后端；Bun 冷启动 ~8ms vs Node ~45ms<sup class="ref">[51][53][65]</sup>。</li>
+  <li><b>Wasmi</b>：纯 Rust 解释器，2.0 用手写汇编 tail-call dispatch 快约 2.2×，无 JIT、可跑在禁止 JIT 环境<sup class="ref">[56][57][66]</sup>。</li>
+</ul>
+
+<h3>2.4 引擎对比表</h3>
+<table>
+<thead><tr><th>引擎</th><th>编译后端</th><th>Warmup</th><th>峰值吞吐</th><th>AOT</th><th>嵌入式占用</th><th>GC</th><th>SIMD</th><th>授权</th><th>典型场景</th></tr></thead>
+<tbody>
+<tr><td><b>V8</b></td><td>Liftoff + TurboFan/Turboshaft<sup class="ref">[36]</sup></td><td>极快：出码比 TF 快 ~10×<sup class="ref">[36]</sup></td><td>参考线</td><td>不直接暴露（快照替代）</td><td>大（全量 50MB+）</td><td>WasmGC 已落地<sup class="ref">[59]</sup></td><td>完整 GA</td><td>BSD-3</td><td>Chrome / Node / Deno / Cloudflare Workers</td></tr>
+<tr><td><b>Wasmtime</b></td><td>Cranelift + Winch + Pulley<sup class="ref">[37]</sup></td><td>快：Winch 单趟</td><td>比 V8 慢 ~2%、比 LLVM 慢 ~14%<sup class="ref">[38]</sup></td><td>原生 cranelift-object<sup class="ref">[41]</sup></td><td>中（数 MB）</td><td>路线图</td><td>完整</td><td>Apache-2.0</td><td>Fastly Compute / Spin / Shopify Functions</td></tr>
+<tr><td><b>WAMR</b></td><td>解释器 + Fast JIT + LLVM JIT + wamrc<sup class="ref">[43]</sup></td><td>解释器零编译；AOT 运行时零编译</td><td>AOT/LLVM 近原生</td><td>原生 .aot + mini-C runtime<sup class="ref">[45]</sup></td><td>极小：50K/80K、16K DRAM<sup class="ref">[44][46]</sup></td><td>路线图</td><td>部分</td><td>Apache-2.0</td><td>ESP32 / SGX / TEE / MCU</td></tr>
+<tr><td><b>Wasmer</b></td><td>Singlepass / Cranelift / LLVM<sup class="ref">[47]</sup></td><td>Singlepass 102ms / Cranelift 295ms<sup class="ref">[49]</sup></td><td>LLVM 比另两者快 ~50%<sup class="ref">[48]</sup></td><td>原生 wasmer compile</td><td>中</td><td>路线图</td><td>完整</td><td>MIT</td><td>多语言 SDK / 区块链 / Edge</td></tr>
+<tr><td><b>JSC</b></td><td>IPInt + BBQ + OMG + B3<sup class="ref">[51]</sup></td><td>快：Bun ~8ms vs Node ~45ms<sup class="ref">[65]</sup></td><td>略低于 V8，启动/内存更优<sup class="ref">[55]</sup></td><td>不直接暴露</td><td>中（单文件分发）</td><td>跟进中<sup class="ref">[53]</sup></td><td>完整</td><td>LGPL-2.1</td><td>Safari / Bun / Apple 系</td></tr>
+<tr><td><b>Wasmi</b></td><td>纯解释器，无 JIT<sup class="ref">[56]</sup></td><td>零编译、确定性</td><td>2.0 比旧版快 ~2.2×<sup class="ref">[57]</sup></td><td>不支持</td><td>极小（no_std）</td><td>tracking</td><td>有限</td><td>Apache-2.0</td><td>iOS 沙盒 / 合约解释</td></tr>
+</tbody>
+</table>
+
+<h3>2.5 工业界实战</h3>
+<ul>
+  <li><b>Cloudflare Workers</b>：跑 V8 Isolate，单 runtime 可跑数千 isolate，比容器快 ~100×、省 10~100× 内存<sup class="ref">[71][72]</sup>。Python Workers 用 Wizer 思路拍线性内存快照<sup class="ref">[73]</sup>；GC 调优后 CPU 基准 +25%<sup class="ref">[74]</sup>。</li>
+  <li><b>Fastly Lucet → Wasmtime</b>：Lucet 主打 AOT，实例化 34~35µs<sup class="ref">[75][83]</sup>；2020 年并入 Wasmtime<sup class="ref">[76]</sup>，今天 Fastly Compute 仍亚毫秒冷启动<sup class="ref">[77]</sup>。</li>
+  <li><b>Shopify Functions</b>：跑在 Wasmtime 沙箱里，每函数 5ms 硬预算、每日数百万次、中位延迟亚毫秒<sup class="ref">[77][84]</sup>。</li>
+  <li><b>Deno / Bun</b>：Deno 默认安全、宿主权限模型 + OS 级 defense-in-depth<sup class="ref">[78][79][80]</sup>；Bun 选 JSC 是为启动与单文件分发<sup class="ref">[55]</sup>。</li>
+</ul>
+
+<h2 id="s3">3. WASM 语义与提案现状</h2>
+<p>Wasm CG 采用 phase 0~5 流程。<b>Wasm 3.0 于 2025-09-17 完成</b><sup class="ref">[5]</sup>，已固化的特性<sup class="ref">[6][7]</sup>：</p>
+<table>
+<thead><tr><th>特性</th><th>状态</th><th>对自研运行时的意义</th></tr></thead>
+<tbody>
+<tr><td>WasmGC（struct/array/i31ref/anyref）</td><td>Phase 4 → 3.0<sup class="ref">[8]</sup></td><td>跑 Kotlin/Wasm / Flutter Wasm 必做；只跑 C/C++ 可后置</td></tr>
+<tr><td>Tail Call（return_call*）</td><td>Phase 4 → 3.0<sup class="ref">[10]</sup></td><td>成本低（一条 JMP），但影响栈遍历与 GC root 枚举，建议早做</td></tr>
+<tr><td>Typed Funcref / call_ref</td><td>Phase 4 → 3.0<sup class="ref">[15][27]</sup></td><td>call_ref 可 lower 成单态直接调用，是去虚化与 PGO 基础</td></tr>
+<tr><td>Multimemory</td><td>Phase 4 → 3.0<sup class="ref">[17]</sup></td><td>ABI 加 memory id 字段，中期做</td></tr>
+<tr><td>Relaxed SIMD</td><td>Phase 4 → 3.0<sup class="ref">[12]</sup></td><td>需在 AOT 时绑定一套具体 lowerings，先固定一种</td></tr>
+<tr><td>Memory64</td><td>Phase 4 → 3.0<sup class="ref">[14][28]</sup></td><td>服务器/大模型推理刚需；SpiderMonkey 实测不一定更快<sup class="ref">[58]</sup></td></tr>
+<tr><td>Exception Handling（try_table）</td><td>Phase 4 → 3.0<sup class="ref">[9][29]</sup></td><td>C++ Itanium / Rust panic=unwind 依赖；中期必做</td></tr>
+<tr><td>Threads / Atomics</td><td>Phase 4，仍未合并入主 spec<sup class="ref">[13][7]</sup></td><td>多线程 C++/Rust（rayon/tokio）刚需；需 pthread 与 futex 抽象</td></tr>
+<tr><td>Component Model</td><td>Phase 1<sup class="ref">[19][32]</sup></td><td>本质是 ABI 包装层，后期外挂，不进 core 编译器</td></tr>
+<tr><td>Shared-Everything Threads</td><td>Phase 1<sup class="ref">[16][35]</sup></td><td>现在不做，但 GC 设计要预留跨线程指针假设</td></tr>
+<tr><td>Stack Switching / ESM Integration</td><td>Phase 3<sup class="ref">[20][18]</sup></td><td>异步运行时需要协程；embedder 层为主</td></tr>
+</tbody>
+</table>
+<div class="callout">
+<b>自研运行时优先级清单：</b><br>
+<b>必做（MVP+2.0 已合并项）</b>：reference types、bulk memory、fixed-width SIMD、multi-value、sign extension、non-trapping conversions、typed funcref、tail call、memory64、atomics/shared memory。<br>
+<b>第二批</b>：WasmGC、EH、Multimemory、Stack Switching。<br>
+<b>后置/外挂</b>：Relaxed SIMD（先锁一套 lowering）、Component Model、Shared-Everything Threads、FP16、Wide Arithmetic。
+</div>
+
+<h2 id="s4">4. Rosetta 2 技术拆解</h2>
+<p>本章严格区分<b>Apple 官方白皮书可证</b>与<b>社区逆向（dougallj、FFRI 等）推断</b>两类来源。</p>
+
+<h3>4.1 官方路径：AOT 整段翻译落盘 + 运行时 JIT fallback</h3>
+<p><b>【官方】</b>内核在镜像执行早期识别 x86_64 Mach-O，把控制权交给 Rosetta translation stub；AOT 路径下翻译产物以"特殊 Mach-O"形式落盘，由特权用户态实体用 Secure Enclave 管理的设备特定密钥做 supplemental signature，存放在 Data Vault，除 Rosetta 服务外任何实体无法访问<sup class="ref">[106]</sup>。Apple 明确：<b>Rosetta AOT 翻译是确定性的</b>——同一输入在任何设备上翻译结果一致<sup class="ref">[106]</sup>。arm64 与 x86_64 不能在同一进程混用<sup class="ref">[105]</sup>。</p>
+<p><b>【社区分析/未官方确认】</b>FFRI 逆向确认安装目录 <code>/Library/Apple/usr/libexec/oah/</code> 含 <code>oahd</code> / <code>runtime</code> / <code>runtime_t8027</code> / <code>translate_tool</code><sup class="ref">[108]</sup>；AOT 产物落在 <code>/var/db/oah/&lt;hash1&gt;/&lt;hash2&gt;/&lt;name&gt;.out.aot</code>，两段 hash 来自时间戳/文件头/路径组合——这正是 Black Hat Asia 2023《Dirty Bin Cache》披露的缓存投毒面<sup class="ref">[109]</sup>。Google CTI 独立确认该目录可作为取证证据<sup class="ref">[110]</sup>。</p>
+
+<h3>4.2 近似一对一翻译与 canonical 状态</h3>
+<p><b>【社区分析/未官方确认】</b>dougallj 2022 年基于 AOT 二进制静态阅读得出<sup class="ref">[111]</sup>：</p>
+<ul>
+  <li>整个 text 段一次性 AOT 翻译，而不是按执行流逐块翻译——牺牲冷代码翻译时间，换热代码 i-cache 局部性；</li>
+  <li>通常近似一对一：每条 x86 指令翻成一到多条 ARM 指令；间接跳转落到 text 段任意偏移时，用 x86→ARM 查找表定位，miss 才回 JIT；</li>
+  <li>为精确异常、profiling 与 LLDB，维护 ARM→x86 地址映射，并保证<b>每条指令之间状态 canonical</b>——这几乎禁止跨指令优化，仅两个例外：unused-flags 优化、函数 prologue/epilogue 合并；</li>
+  <li>sqlite3 实测展开率约 <b>1.64×</b>（x86 1.05MB → ARM 1.72MB）；</li>
+  <li>返回地址预测：CALL/RET 重写成 ARM BL/RET，把"期望 x86 返回地址 + 翻译后跳转目标"成对压在特殊栈上，让 host RAS 继续正确预测。</li>
+</ul>
+
+<h3>4.3 硬件红利：寄存器、FEAT_AFP / FlagM / TSO</h3>
+<p><b>【社区分析/未官方确认】</b>这是 Rosetta 比 QEMU TCG 快一大截的硬件级原因<sup class="ref">[111]</sup>：</p>
+<ul>
+  <li><b>寄存器红利</b>：x86_64 只有 16 个 GPR，ARM64 有 31 个，所有 guest 寄存器可全部常驻 host 寄存器，基本块出入口无需 guest 状态 load/store；</li>
+  <li><b>FEAT_FlagM / FlagM2</b>：<code>CFINV</code> 处理借位/进位语义相反、<code>RMIF</code> 把位移入 CF、<code>SETF8/16</code> 模拟 8/16 位保留高位、<code>AXFLAG/XAFLAG</code> 在 FPSR 与"恰好就是 x86"的外部格式间转换；</li>
+  <li><b>未公开扩展</b>：M1 有未文档化扩展让 <code>ADDS/SUBS/CMP</code> 额外计算 PF、AF；</li>
+  <li><b>FEAT_AFP</b>（ARMv8.7 才标准化，M1 设计更早）：让 ARM alternate FP behavior 恰好匹配 x86；</li>
+  <li><b>TSO 扩展</b>：x86 是 Total Store Order，普通 ARM 是弱序；M1 开启 TSO 后普通 load/store 即有 x86 序保证，省掉 DBT 中最昂贵的 fence 插入。</li>
+</ul>
+
+<h3>4.4 ABI / syscall / ObjC thunking 与 SMC 检测</h3>
+<p>syscall 指令翻译为 runtime 支持函数调用，由 runtime 用 ARM64 原生 syscall 触发并做 ABI 转换；外部函数走 <code>__stubs_sh</code> 桩 + <code>resolve_x64_addr</code> 红黑树懒绑定<sup class="ref">[108][111]</sup>。SMC：<b>【官方】</b>JIT 路径下内核在每个 x86_64 页换入时校验代码哈希<sup class="ref">[106]</sup>；<b>【社区】</b>DynamoRIO 在 AArch64 上的做法是 mangle <code>IC IALLUIS</code>/<code>IC IVAU</code> 指令，检测到 icache flush 即 invalidate 对应 fragment<sup class="ref">[113]</sup>。</p>
+
+<h3>4.5 Warmup 曲线</h3>
+<p><b>【官方】</b>AOT 翻译发生在"系统认为对该代码响应性最优的时机"，是确定性的、可缓存的<sup class="ref">[106]</sup>。<b>【社区】</b>M1 首批评测：Geekbench 5 单核约为原生 arm64 的 60%~74%<sup class="ref">[114][115][116]</sup>；CPU-bound 约 70%~90% 原生、memory-bound 80%~95%、I/O-bound 几乎无损、GPU/Metal 70%~80%<sup class="ref">[117]</sup>。CodeGenes 总结：核心是"静态翻译为主 + 动态补丁为辅"<sup class="ref">[118]</sup>。</p>
+
+<h2 id="s5">5. DBT 经典：QEMU TCG / HP Dynamo / Transmeta / DynamoRIO</h2>
+<ul>
+  <li><b>QEMU TCG</b>：Translation Block 一次翻一个 guest 基本块输出 TCG IR；<code>tb_set_jmp_target()</code> 原子 patch 直接跳转做 TB chaining——这是性能命门，避免每个 TB 出口都回主循环查 hash 表<sup class="ref">[119][121][122]</sup>。多线程用无锁 radix tree + cmpxchg。</li>
+  <li><b>HP Dynamo（PLDI 2000）</b>：在 HP PA-8000 上把原生 PA-RISC 再翻译一遍，用 <b>NEXT（Next Executing Tail）</b>算法动态选 trace；trace 内联 + code cache 重排 + 跨块常量传播让 SPECint 上有可见加速——DBT 历史上罕见地"超过原生"<sup class="ref">[124][125][126]</sup>。代价是 warmup：短生命周期程序反而变慢。</li>
+  <li><b>DynamoRIO</b>：同时维护 basic block cache 与 trace cache；trace head 计数超阈值后记录新 trace，side exit 回 dispatch；<code>dr_flush_region()</code> 失效某段翻译<sup class="ref">[127][128]</sup>。</li>
+  <li><b>Transmeta Crusoe</b>：第一个量产 x86→VLIW 软件翻译。CMS = 解释器 + runtime + DBT；shadowed registers + gated store buffer 支持激进重排后精确异常回滚；硬件 alias 检测判断 load/store 重排合法性<sup class="ref">[129][130][131]</sup>。Efficeon 把 VLIW 宽度从 4 操作扩到 8<sup class="ref">[132]</sup>。</li>
+</ul>
+<div class="callout">
+<b>共同命门：chaining。</b>QEMU 的 <code>tb_set_jmp_target</code>、DynamoRIO 的 trace 内联、Rosetta 的直接 BL + 查找表，本质都是把"每个块出口回 dispatch 查表"这条慢路径在热路径上 patch 成直接跳转。没有 chaining，基本块 dispatch 开销会吃掉所有其他优化。
+</div>
+
+<h2 id="s6">6. Rosetta → WASM 可迁移手法清单（核心表）</h2>
+<p>下表对每个手法给出"能搬 / 部分搬 / 不能搬"判断与理由。<b>三档判断依据</b>：WASM 跑在不可信沙箱里，没有内核权限、没有设备特定密钥、host ISA 也无 Rosetta 那种非标准扩展。</p>
+
+<table>
+<thead><tr><th style="width:14%">手法</th><th style="width:24%">Rosetta 怎么做</th><th style="width:10%">能否直接搬</th><th style="width:30%">WASM 里的软件等价物</th><th style="width:22%">代价 / 备注</th></tr></thead>
+<tbody>
+<tr><td><b>AOT 落盘缓存</b></td><td>整 text 段一次性翻完，<code>/var/db/oah/</code> 落盘，Secure Enclave 签名<sup class="ref">[106][108]</sup></td><td><span class="tag part">部分搬</span></td><td>模块级编译缓存（key = wasm 内容 hash + 后端版本 + CPU 特征），不带设备签名；Wasmtime <code>cranelift-object</code>、WAMR <code>wamrc</code> 已是范本<sup class="ref">[41][43]</sup></td><td>无可信根时缓存需自校验完整性；跨架构失效</td></tr>
+<tr><td><b>近似一对一翻译</b></td><td>每条 x86 → 1~多条 ARM，靠 31 GPR 全常驻<sup class="ref">[111]</sup></td><td><span class="tag yes">能搬</span></td><td>WASM 本就是结构化栈式字节码，baseline JIT 单趟 lowering 就是近似一对一（Liftoff/Winch）<sup class="ref">[36][37]</sup></td><td>无 guest/host 寄存器数量倒挂问题</td></tr>
+<tr><td><b>Canonical 状态（指令间可观测）</b></td><td>ARM→x86 地址映射 + 每指令间状态一致，支持 LLDB<sup class="ref">[111]</sup></td><td><span class="tag no">不能搬</span></td><td>WASM 调试只需字节码级 / 源码级映射，粒度更粗；保留偏移级 line table 即可</td><td>强行照搬会放弃跨指令优化空间</td></tr>
+<tr><td><b>寄存器红利</b></td><td>16 x86 GPR 全映射到 31 ARM64 GPR<sup class="ref">[111]</sup></td><td><span class="tag part">部分搬</span></td><td>WASM 有 20+ 虚拟寄存器，SSA 后由线性扫描 RA 分配；x64/ARM64 后端都够用，但 spilling 仍需控制</td><td>无"全常驻"红利，但也无倒挂</td></tr>
+<tr><td><b>硬件扩展贴 guest 语义</b></td><td>FEAT_AFP / FlagM / 未公开 PF/AF / TSO<sup class="ref">[111]</sup></td><td><span class="tag no">不能搬</span></td><td>WASM FP 语义本身固定，host 差异由引擎在 IR 层归一化（NaN payload、tininess）；内存模型走 C++ RC11 style，显式 barrier<sup class="ref">[33]</sup></td><td>付 helper / barrier 开销，但规范自洽</td></tr>
+<tr><td><b>Trace / superblock</b></td><td>社区未见显式 trace 优化，靠 AOT 局部性<sup class="ref">[111]</sup></td><td><span class="tag part">部分搬</span></td><td>hot loop 识别 + OSR + side exit；但 Wasm 静态类型、结构化 CFG，trace 收益低于 LuaJIT，主路径仍走 method JIT<sup class="ref">[97]</sup></td><td>仅对数值/循环密集负载值得做</td></tr>
+<tr><td><b>Chaining（跨块直接跳转）</b></td><td>AOT 内直接 BL；间接目标走查找表<sup class="ref">[111]</sup></td><td><span class="tag yes">能搬</span></td><td>call_ref/call_indirect 命中 hot target 后 patch 成直接跳转；TB chaining 同 QEMU<sup class="ref">[121]</sup></td><td>JIT 代码需可写可 patch</td></tr>
+<tr><td><b>Profile 触发 tier-up</b></td><td>未见公开；AOT 阶段确定性翻译<sup class="ref">[111]</sup></td><td><span class="tag yes">能搬</span></td><td>call counter + loop backedge counter；阈值参考 HotSpot ~10k、V8 Maglev ~500<sup class="ref">[88][93]</sup></td><td>计数器放热路径，零开销 decrement + 分支</td></tr>
+<tr><td><b>解释器 fallback</b></td><td>未见公开解释器；JIT 路径按页翻译<sup class="ref">[111]</sup></td><td><span class="tag yes">能搬</span></td><td>token-threaded 解释器（Wasmi 2.0 / WAMR fast interp）作为冷路径与未支持指令 fallback<sup class="ref">[57][43]</sup></td><td>禁止 JIT 环境也能跑</td></tr>
+<tr><td><b>SMC 检测</b></td><td>内核页哈希校验 + JIT 按需重译<sup class="ref">[106]</sup></td><td><span class="tag part">部分搬</span></td><td>WASM 规范禁止自修改 guest code；但 JIT 自身 deopt / OSR / reoptimization 等价于"让某段 mcode 失效"——用 DynamoRIO flush region 思路<sup class="ref">[113][127]</sup></td><td>无需内核配合</td></tr>
+<tr><td><b>返回地址预测重写</b></td><td>CALL/RET → BL/RET + 特殊栈对<sup class="ref">[111]</sup></td><td><span class="tag no">不能搬</span></td><td>WASM 函数调用本身就是 host 调用，直接用 host BL/RET，RAS 自然生效</td><td>无对应问题</td></tr>
+<tr><td><b>Code cache eviction</b></td><td>AOT 产物落盘 Data Vault，只读分发 fd<sup class="ref">[106]</sup></td><td><span class="tag part">部分搬</span></td><td>进程内 code cache 按 LRU / hotness eviction；落盘缓存按 LRU + 总量上限清理（参考 Dirty Bin Cache 教训，路径不可预测<sup class="ref">[109]</sup>）</td><td>不可信环境不能用设备签名</td></tr>
+<tr><td><b>PGO 回灌</b></td><td>Rosetta AOT 确定性、无运行时 profile<sup class="ref">[106]</sup></td><td><span class="tag yes">能搬</span></td><td>线上采样 edge/call/loop counter 落盘，下次启动直接驱动 AOT / 内联布局（JEP 544 范式<sup class="ref">[94]</sup>）</td><td>服务器场景必备</td></tr>
+</tbody>
+</table>
+
+<h2 id="s7">7. 自研运行时架构方案</h2>
+
+<h3>7.1 总体分层</h3>
+<figure>
+<svg viewBox="0 0 960 460" width="100%" style="max-width:960px">
+  <defs>
+    <marker id="arr2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#1f4e79"/>
+    </marker>
+  </defs>
+  <!-- embedder cross-cutting -->
+  <rect x="20" y="20" width="920" height="50" rx="6" fill="#eaf1f8" stroke="#1f4e79"/>
+  <text x="480" y="50" font-size="14" fill="#1f4e79" text-anchor="middle" font-weight="600">Embedder API / WASI / wasm-c-api / WasmGC 接口（横切层）</text>
+
+  <!-- row 1: decode+validate -->
+  <rect x="60" y="100" width="200" height="60" rx="6" fill="#fff" stroke="#1f4e79"/>
+  <text x="160" y="128" font-size="13" fill="#1f2329" text-anchor="middle">解码 + 校验</text>
+  <text x="160" y="146" font-size="11" fill="#666" text-anchor="middle">wasmparser 风格流式</text>
+
+  <rect x="300" y="100" width="200" height="60" rx="6" fill="#fff" stroke="#1f4e79"/>
+  <text x="400" y="128" font-size="13" fill="#1f2329" text-anchor="middle">Token-threaded 解释器</text>
+  <text x="400" y="146" font-size="11" fill="#666" text-anchor="middle">冷路径 / 禁 JIT 环境</text>
+
+  <rect x="540" y="100" width="200" height="60" rx="6" fill="#fff" stroke="#1f4e79"/>
+  <text x="640" y="128" font-size="13" fill="#1f2329" text-anchor="middle">Baseline JIT</text>
+  <text x="640" y="146" font-size="11" fill="#666" text-anchor="middle">单趟线性扫描，跳过 HIR</text>
+
+  <rect x="760" y="100" width="160" height="60" rx="6" fill="#fff" stroke="#1f4e79"/>
+  <text x="840" y="128" font-size="13" fill="#1f2329" text-anchor="middle">Profile 采样</text>
+  <text x="840" y="146" font-size="11" fill="#666" text-anchor="middle">call/edge/loop counter</text>
+
+  <!-- row 2: HIR/LIR/machine -->
+  <rect x="60" y="200" width="240" height="70" rx="6" fill="#f7f8fa" stroke="#0f5132"/>
+  <text x="180" y="226" font-size="13" fill="#0f5132" text-anchor="middle" font-weight="600">HIR（统一 SSA / sea-of-nodes）</text>
+  <text x="180" y="244" font-size="11" fill="#444" text-anchor="middle">GCM · BCE · 内联 · 逃逸分析</text>
+  <text x="180" y="258" font-size="11" fill="#444" text-anchor="middle">参考 Turboshaft / Cranelift</text>
+
+  <rect x="340" y="200" width="240" height="70" rx="6" fill="#f7f8fa" stroke="#0f5132"/>
+  <text x="460" y="226" font-size="13" fill="#0f5132" text-anchor="middle" font-weight="600">LIR + 指令选择</text>
+  <text x="460" y="244" font-size="11" fill="#444" text-anchor="middle">ISLE 风格重写规则（可选）</text>
+  <text x="460" y="258" font-size="11" fill="#444" text-anchor="middle">线性扫描寄存器分配</text>
+
+  <rect x="620" y="200" width="300" height="70" rx="6" fill="#f7f8fa" stroke="#0f5132"/>
+  <text x="770" y="226" font-size="13" fill="#0f5132" text-anchor="middle" font-weight="600">机器码 emit（x64 / ARM64 双后端）</text>
+  <text x="770" y="244" font-size="11" fill="#444" text-anchor="middle">code cache · trap stub · bounds check stub</text>
+  <text x="770" y="258" font-size="11" fill="#444" text-anchor="middle">可复用 Cranelift/LLVM 作为 backend</text>
+
+  <!-- row 3: runtime -->
+  <rect x="60" y="300" width="280" height="60" rx="6" fill="#fff" stroke="#7c3aed"/>
+  <text x="200" y="326" font-size="13" fill="#7c3aed" text-anchor="middle">内存沙箱：线性内存 + guard page</text>
+  <text x="200" y="344" font-size="11" fill="#666" text-anchor="middle">Table / funcref type check</text>
+
+  <rect x="360" y="300" width="280" height="60" rx="6" fill="#fff" stroke="#7c3aed"/>
+  <text x="500" y="326" font-size="13" fill="#7c3aed" text-anchor="middle">GC 接口预留</text>
+  <text x="500" y="344" font-size="11" fill="#666" text-anchor="middle">safepoint · 写屏障 · root 枚举</text>
+
+  <rect x="660" y="300" width="260" height="60" rx="6" fill="#fff" stroke="#7c3aed"/>
+  <text x="790" y="326" font-size="13" fill="#7c3aed" text-anchor="middle">AOT + code cache + PGO 回灌</text>
+  <text x="790" y="344" font-size="11" fill="#666" text-anchor="middle">产物带版本/CPU 特征校验</text>
+
+  <!-- arrows -->
+  <line x1="260" y1="130" x2="300" y2="130" stroke="#1f4e79" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <line x1="500" y1="130" x2="540" y2="130" stroke="#1f4e79" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <line x1="640" y1="160" x2="640" y2="195" stroke="#0f5132" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <line x1="300" y1="235" x2="340" y2="235" stroke="#0f5132" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <line x1="580" y1="235" x2="620" y2="235" stroke="#0f5132" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <line x1="770" y1="270" x2="770" y2="295" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arr2)"/>
+  <line x1="500" y1="270" x2="500" y2="295" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arr2)"/>
+
+  <!-- tier-up feedback -->
+  <path d="M840,160 C 840,380 400,380 400,270" stroke="#9a3412" stroke-width="1.5" fill="none" stroke-dasharray="5,3" marker-end="url(#arr2)"/>
+  <text x="620" y="395" font-size="11" fill="#9a3412" text-anchor="middle">tier-up：counter 超阈值 → 异步 HIR 重编译</text>
+</svg>
+<figcaption>图 7-1　自研运行时总体分层：解码/解释/baseline → HIR/LIR/机器码 → 运行时与 AOT 横切</figcaption>
+</figure>
+
+<h3>7.2 IR 选型：统一 SSA / sea-of-nodes，不走 trace JIT 为主路径</h3>
+<p><b>决策：优化层用统一 SSA / sea-of-nodes IR，参考 Turboshaft 与 Cranelift CLIF<sup class="ref">[60][61]</sup>；baseline JIT 走快速通道直接 lowering，不经过 HIR。</b></p>
+<p>理由：</p>
+<ul>
+  <li><b>Crankshaft 教训</b>：双 IR（full-codegen vs Crankshaft）导致每加一个语言特性都要改编译器，2017 年 V8 被迫用 Ignition+TurboFan 整体替换<sup class="ref">[85][99]</sup>。从第一天就用一套 IR。</li>
+  <li><b>Wasm 不适合以 trace JIT 为主</b>：Wasm 是静态类型、校验期已确定所有类型、结构化 CFG。LuaJIT trace 的"动态类型 specialize"红利在 Wasm 上不存在；多态 call_ref 是 trace 的天敌<sup class="ref">[97]</sup>。但 hot loop 仍可做 trace 内联（Dynamo NEXT 风格<sup class="ref">[124][126]</sup>）作为优化层补充，而不是主路径。</li>
+  <li><b>可复用后端</b>：IR 设计对齐 Cranelift CLIF，使后端可以直接复用 Cranelift（ISLE + regalloc2<sup class="ref">[61][67]</sup>）甚至 LLVM；自研团队只做上层调度 / PGO / GC 集成 / tier-up 策略，不重写 LLVM 级优化器。</li>
+</ul>
+
+<h3>7.3 编译器管道</h3>
+<p><b>优化 tier</b>：<code>.wasm → 解码 → 校验 → HIR 构造（按支配树插 φ，SSA）→ 中端（GCM、BCE、内联小函数、逃逸分析）→ LIR → 线性扫描 RA → 机器码 emit</code>。</p>
+<p><b>Baseline tier</b>：<code>.wasm → 解码+校验 → 单趟 visitor 直接 lowering（无 IR）→ 机器码</code>，参考 Liftoff / Winch<sup class="ref">[36][37]</sup>。函数进入时一次性分配栈帧，local 映射到固定槽位，出码速度目标比优化 tier 快 5~10×。</p>
+
+<h3>7.4 内存与沙箱</h3>
+<ul>
+  <li><b>线性内存</b>：<code>mmap</code> 独立虚拟地址区间 + guard page，硬件缺页即 trap，省去显式 bounds check；这是 Wasm 性能近原生的核心<sup class="ref">[34]</sup>。</li>
+  <li><b>Table / funcref</b>：函数指针不放进线性内存，经 Table 间接化；typed funcref 的 <code>call_ref</code> 在 validation 期完成类型检查，JIT 可 lower 成单态直接调用<sup class="ref">[15][27]</sup>。</li>
+  <li><b>GC 接口预留</b>：所有可能触发 GC 的点（call、分配、safepoint poll）必须能枚举栈/寄存器上的 GC 指针；写屏障、root 枚举、deopt 重建帧在 IR 层就设计好<sup class="ref">[92]</sup>。</li>
+  <li><b>WASI / embedder 桥接</b>：wasm-c-api 作为 C ABI<sup class="ref">[70]</sup>；WASI 能力按 capability 导入；Component Model 后期外挂<sup class="ref">[19]</sup>。</li>
+</ul>
+
+<h3>7.5 Profile 与 tier-up</h3>
+<table>
+<thead><tr><th>计数器</th><th>放置点</th><th>初始阈值</th><th>动作</th></tr></thead>
+<tbody>
+<tr><td>call counter</td><td>函数入口</td><td>~1000 次调用</td><td>触发异步优化 tier 重编译（参考 HotSpot C1→C2 量级<sup class="ref">[90][93]</sup>）</td></tr>
+<tr><td>loop backedge counter</td><td>循环回边</td><td>~10000 次迭代</td><td>OSR 到优化 tier，不等函数返回（参考 LuaJIT hot loop ~35~56<sup class="ref">[97][133]</sup>，但 Wasm 函数粒度更粗，阈值放大）</td></tr>
+<tr><td>edge counter</td><td>条件分支</td><td>随 call counter 采样</td><td>PGO 回灌：branch layout、内联决策</td></tr>
+</tbody>
+</table>
+<p><b>PGO 数据结构</b>：<code>{module_hash, function_id → {call_count, edge_counts, loop_counts, inline_candidates}}</code>，二进制 append-only 落盘；下次启动加载后直接喂给 AOT 编译器做布局与内联决策，参考 OpenJDK JEP 544 modern AOT cache<sup class="ref">[94]</sup>。AOT 产物格式头含 <code>{wasm_content_hash, compiler_version, isa_features, pgo_generation}</code> 四元组，任一不匹配即失效重编译。</p>
+
+<h3>7.6 与 Wasmtime / WAMR / V8 的差异化定位</h3>
+<div class="callout">
+<b>做什么：</b>小体积（目标 VMCore &lt; 200KB，AOT 路径 &lt; 100KB）、快 warmup（冷启动 &lt; 50ms 出码、&lt; 200ms 达 80% 峰值）、可控 tier-up 与 PGO 回灌、可嵌入自家产品（C ABI + 单文件分发）。IR 与后端可复用 Cranelift/LLVM，上层自研调度 / PGO / GC 集成 / tier-up 策略。<br><br>
+<b>不做什么：</b>不重写 Cranelift 级优化器；不做浏览器 JS 互操作；不追求 V8 那种全量 JS+Wasm 一体化堆；不支持 AVX-512 级别激进 SIMD（与 Rosetta 一致<sup class="ref">[105]</sup>，先固定一套 lowerings）；不在 v1 做 Shared-Everything Threads 与 Component Model。
+</div>
+
+<h2 id="s8">8. 关键技术难点与对策</h2>
+<table>
+<thead><tr><th style="width:18%">难点</th><th style="width:36%">业界做法</th><th style="width:46%">本方案对策</th></tr></thead>
+<tbody>
+<tr><td><b>bounds check 消除</b></td><td>V8/Wasmtime 在 proven 范围内 BCE（bounds check elimination）；guard page 让野地址直接 trap<sup class="ref">[34]</sup></td><td>HIR 层 GCM + 范围分析，把 load/store 的 bounds check 外提到循环外；无法消除时用 guard page 硬件 trap</td></tr>
+<tr><td><b>null / type check 消除</b></td><td>WasmGC struct/array 走带 map 的 inline 检查<sup class="ref">[59]</sup>；typed funcref 在 validation 期完成<sup class="ref">[15]</sup></td><td>call_ref 直接 lower 成单态调用；ref.cast 用 map 内联比较，失败走 deopt</td></tr>
+<tr><td><b>call_indirect megamorphic</b></td><td>V8 按 monomorphic/polymorphic/megamorphic 分级，megamorphic 放弃内联<sup class="ref">[87]</sup></td><td>1~4 个 target 生成线性检查链；&gt;4 个走 Table 间接；profile 显示稳定后 patch 成直接跳转（chaining）</td></tr>
+<tr><td><b>GC 与 safepoint</b></td><td>HotSpot safepoint poll + oop map<sup class="ref">[92]</sup>；V8 Oilpan<sup class="ref">[59]</sup></td><td>所有 call/分配/safepoint poll 点枚举 GC 指针；baseline 与优化层共用同一套 oop map；Shared-Everything Threads 预留写屏障接口<sup class="ref">[16]</sup></td></tr>
+<tr><td><b>SIMD 128-bit</b></td><td>fixed-width SIMD 已 GA；Relaxed SIMD 需在 AOT 绑定 lowerings<sup class="ref">[11][12]</sup></td><td>v128 统一 IR 类型，x64 用 SSE/AVX、ARM64 用 NEON；Relaxed SIMD v1 先固定 x64 AVX 一套，ARM 后续补</td></tr>
+<tr><td><b>memory64</b></td><td>Firefox 134 / Chrome 133 起发布；实测不一定更快<sup class="ref">[58]</sup></td><td>内存操作分 32/64 两套 lowering；地址计算变宽后监控寄存器压力，仅在 &gt;4GB 负载开启</td></tr>
+<tr><td><b>EH 展开</b></td><td>try_table 一条指令多 catch landing pad<sup class="ref">[9]</sup>；需 DWARF CFI / Windows EH info</td><td>v1 用 Itanium ABI 兼容的 landing pad；异常对象在堆上分配；-fno-exceptions 路径直通</td></tr>
+<tr><td><b>warmup 与冷启动预算</b></td><td>Winch 单趟 baseline<sup class="ref">[37]</sup>；Wizer 线性内存快照<sup class="ref">[73]</sup>；JEP 544 AOT cache<sup class="ref">[94]</sup></td><td>冷启动路径 = 解释器 + baseline JIT 并行；PGO 命中后直接 AOT；提供快照 API（Wizer 兼容）</td></tr>
+<tr><td><b>code cache 体积</b></td><td>LuaJIT mcode 默认 32MB<sup class="ref">[97]</sup>；Wasmtime 进程内 cache</td><td>code cache 按 hotness 分代，冷代码 eviction；落盘缓存按 LRU + 总量上限；Dirty Bin Cache 教训：路径用不可预测 hash<sup class="ref">[109]</sup></td></tr>
+<tr><td><b>多线程与原子</b></td><td>Threads Phase 4 未合并入主 spec<sup class="ref">[13][7]</sup>；RC11 风格 release/acquire<sup class="ref">[33]</sup></td><td>pthread 抽象 + futex 对接；fence 仅在 atomic.* 与共享内存访问处插入；单线程模式零开销</td></tr>
+</tbody>
+</table>
+
+<h2 id="s9">9. 里程碑与人力预估</h2>
+
+<figure>
+<svg viewBox="0 0 960 280" width="100%" style="max-width:960px">
+  <!-- timeline -->
+  <line x1="80" y1="20" x2="920" y2="20" stroke="#999" stroke-width="1.5"/>
+  <g font-size="11" fill="#666">
+    <text x="80" y="12" text-anchor="middle">0</text>
+    <text x="290" y="12" text-anchor="middle">3 月</text>
+    <text x="500" y="12" text-anchor="middle">6 月</text>
+    <text x="710" y="12" text-anchor="middle">9 月</text>
+    <text x="920" y="12" text-anchor="middle">12 月</text>
+  </g>
+  <g stroke="#ccc">
+    <line x1="80" y1="20" x2="80" y2="250"/>
+    <line x1="290" y1="20" x2="290" y2="250"/>
+    <line x1="500" y1="20" x2="500" y2="250"/>
+    <line x1="710" y1="20" x2="710" y2="250"/>
+    <line x1="920" y1="20" x2="920" y2="250"/>
+  </g>
+
+  <!-- Phase 1 -->
+  <rect x="80" y="40" width="210" height="44" rx="4" fill="#eaf1f8" stroke="#1f4e79"/>
+  <text x="185" y="60" font-size="12" fill="#1f4e79" text-anchor="middle" font-weight="600">0~3 月 MVP</text>
+  <text x="185" y="76" font-size="10.5" fill="#333" text-anchor="middle">校验 + 解释器 + baseline JIT · 3~4 FTE</text>
+
+  <!-- Phase 2 -->
+  <rect x="290" y="100" width="210" height="44" rx="4" fill="#dcfce7" stroke="#0f5132"/>
+  <text x="395" y="120" font-size="12" fill="#0f5132" text-anchor="middle" font-weight="600">3~6 月 HIR + 优化 JIT</text>
+  <text x="395" y="136" font-size="10.5" fill="#333" text-anchor="middle">SSA/GCM/BCE/内联/线性扫描 RA · 4~5 FTE</text>
+
+  <!-- Phase 3 -->
+  <rect x="500" y="160" width="210" height="44" rx="4" fill="#fef3c7" stroke="#92400e"/>
+  <text x="605" y="180" font-size="12" fill="#92400e" text-anchor="middle" font-weight="600">6~9 月 AOT + PGO + SIMD</text>
+  <text x="605" y="196" font-size="10.5" fill="#333" text-anchor="middle">code cache · typed call_indirect · WASI · 4~5 FTE</text>
+
+  <!-- Phase 4 -->
+  <rect x="710" y="220" width="210" height="44" rx="4" fill="#fce7f3" stroke="#9d174d"/>
+  <text x="815" y="240" font-size="12" fill="#9d174d" text-anchor="middle" font-weight="600">9~12 月 GC / EH / mem64</text>
+  <text x="815" y="256" font-size="10.5" fill="#333" text-anchor="middle">safepoint/写屏障 · 对标 Liftoff/TurboFan warmup · 5~6 FTE</text>
+</svg>
+<figcaption>图 9-1　12 个月路线图（阶段条 + 人力投入）</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>阶段</th><th>交付内容</th><th>人力（FTE）</th><th>验收指标</th></tr></thead>
+<tbody>
+<tr><td><b>0~3 月 MVP</b></td><td>Wasm 2.0 子集校验；token-threaded 解释器；baseline JIT（单趟线性扫描）</td><td>3~4</td><td>跑通 coremark / wasm-micro-regression；warmup &lt; 100ms；VMCore &lt; 300KB</td></tr>
+<tr><td><b>3~6 月 优化 JIT</b></td><td>HIR（SSA）；GCM、BCE、内联、线性扫描 RA</td><td>4~5</td><td>峰值吞吐达 Wasmtime-Cranelift 的 60~80%<sup class="ref">[38]</sup>；编译时间可预测</td></tr>
+<tr><td><b>6~9 月 AOT + PGO</b></td><td>AOT 产物格式 + code cache + PGO 回灌；Table/funcref typed call_indirect；SIMD；WASI 桥接</td><td>4~5</td><td>二次启动零 JIT 编译；AOT 路径冷启动 &lt; 50ms；SIMD 基准对齐单精度 C</td></tr>
+<tr><td><b>9~12 月 GC / EH</b></td><td>WasmGC 接口（safepoint / 写屏障 / root 枚举）；EH 展开；memory64 实测</td><td>5~6</td><td>跑通 Kotlin/Wasm demo；warmup 曲线对标 V8 Liftoff/TurboFan<sup class="ref">[36]</sup>；memory64 大内存负载 &gt;4GB 可跑</td></tr>
+</tbody>
+</table>
+
+<h2 id="s10">10. 风险与未决问题</h2>
+<table>
+<thead><tr><th style="width:18%">类别</th><th style="width:38%">风险</th><th style="width:44%">缓解措施</th></tr></thead>
+<tbody>
+<tr><td rowspan="3"><b>技术</b></td><td>GC 与优化器耦合：WasmGC 引入后，SSA 优化与 safepoint/写屏障互相约束，中档优化层最易出安全 bug（Maglev CVE-2023-4069 教训<sup class="ref">[89]</sup>）</td><td>GC 接口在 HIR 层就设计好；所有 deopt guard 配重建描述符；优先复用 Cranelift GC 路线，不自研</td></tr>
+<tr><td>SIMD 一致性：Relaxed SIMD 允许非确定性语义，x64/ARM 浮点尾差可能不一致<sup class="ref">[12]</sup></td><td>v1 先固定一套 lowerings（x64 AVX）；AOT 产物头绑定 isa_features，跨架构失效重编译</td></tr>
+<tr><td>x64 / ARM64 双后端工作量：指令选择 + RA + 代码 emitter 双份</td><td>IR 对齐 Cranelift CLIF<sup class="ref">[61]</sup>，后端优先复用 Cranelift/LLVM，自研只做调度与 PGO</td></tr>
+<tr><td rowspan="2"><b>工程</b></td><td>人才：懂 Wasm 运行时 + DBT + SSA 优化的工程师稀缺</td><td>核心 2~3 人从 Cranelift/WAMR 社区招人；其余按层分配（前端/中端/后端/GC）</td></tr>
+<tr><td>与上游 spec 跟进 + 安全 CVE：Wasm 提案演进快（Shared-Everything Threads 等<sup class="ref">[16]</sup>）</td><td>加入 Bytecode Alliance 安全公告订阅；校验器独立模块化，spec 变更只动前端</td></tr>
+<tr><td><b>商业</b></td><td>与 Wasmtime/WAMR 差异化是否成立：小体积+快 warmup 是否足以让客户放弃现成方案</td><td>明确不做通用浏览器引擎，只做"嵌入自家产品"场景；PGO 回灌与 tier-up 可控性是 Wasmtime/WAMR 目前未打磨的点</td></tr>
+</tbody>
+</table>
+
+<h2 id="s11">11. 参考资料</h2>
+<div class="refs">
+<ol>
+<li>Wasm Core Spec — Modules. https://webassembly.github.io/spec/core/syntax/modules.html</li>
+<li>W3C WebAssembly Core Specification 1.0. https://www.w3.org/TR/wasm-core-1/</li>
+<li>WebAssembly JS Interface. https://webassembly.github.io/spec/js-api/</li>
+<li>WebAssembly 2.0 Core Specification PDF. https://webassembly.github.io/custom-descriptors/versions/core/WebAssembly-2.0.pdf</li>
+<li>Wasm 3.0 Completed (2025-09-17). https://webassembly.org/news/2025-09-17-wasm-3.0/</li>
+<li>WebAssembly finished-proposals.md. https://github.com/WebAssembly/proposals/blob/main/finished-proposals.md</li>
+<li>WebAssembly proposals README. https://github.com/WebAssembly/proposals/blob/main/README.md</li>
+<li>WebAssembly/gc. https://github.com/WebAssembly/gc</li>
+<li>WebAssembly/exception-handling. https://github.com/WebAssembly/exception-handling</li>
+<li>WebAssembly/tail-call. https://github.com/WebAssembly/tail-call</li>
+<li>WebAssembly/simd. https://github.com/WebAssembly/simd</li>
+<li>WebAssembly/relaxed-simd. https://github.com/WebAssembly/relaxed-simd</li>
+<li>WebAssembly/threads. https://github.com/webassembly/threads</li>
+<li>WebAssembly/memory64. https://github.com/WebAssembly/memory64</li>
+<li>WebAssembly/function-references. https://github.com/WebAssembly/function-references</li>
+<li>WebAssembly/shared-everything-threads. https://github.com/WebAssembly/shared-everything-threads</li>
+<li>WebAssembly/multi-memory. https://github.com/WebAssembly/multi-memory</li>
+<li>WebAssembly/esm-integration. https://github.com/WebAssembly/esm-integration</li>
+<li>WebAssembly/component-model. https://github.com/WebAssembly/component-model</li>
+<li>WebAssembly/stack-switching. https://github.com/WebAssembly/stack-switching</li>
+<li>WebAssembly/custom-page-sizes. https://github.com/WebAssembly/custom-page-sizes</li>
+<li>WebAssembly/wide-arithmetic. https://github.com/WebAssembly/wide-arithmetic</li>
+<li>WebAssembly/acquire-release-atomics. https://github.com/WebAssembly/acquire-release-atomics</li>
+<li>WebAssembly/half-precision. https://github.com/WebAssembly/half-precision</li>
+<li>WebAssembly/compilation-hints. https://github.com/WebAssembly/compilation-hints</li>
+<li>WebAssembly/js-promise-integration. https://github.com/WebAssembly/js-promise-integration</li>
+<li>Function References bikeshed. https://webassembly.github.io/function-references/core/bikeshed/index.html</li>
+<li>Memory64 changes appendix. https://webassembly.github.io/memory64/core/appendix/changes.html</li>
+<li>Exception Handling JS API. https://webassembly.github.io/exception-handling/js-api/</li>
+<li>Wasm Core Spec — Instructions. https://webassembly.github.io/spec/core/syntax/instructions.html</li>
+<li>Wasm Core Spec bikeshed. https://webassembly.github.io/spec/core/bikeshed/</li>
+<li>Wasm WG Charter draft (2026). http://w3c.github.io/charter-drafts/2026/wasm-wg-charter.html</li>
+<li>MDN Understanding Wasm text format. https://developer.mozilla.org/en-US/docs/WebAssembly/Guides/Understanding_the_text_format</li>
+<li>MDN Using the WebAssembly JavaScript API. https://developer.mozilla.org/en-US/docs/WebAssembly/Guides/Using_the_JavaScript_API</li>
+<li>Security Implications of Wasm Shared-Everything Threads. https://www.systemshardening.com/articles/wasm/wasm-shared-everything-threads-security/</li>
+<li>V8 Blog: Liftoff. https://v8.dev/blog/liftoff</li>
+<li>Bytecode Alliance: Wasmtime and Cranelift in 2023. https://bytecodealliance.org/articles/wasmtime-and-cranelift-in-2023</li>
+<li>Cranelift 官方站点. https://cranelift.dev/</li>
+<li>Bytecode Alliance: Cranelift inliner. https://bytecodealliance.org/articles/inliner</li>
+<li>Wasmtime stability tiers. https://docs.wasmtime.dev/stability-tiers.html</li>
+<li>Wasmtime contributing architecture. https://docs.wasmtime.dev/contributing-architecture.html</li>
+<li>Bytecode Alliance articles. https://bytecodealliance.org/articles/</li>
+<li>WAMR GitHub 仓库. https://github.com/bytecodealliance/wasm-micro-runtime</li>
+<li>ESP Component: wasm-micro-runtime 2.2.0. https://components.espressif.com/components/espressif/wasm-micro-runtime/versions/2.2.0~2</li>
+<li>W3C WAMR 介绍 PDF. https://www.w3.org/2020/08/29-chinese-web/wamr.pdf</li>
+<li>TWINE 论文 (arXiv 2103.15860). https://arxiv.org/pdf/2103.15860.pdf</li>
+<li>Wasmer Runtime Features. https://docs.wasmer.io/runtime/features/</li>
+<li>crates.io wasmer 7.3.0-rc.1. https://crates.io/crates/wasmer/7.3.0-rc.1</li>
+<li>Wasmer Python Embedding 1.0 博客. https://wasmer.io/es/posts/wasmer-python-embedding-1_0</li>
+<li>Introducing Wasmer v5. https://wasmer.io/posts/introducing-wasmer-v5</li>
+<li>WebKit: Assembling WebAssembly. https://webkit.org/blog/7691/webassembly/</li>
+<li>Introducing the B3 JIT Compiler. https://webkit.org/blog/5852/introducing-the-b3-jit-compiler/</li>
+<li>Introducing JetStream 3. https://webkit.org/blog/17899/introducing-the-jetstream-3-benchmark-suite/</li>
+<li>WebKit Features in Safari 18.2. https://webkit.org/blog/16301/webkit-features-in-safari-18-2/</li>
+<li>Bun Runtime 文档. https://bun.com/docs/runtime</li>
+<li>docs.rs wasmi_wast 2.0.0-beta.8. https://docs.rs/crate/wasmi_wast/2.0.0-beta.8</li>
+<li>Wasmi 2.0 发布博客. https://wasmi-labs.github.io/blog/posts/wasmi-v2.0/</li>
+<li>SpiderMonkey: Is Memory64 actually worth using? https://spidermonkey.dev/blog/2025/01/15/is-memory64-actually-worth-using.html</li>
+<li>WasmGC enabled by default in Chrome. https://developer.chrome.com/blog/wasmgc</li>
+<li>DeepWiki: V8 Turboshaft &amp; TurboFan. https://deepwiki.com/v8/v8/3.3-turboshaft-and-turbofan:-optimizing-compilers</li>
+<li>DeepWiki: Wasmtime Cranelift Compiler. https://deepwiki.com/bytecodealliance/wasmtime/4.1-cranelift-compiler</li>
+<li>Leaving the Sea of Nodes (Turboshaft 译文). https://rosettalens.com/s/ko/leaving-the-sea-of-nodes</li>
+<li>ursb.me: immersive webassembly. https://ursb.me/immersive/webassembly/</li>
+<li>xenojoshua: Liftoff 中文镜像. https://xenojoshua.com/posts/2018/08/liftoff</li>
+<li>josenaldo: Bun vs Node 冷启动. https://josenaldo.com.br/codex-technomanticus-site/03-dominios/tecnologia/20---bun-como-runtime-e-toolkit-all-in-one</li>
+<li>Wasmi 2.0 2.2× 报道. https://www.webanditnews.com/2026/09/03/wasmi-2-0-delivers-2-2x-speed-boost-for-webassembly-in-constrained-environments/</li>
+<li>LWN: Cranelift. https://lwn.net/Articles/965369/</li>
+<li>Cornell veri-isle preprint. https://www.cs.cornell.edu/~avh/veri-isle-preprint.pdf</li>
+<li>arXiv 2606.26977: ISLE. https://arxiv.org/html/2606.26977v1</li>
+<li>WASI.dev. https://wasi.dev/</li>
+<li>Cloudflare Workers: How Workers Isolates work. https://developers.cloudflare.com/workers/reference/how-workers-works/#isolates</li>
+<li>Cloudflare Blog: Dynamic Workers. https://blog.cloudflare.com/dynamic-workers/</li>
+<li>How Python Workers Work. https://developers.cloudflare.com/workers/languages/python/how-python-workers-work</li>
+<li>Cloudflare CPU benchmarks. https://blog.cloudflare.com/unpacking-cloudflare-workers-cpu-performance-benchmarks/</li>
+<li>Fastly: Announcing Lucet. https://www.fastly.com/blog/announcing-lucet-fastly-native-webassembly-compiler-runtime</li>
+<li>Fastly: How Lucet and Wasmtime make stronger compiler together. https://www.fastly.com/blog/how-lucet-wasmtime-make-stronger-compiler-together</li>
+<li>nordiso: Wasm production use cases. https://www.nordiso.com/blog/webassembly-production-use-cases-performance-benchmarks</li>
+<li>Deno Permissions 文档. https://deno.land/manual@main/basics/permissions</li>
+<li>Deno 官网. https://deno.com/</li>
+<li>Deno Sandbox 博客. https://deno.com/blog/introducing-deno-sandbox</li>
+<li>Cloudflare Rust 标签. https://blog.cloudflare.com/tag/rust/rss</li>
+<li>Fastly 日文博客: 社区投资. https://www.fastly.co.jp/jp/blog/how-fastly-and-developer-community-invest-in-webassembly-ecosystem</li>
+<li>notist: Wasm to the browser and beyond. https://notist.co/patrickhamann/uEw4zt/webassembly-to-the-browser-and-beyond</li>
+<li>AIO APEX: Wasm beyond browser 2026. https://aioapex.com/es/blog/webassembly-beyond-browser-2026</li>
+<li>V8: Behind the Scenes (Feb 2017). https://benediktmeurer.de/2017/03/01/v8-behind-the-scenes-february-edition/</li>
+<li>V8 Blog: Maglev. https://v8.dev/blog/maglev</li>
+<li>V8 multi-tier pipeline. https://readoss.com/en/v8/v8/v8-multi-tier-compilation-pipeline</li>
+<li>V8 Engine Architecture. https://sujeet.pro/articles/v8-engine-architecture</li>
+<li>GitHub Blog: CVE-2023-4069 Maglev RCE. https://github.blog/2023-10-17-getting-rce-in-chrome-with-incomplete-object-initialization-in-the-maglev-compiler/</li>
+<li>Oracle HotSpot Performance Enhancements. http://docs.oracle.com/en/java/javase/11/vm/java-hotspot-virtual-machine-performance-enhancements.html</li>
+<li>HotSpot Escape Analysis Status. https://cr.openjdk.org/~cslucas/escape-analysis/EscapeAnalysis.html</li>
+<li>Red Hat: How JIT boosts Java. https://developers.redhat.com/articles/2021/06/23/how-jit-compiler-boosts-java-performance-openjdk</li>
+<li>GeekWorkbench: Tiered Compilation. https://geekworkbench.com/blog/technical/tiered-compilation</li>
+<li>JEP 544: Modern AOT Code Cache. http://openjdk.org/jeps/544</li>
+<li>Mozilla Hacks: Warp in Firefox 83. https://hacks.mozilla.org/2020/11/warp-improved-js-performance-in-firefox-83/</li>
+<li>Firefox Source Docs: How SpiderMonkey Optimizes. https://firefox-source-docs.mozilla.org/js/how-we-optimize.html</li>
+<li>LuaJIT Running. https://luajit.org/running.html</li>
+<li>Cloudflare: getting next() out of NYI. https://blog.cloudflare.com/luajit-hacking-getting-next-out-of-the-nyi-list/</li>
+<li>V8 Crankshaft 概述. http://nothingcosmos.github.io/V8Crankshaft/src/blog.html</li>
+<li>arXiv 2205.01183: in-place interpreter. https://arxiv.org/pdf/2205.01183v1.pdf</li>
+<li>ACM 综述 10.1145/3731451. https://dl.acm.org/doi/pdf/10.1145/3731451</li>
+<li>ACM HybridServe 10.1145/3774899.3775011. https://dl.acm.org/doi/pdf/10.1145/3774899.3775011</li>
+<li>InfoQ 2023 Wasm 年度回顾. http://m.toutiao.com/group/7324979199884984859/</li>
+<li>wasmparser validator.rs. https://raw.githubusercontent.com/mozilla-firefox/firefox/main/third_party/rust/wasmparser/src/validator.rs</li>
+<li>Apple: About the Rosetta translation environment. https://developer.apple.com/documentation/apple-silicon/about-the-rosetta-translation-environment</li>
+<li>Apple Security: Rosetta 2 on Apple silicon. https://support.apple.com/guide/security/rosetta-2-on-a-mac-with-apple-silicon-secebb113be1/web</li>
+<li>Apple 支持 102527. https://support.apple.com/en-la/102527</li>
+<li>FFRI Project Champollion Part1. https://ffri.github.io/ProjectChampollion/part1/</li>
+<li>Black Hat Asia 23: Dirty Bin Cache. https://i.blackhat.com/Asia-23/AS-23-Koh-Dirty-Bin-Cache-A-New-Code-Injection-Poisoning-Binary-Translation-Cache.pdf</li>
+<li>Google CTI: Rosetta2 artifacts. https://cloud.google.com/blog/topics/threat-intelligence/rosetta2-artifacts-macos-intrusions</li>
+<li>dougallj: Why is Rosetta 2 fast? https://dougallj.wordpress.com/2022/11/</li>
+<li>Yining Karu: Porting Takua to ARM pt2. https://blog.yiningkarlli.com/2021/07/porting-takua-to-arm-pt2</li>
+<li>DynamoRIO AArch64 port. https://dynamorio.org/page_aarch64_port.html</li>
+<li>AppleInsider M1 benchmarks. https://appleinsider.com/articles/20/11/17/m1-benchmarks-proves-apple-silicon-outclasses-nearly-all-current-intel-mac-chips/amp/</li>
+<li>LifeinTECH M1. https://www.lifeintech.com/2020/11/18/apple-m1/</li>
+<li>Daring Fireball: M1 Macs. https://daringfireball.net/2020/11/the_m1_macs</li>
+<li>cloudstreet-dev: architecture considerations. https://cloudstreet-dev.github.io/macOS-and-Unix/part12-performance/architecture-considerations.html</li>
+<li>Codegenes: Why QEMU can't match Rosetta. https://www.codegenes.net/blog/why-can-t-qemu-get-even-close-to-rosetta-2-s-performance-when-translating-x86-to-m1/</li>
+<li>QEMU Translator Internals (TCG). https://www.qemu.org/docs/master/devel/tcg.html</li>
+<li>QEMU TCG Intermediate Representation. https://www.qemu.org/docs/master/devel/tcg-ops.html</li>
+<li>QEMU Multi-thread TCG. https://www.qemu.org/docs/master/devel/multi-thread-tcg.html</li>
+<li>Bellard 2005 USENIX ATC: QEMU. https://www.usenix.org/legacy/publications/library/proceedings/usenix05/tech/freenix/full_papers/bellard/bellard_html/index.html</li>
+<li>QEMU About Emulation. https://www.qemu.org/docs/master/about/emulation.html</li>
+<li>PLDI 2000: Dynamo. https://dl.acm.org/doi/pdf/10.1145/358438.349303</li>
+<li>UCSD: Dynamo PLDI 2000 PDF. http://www-cse.ucsd.edu/classes/sp00/cse231/dynamopldi.pdf</li>
+<li>MIT Tim Meng thesis: RIO. https://groups.csail.mit.edu/cag/rio/tim-meng-thesis.pdf</li>
+<li>DynamoRIO API: BT. https://dynamorio.org/API_BT.html</li>
+<li>DynamoRIO deploy. https://dynamorio.org/page_deploy.html</li>
+<li>Transmeta Crusoe CMS PDF. https://www.ic72.com/pdf_file/t/431077.pdf</li>
+<li>Berkeley CS152 L22: Virtual Machines. https://inst.eecs.berkeley.edu/~cs152/sp09/lectures/L22-VirtualMachines.pdf</li>
+<li>LLVM 2003: LLVA emu. https://www.llvm.org/ProjectsWithLLVM/2003-Fall-CS497YYZ-LLVA-emu.pdf</li>
+<li>DankWiki: TM8300/TM8600 Efficeon. https://nick-black.com/dankwiki/images/a/a9/Tm8300tm8600.pdf</li>
+<li>cstopics: LuaJIT JIT techniques. https://cstopics.com/encyclopedia/compilers/just-in-time-compilation/jit-techniques/luajit</li>
+<li>Talos: DBI with DynamoRIO. https://blog.talosintelligence.com/dynamic-binary-instrumentation-dbi-with-dynamorio/</li>
+<li>zhenhuaw: virtual machine &amp; dynamic compiling. https://zhenhuaw.me/blog/2019/revisiting-vitrual-machine-and-dynamic-compiling.html</li>
+</ol>
+</div>
+
+<div class="footer">
+本报告基于三份研究稿（01_wasm_runtimes / 02_wasm_proposals_and_jit_classics / 03_rosetta_and_dbt）整合撰写；所有数字、性能结论、提案状态与版本均沿用原研究稿来源，未新增外部 URL。Rosetta 2 部分严格区分 Apple 官方白皮书与社区逆向（dougallj / FFRI 等）两类证据。
+</div>
+
+</div>
+</body>
+</html>

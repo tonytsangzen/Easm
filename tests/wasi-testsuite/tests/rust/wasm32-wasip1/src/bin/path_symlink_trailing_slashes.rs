@@ -1,0 +1,86 @@
+use std::{env, process};
+use wasi_tests::{TESTCONFIG, assert_errno, create_file, create_tmp_dir, root_directory};
+use wasip1 as wasi;
+
+unsafe fn test_path_symlink_trailing_slashes(dir_fd: wasi::Fd) {
+    if TESTCONFIG.support_dangling_filesystem() {
+        // Dangling symlink: Link destination shouldn't end with a slash.
+        assert_errno!(
+            wasi::path_symlink("source", dir_fd, "target/")
+                .expect_err("link destination ending with a slash should fail"),
+            wasi::ERRNO_NOENT
+        );
+
+        // Dangling symlink: Without the trailing slash, this should succeed.
+        if wasi::path_symlink("source", dir_fd, "target").is_ok() {
+            wasi::path_unlink_file(dir_fd, "target").expect("removing a file");
+        }
+    }
+
+    // Link destination already exists, target has trailing slash.
+    wasi::path_create_directory(dir_fd, "target").expect("creating a directory");
+    assert_errno!(
+        wasi::path_symlink("source", dir_fd, "target/")
+            .expect_err("link destination already exists"),
+        unix => wasi::ERRNO_EXIST,
+        windows => wasi::ERRNO_NOENT
+    );
+    wasi::path_remove_directory(dir_fd, "target").expect("removing a directory");
+
+    // Link destination already exists, target has no trailing slash.
+    wasi::path_create_directory(dir_fd, "target").expect("creating a directory");
+    assert_errno!(
+        wasi::path_symlink("source", dir_fd, "target")
+            .expect_err("link destination already exists"),
+        unix => wasi::ERRNO_EXIST,
+        windows => wasi::ERRNO_NOENT
+    );
+    wasi::path_remove_directory(dir_fd, "target").expect("removing a directory");
+
+    // Link destination already exists, target has trailing slash.
+    create_file(dir_fd, "target");
+
+    assert_errno!(
+        wasi::path_symlink("source", dir_fd, "target/")
+            .expect_err("link destination already exists"),
+        unix => wasi::ERRNO_NOTDIR,
+        windows => wasi::ERRNO_NOENT,
+        wasi::ERRNO_EXIST
+    );
+    wasi::path_unlink_file(dir_fd, "target").expect("removing a file");
+
+    // Link destination already exists, target has no trailing slash.
+    create_file(dir_fd, "target");
+
+    assert_errno!(
+        wasi::path_symlink("source", dir_fd, "target")
+            .expect_err("link destination already exists"),
+        unix => wasi::ERRNO_EXIST,
+        windows => wasi::ERRNO_NOENT
+    );
+    wasi::path_unlink_file(dir_fd, "target").expect("removing a file");
+}
+
+fn main() {
+    let base_dir_fd = match root_directory() {
+        Ok(dir_fd) => dir_fd,
+        Err(err) => {
+            eprintln!("{}", err);
+            process::exit(1)
+        }
+    };
+
+    const DIR_NAME: &str = "path_symlink_trailing_slashes_dir.cleanup";
+    let dir_fd;
+    unsafe {
+        dir_fd = create_tmp_dir(base_dir_fd, DIR_NAME);
+    }
+
+    // Run the tests.
+    unsafe { test_path_symlink_trailing_slashes(dir_fd) }
+
+    unsafe {
+        wasi::fd_close(dir_fd).unwrap();
+    }
+    unsafe { wasi::path_remove_directory(base_dir_fd, DIR_NAME).expect("failed to remove dir") }
+}

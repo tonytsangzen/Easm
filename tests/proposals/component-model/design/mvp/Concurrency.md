@@ -1,0 +1,1606 @@
+# Concurrency Explainer
+
+This document contains a high-level summary of the native concurrency support,
+providing background for understanding the definitions in the [WIT], [AST
+explainer], [binary format] and [Canonical ABI explainer] documents that are
+gated by the 🔀 (async) and 🧵 (threading) emojis.
+
+* [Goals](#goals)
+* [Summary](#summary)
+* [Concepts](#concepts)
+  * [Threads and Tasks](#threads-and-tasks)
+  * [Subtasks and Supertasks](#subtasks-and-supertasks)
+  * [Current Thread and Task](#current-thread-and-task)
+  * [Thread Built-ins](#thread-built-ins)
+  * [Thread-Local Storage](#thread-local-storage)
+  * [Blocking](#blocking)
+  * [Waitables and Waitable Sets](#waitables-and-waitable-sets)
+  * [Streams and Futures](#streams-and-futures)
+  * [Stream Readiness](#stream-readiness)
+  * [Backpressure](#backpressure)
+  * [Returning](#returning)
+  * [Borrows](#borrows)
+  * [Cancellation](#cancellation)
+  * [Nondeterminism](#nondeterminism)
+  * [Reentrance](#reentrance)
+* [Interaction with the start function](#interaction-with-the-start-function)
+* [Async ABI](#async-abi)
+  * [Async Import ABI](#async-import-abi)
+  * [Async Export ABI](#async-export-abi)
+* [Examples](#examples)
+* [Component Instance Lifetime](#component-instance-lifetime)
+* [TODO](#todo)
+
+
+## Goals
+
+With the release of [WASI] 0.3, the following concurrency-specific goals and
+use cases are added, refining the Component Model's high-level
+[goals](../high-level/Goals.md) and [use cases](../high-level/UseCases.md):
+
+* Integrate with idiomatic source-language concurrency features including:
+  * `async` functions in languages like C#, JS, Python, Rust and Swift
+  * coroutines in languages like Kotlin, Perl, PHP and (recently) C++
+  * green threads scheduled by the language's own runtime in languages like Go
+    and (initially and recently again) Java
+  * host threads that are scheduled outside the language's own runtime in
+    languages like C, C++, C#, Python, Rust and many more that expose pthreads
+    or other OS threads
+  * promises, futures, streams and channels
+  * callbacks, in languages with no other built-in concurrency mechanisms
+* Provide [fiber]-like stack-switching capabilities via Core WebAssembly
+  import calls in a way that composes with, and is [specified in terms of],
+  but doesn't actually depend on, the Core WebAssembly [stack-switching]
+  proposal.
+* Allow polyfilling in browsers via JavaScript Promise Integration ([JSPI])
+* Avoid partitioning interfaces and components into separate ecosystems based
+  on degree of concurrency; don't give components a "[color]".
+* Allow runtimes to maintain meaningful cross-language call stacks (for the
+  benefit of debugging, logging, tracing and profiling).
+* Consider backpressure and cancellation as part of the design.
+* Provide optional run-to-completion semantics for async code as described
+  by [Component Invariant] #2.
+
+
+## Summary
+
+To support the wide variety of language-level concurrency mechanisms listed
+above, the Component Model defines a new low-level, language-agnostic async
+calling convention (the "async ABI") for both calling into and calling out of
+Core WebAssembly. Language compilers and runtimes can bind to this async ABI in
+the same way that they already bind to various OS's concurrent I/O APIs (such
+as `select`, `epoll`, `io_uring`, `kqueue` and Overlapped I/O) making the
+Component Model "just another OS" from the language toolchain's perspective.
+
+In addition to adding a new async *ABI* for use by the language's compiler and
+runtime, the Component Model also adds a new `async` [effect type] that can be
+added to function types (in both WIT and raw component function type
+definitions) to indicate that the function may block before returning its value.
+```wit
+interface processor {
+  process: async func(in: inputs) -> outputs;  /* may block */
+  ready: func() -> bool;                       /* may not block */
+}
+```
+When a function type does *not* contain `async`, the Component Model traps if
+the callee blocks at runtime before returning a value (as described in more
+detail [below](#blocking)). Thus, the absence of `async` means that a host or
+component caller never needs to handle the case where the callee blocks before
+returning a value. For hosts like browsers with event-loop concurrency, this
+invariant is necessary to allow non-`async` component exports to be called in
+synchronous contexts (like event listeners, callbacks, getters, setters and
+constructors).
+
+The new async ABI can be used alongside or instead of the existing [WASI] 0.2
+"sync ABI" to call or implement any `async`-typed functions. When *calling* an
+imported function via the async ABI, if the `async` callee [blocks](#blocking),
+control flow is returned immediately to the caller, and the callee continues
+executing concurrently. When *implementing* an `async` function via the async
+ABI, multiple concurrent export calls are allowed to be made by the caller.
+Critically, both sync-ABI-calls-async-ABI and async-ABI-calls-sync-ABI pairings
+have well-defined, composable behavior for both inter-component and
+intra-component calls.
+
+Because `async` function exports may be implemented with the *sync* ABI and
+then call `async` function imports using the *sync* ABI, traditional sync code
+can compile directly to components exporting `async` functions without having
+to be rewritten to use source-language concurrency mechanisms (like callbacks,
+`async`/`wait`, coroutines, etc). For example, traditional C programs with a
+`main()` and calls to `read()`, `write()` and `select()` can run without change
+in the [WASI] 0.3 `wasi:cli/command` world, which exports `run: async func() ->
+result`. Thus, `async` in WIT does not require the same kind of transitive
+source-code changes as source-level `async` in languages like C#, Python, JS,
+Rust and Dart.
+
+Because `async` exports impose little to no requirements on the guest
+language's style of concurrency, most `world`s (including `wasi:cli/command`,
+`wasi:http/service` and `wasi:http/middleware`) are expected to export `async`
+functions so that the contained Core WebAssembly code is free to block.
+Implementing a non-`async` function will primarily only arise when a component
+is *virtualizing* the non-`async` *imports* of a `world` (e.g., the getters and
+setters of `wasi:http/types.headers`). In this more exotic virtualization
+scenario, a [future extension](#TODO) could allow a parent component that
+imports `async` functions to implement its child's non-`async` imports in the
+same manner as [JSPI] in the browser.
+
+Thus, overall, `async` in WIT and the Component Model does not behave like a
+"color" in the sense described by the popular [What Color Is Your Function?]
+essay.
+
+Each time a component export is called, the wasm runtime logically spawns a new
+[green thread]  (as opposed to a [kernel thread]) to execute the export call
+concurrently with other calls in the runtime. This means that [thread-local
+storage](#thread-local-storage) is never reused between export calls and, in
+general, a caller's thread's identity is never observable to the callee. In
+some cases (such as when only sync ABI components are used) the runtime can
+statically, as an optimization, make a plain synchronous function call with the
+same wasm-observable behavior as-if it had created a new thread. But in
+general, when one component makes an async call that transitively blocks in
+another component, having the callee on its own native callstack is needed for
+the runtime to be able to switch back to the caller without having to unwind
+the stack.
+
+In addition to the *implicit* threads logically created for export calls, Core
+WebAssembly code can also *explicitly* create new green threads by calling the
+[`thread.new-indirect`] built-in. Regardless of how they were created, all
+threads can call a set of Component Model-defined `thread.*` built-in functions
+(listed [below](#thread-built-ins)) to suspend themselves and/or resume other
+threads. These built-ins provide sufficient functionality to implement both the
+internally-scheduled "green thread" and the externally-scheduled "host thread"
+use cases mentioned in the [goals](#goals).
+
+Until the Core WebAssembly [shared-everything-threads] proposal allows Core
+WebAssembly function types to be annotated with `shared`, `thread.new-indirect`
+can only call non-`shared` functions (via `(table funcref)` index, just
+like `call_indirect`) and thus currently all threads must execute
+[cooperatively] in a sequentially-interleaved fashion, switching between
+threads only at explicit program points just like (and implementable via) a
+traditional OS [fiber]. While these **cooperative threads** do not allow a
+single component instance to increase its internal parallelism, cooperative
+threads are still quite useful for getting existing threaded code to Just Work
+(as-if running on a single core) without the overhead of [CPS Transform]
+techniques like [Asyncify] and without depending on [shared-everything-threads].
+Moreover, in various embeddings, all available parallelism is already saturated
+by running independent component instances on separate kernel threads.
+
+Because new threads are (semantically, if not physically) created at all
+cross-component call boundaries, the degree of `shared` and non-`shared` thread
+use is kept an encapsulated implementation detail of a component (similar to
+the choice of linear vs. GC memory). This enables component authors to
+compatibly change their implementation strategy over time, starting simple and
+adding complexity for performance as needed over time.
+
+To provide wasm runtimes with additional optimization opportunities for
+languages with "stackless" concurrency (e.g. languages using `async`/`await`),
+two async ABI sub-options are provided: a "stackless" async ABI selected by
+providing a `callback` function and a "stackful" async ABI selected by *not*
+providing a `callback` function. The stackless async ABI allows core wasm to
+repeatedly return to an event loop to receive events (delivered to the
+`callback`), thereby clearing the native stack for the benefit of the wasm
+runtime while waiting in the event loop.
+
+To propagate backpressure, it's necessary for a component to be able to say
+"there are too many concurrent export calls already in progress, don't start
+any more `async` calls until I let some of the current calls complete". Thus,
+the Component Model provides a built-in way for a component instance to apply
+and release backpressure that callers experience by having their import call
+immediately block.
+
+This backpressure mechanism provides the basis for how the sync and async ABIs
+interoperate:
+1. If a component calls an import using the async ABI, and the import is
+   implemented by a component using the sync ABI, the callee first acquires
+   an "exclusive" lock on the component instance and then starts executing. If
+   the callee blocks, execution is immediately transferred back to the caller
+   (as required by the async ABI).
+2. If another async call attempts to start in this same component instance, the
+   callee immediately blocks when acquiring the "exclusive" lock, waiting for the
+   previous call to return and release the lock.
+
+Note that because functions without `async` in their type are not allowed to
+block, non-`async` functions do not attempt to acquire the "exclusive" lock;
+they just barge in. Components exporting a mix of `async` and non-`async`
+functions (which again mostly only arises in the more advanced virtualization
+scenarios) must therefore take care to handle the "barge-in" case gracefully
+by, for example, allocating a fresh linear memory shadow stack.
+
+Lastly, WIT is extended with two new type constructors—`future<T>` and
+`stream<T>`—to allow new WIT interfaces to explicitly represent concurrency in
+*both* the sync and async ABIs in way that can be bound to many language's
+idiomatic futures, promises, streams and channels. Futures and streams are,
+semantically, unidirectional unbuffered channels with a dynamically-enforced
+[session type] describing the passing of exactly 1 or 0..N values, resp., with
+the additional ability for the reader end to signal a loss of interest
+to the writer end. Thus, futures and streams are more primitive concepts than,
+e.g., Unix pipes (which have an associated intermediate memory buffer that
+values are copied into and out of). Rather, streams could be used to *define*
+higher-level concepts like pipes, HTTP response bodies or stream transformers.
+E.g.:
+```wit
+resource pipe {
+  constructor(buffer-size: u32);
+  write: func(bytes: stream<u8>) -> result;
+  read: func() -> stream<u8>;
+}
+resource response {
+  constructor(body: stream<u8>);
+  consume-body: func() -> stream<u8>;
+}
+transform: func(in: stream<point>) -> stream<point>;
+```
+A `future` or `stream` in a function signature always refers to the transfer of
+unique ownership of the *readable end* of the future or stream. To get a
+*writable end*, a component must first internally create a (readable, writable)
+end pair (via the [`{stream,future}.new`] built-ins) and then pass the readable
+end elsewhere (e.g., in the above WIT, as a parameter to an imported
+`pipe.write` or as a result of an exported `transform`). Given the readable or
+writable end of a future or stream (represented as an `i32` index into the
+component instance's handle table), Core WebAssembly can then call a
+[`{stream,future}.{read,write}`] built-in to synchronously or asynchronously
+copy into or out of a caller-provided buffer of Core WebAssembly linear (or,
+soon, GC) memory.
+
+## Concepts
+
+The following concepts are defined as part of the Component Model's concurrency
+support.
+
+### Threads and Tasks
+
+As described in the [summary](#summary), each call to a component export
+logically creates a new ([green][green thread]) **thread** which, in many
+cases, can be optimized away and replaced with a synchronous function call.
+Each call to a component export also creates a new **task** that *contains*
+this new thread. Whereas a *thread* contains a callstack and other execution
+state, a *task* contains ABI bookkeeping state that is used to enforce the
+Canonical ABI's rules for export calls. Tasks are themselves contained by the
+component instance whose export was called. Thus, the overall containment
+relationship is:
+```
+Component Store
+  ↓ contains
+Component Instance
+  ↓ contains
+Task
+  ↓ contains
+Thread
+```
+where a **component store** is the top-level "thing" and analogous to a Core
+WebAssembly [store].
+
+The reason for the thread/task split is that, when one thread creates a new
+thread, the new thread is contained by the task of the original thread which
+creates an N:1 relationship between threads and tasks that ties N threads to
+the original export call (= "task") that transitively spawned those N threads.
+This relationship serves several purposes described in the following sections.
+
+In the Canonical ABI explainer, threads, tasks, component instances and
+component stores are represented by the [`Thread`], [`Task`],
+[`ComponentInstance`] and [`Store`] classes, resp.
+
+### Subtasks and Supertasks
+
+As mentioned above, calling a component export creates a task to track the
+state used to enforce Canonical ABI rules that apply to the callee (an example
+being: the number of received borrowed handles that still need to be dropped
+before the call returns).
+
+Symmetrically, calling a component *import* creates a **subtask** to track the
+state used to enforce Canonical ABI rules that apply to the *caller* (an
+example being: which handles have been lent that the caller can't drop until
+the call resolves).
+
+When one component calls another, there is thus a new task+subtask pair created
+to ensure that both components uphold their end of the Canonical ABI rules. But
+when the host calls a component export, there is only a task and,
+symmetrically, when a component calls a host-defined import, there is only a
+subtask. Thus, the **async call stack** at the point when a component calls a
+host-defined import will have the general form:
+```
+[Host]
+  ↓ host calls component export
+[Component Task]
+  ↓ component calls import implemented by another component's export 0..N times
+[Component Subtask <> Component Task]*
+  ↓ component calls import implemented by the host
+[Component Subtask <> Host task]
+```
+Here, the `↓` arrow represents the **subtask** relationship (the dual of which
+is the **supertask** relationship). Since a task+subtask pair have the same
+supertask, they can be thought of as a single node in the async call stack.
+
+A subtask/supertask relationship is immutably established when an import is
+called, setting the [current task](#current-thread-and-task) as the supertask
+of the new subtask created for the import call. Thus, one reason for
+associating every thread with a "containing task" is to ensure that there is
+always a well-defined async call stack.
+
+The async call stack is not currently observable to running components, except
+that it may nondeterministically appear as part of the callstack stored in
+`error-context` 📝. (In the [future](#TODO), functionality could be added to
+allow a [donut wrapping] parent to follow the async call stack from a child's
+import call to a child's export call.) Instead, the async call stack is
+currently used to provide backtraces when debugging, profiling, tracing and
+logging. While particular languages can and do maintain their own async call
+stacks in core wasm state, without the Component Model's async call stack,
+linkage *between* different languages would be lost at component boundaries,
+leading to a loss of overall context in multi-component applications.
+
+There is an important gap between the Component Model's minimal form of
+Structured Concurrency and the Structured Concurrency support that appears in
+popular source language features/libraries. Often, "[Structured Concurrency]"
+refers to an invariant that all "child tasks" finish or are cancelled before a
+"parent task" completes. However, the Component Model doesn't force a subtask's
+threads to all return before the supertask's threads all return. The reason for
+not enforcing a stricter form of Structured Concurrency at the Component Model
+level is that there are important use cases where forcing a supertask's thread
+to stay resident just to wait for subtasks to finish would waste resources
+without tangible benefit. Instead, we can say that once a supertask's last
+thread finishes execution, the supertask semantically "tail calls" any still-
+executing subtasks, staying technically-alive and on the async call stack until
+they complete, but not consuming real resources.
+
+For scenarios where one component wants to *non-cooperatively* put an upper
+bound on execution of a call into another component, a separate "[blast zone]"
+feature is necessary in any case (due to iloops and traps).
+
+### Current Thread and Task
+
+At any point in time while executing Core WebAssembly code or a [canonical
+built-in] called by Core WebAssembly code, there is a well-defined **current
+thread** whose containing task is the **current task**.
+
+The "current thread" is [specified in terms of] stack-switching with a
+`current-thread` effect for retrieving the current thread from the parent
+`resume` handler's state. However, due to structural invariants, engines can
+reliably optimize this `current-thread` effect by storing the current thread in
+the VM's execution state (or a special Core WebAssembly `global`) so that it
+could be cheaply loaded and/or kept in register state.
+
+Threads store their containing task so that the "current task" is always
+`current_thread.task`.
+
+Because there is always a well-defined current task and tasks are always
+created for calls to typed functions, it is therefore also always well-defined
+to refer to the current task's function's type, e.g., when returning a value or
+determining whether blocking is allowed.
+
+### Thread Built-ins
+
+The Component Model provides a set of built-in Core WebAssembly functions for
+creating and running threads.
+
+New threads are created with the [`thread.new-indirect`] built-in. As mentioned
+[above](#threads-and-tasks), a spawned thread inherits the task of the spawning
+thread which is why threads and tasks are N:1. `thread.new-indirect` adds a new
+thread to the component instance's threads table and returns the `i32` index of
+this table entry to the Core WebAssembly caller. Like [`pthread_create`],
+`thread.new-indirect` takes a Core WebAssembly function (via index into a
+`funcref` table) and a "closure" parameter to pass to the function when called
+on the new thread. However, unlike `pthread_create`, the new thread is
+initially in a "suspended" state and must be explicitly "resumed" using one of
+the following 3 thread built-ins. Once the thread is resumed, the thread can
+learn its own index by calling the [`thread.index`] built-in.
+
+A suspended thread (identified by thread-table index) can be resumed at some
+nondeterministic point in future via the [`thread.resume-later`] built-in. In
+contrast, the [`thread.yield-then-resume`] built-in switches execution to the
+given thread immediately, leaving the *calling* thread to be resumed at some
+nondeterministic point in the future. Lastly, the [`thread.suspend-then-resume`]
+built-in switches execution to the given thread immediately, like
+`thread.yield-then-resume`, but leaves the calling thread in the "suspended"
+state. These three functions can be used to resume both newly-created threads as
+well as threads that executed and then suspended.
+
+Threads can also explicitly put themselves in the "suspended" state without
+specifying the other thread to run by calling the [`thread.suspend`] built-in.
+This is useful if a thread needs to wait on some condition that will be met by
+some unknown thread in the future (which will resume the suspended thread).
+Similarly, threads can explicitly put themselves in the "ready to run" state
+without specifying the other thread to run by calling [`thread.yield`]. This is
+useful if a thread has a long-running computation without I/O but still needs to
+allow other cooperative threads to make progress concurrently.
+
+Lastly, in addition to being able to switch to "suspended" threads, threads can
+also switch to threads that are in a "ready to run" state by calling the
+[`thread.suspend-then-promote`] and [`thread.yield-then-promote`] built-ins
+which, like the `thread.{suspend,yield}-then-resume` built-ins, leave the
+calling thread in a "suspended" or "ready to run" state, resp. The calling
+thread *may* know that the target thread is ready to run (e.g., because the
+target thread is known to have yielded or to be waiting on a future/stream
+operation that the calling thread just completed). However, in general,
+readiness may depend on nondeterministic external I/O and the calling thread may
+just want to yield its timeslice to the target thread *if* it's ready as a
+scheduling optimization. Thus, if the target thread is *not* "ready to run",
+these built-ins are defined to gracefully fall back to the behavior of the
+`thread.{suspend,yield}` built-ins.
+
+Together, these thread built-ins support both the "green thread" [use
+cases](#goals), where Core WebAssembly code running inside the component wants
+to fully control thread scheduling (via suspending and resuming built-ins),
+and the "host thread" use cases, where the Core WebAssembly code wants to let
+the containing runtime nondeterministically schedule threads (via yielding
+built-ins) with hints (via the promoting built-ins) — or a mixture of both.
+
+
+### Thread-Local Storage
+
+Each thread contains a distinct mutable **thread-local storage** array. The
+current thread's thread-local storage can be read and written from core wasm
+code by calling the [`context.get`] and [`context.set`] built-ins.
+
+The thread-local storage array's length is currently fixed to contain exactly
+2 elements with the goal of allowing this array to be stored inline in whatever
+existing runtime data structure is already efficiently reachable from ambient
+compiled wasm code. Because module instantiation is declarative in the
+Component Model, the imported `context.{get,set}` built-ins can be inlined by
+the core wasm compiler as-if they were instructions, allowing the generated
+machine code to be a single load or store. This makes thread-local storage a
+natural place to store:
+1. a pointer to the linear-memory "shadow stack" pointer
+2. a pointer to a struct used by the runtime to implement the language's
+   thread-local features
+
+Both of `context.{get,set}` take an immediate argument of `i32` or `i64` to
+indicate the return or argument type. As part of component-level validation, all
+`context.{get,set}` definitions within a single component are required to
+specify the *same* thread-local element type, so that there is no mixing of
+types between loads and stores. This restriction would allow Core WebAssembly
+reference types to be used as thread-local storage element types in the future.
+
+When threads are created explicitly by `thread.new-indirect`, the lifetime of
+the thread-local storage array ends when the function passed to
+`thread.new-indirect` returns and thus any linear-memory allocations associated
+with the thread-local storage array should be eagerly freed by guest code right
+before returning. Similarly, since each call to an export logically creates a
+fresh thread, thread-local allocations can be eagerly released when this
+implicit thread exits by returning from the exported function or, if the
+stackless async ABI is used, returning the "exit" code to the event loop. This
+non-reuse of thread-local storage between distinct export calls avoids what
+would otherwise be a likely source of TLS-related memory leaks.
+
+Since the same mutable thread-local storage cells are shared by all core wasm
+running under the same thread in the same component, the cells' contents must
+be carefully coordinated in the same way as native code has to carefully
+coordinate native ISA state (e.g., the [FS or GS segment base address]). In the
+common case, thread-local storage is only `context.set` by the entry trampoline
+invoked by [`canon_lift`] and then all transitively reachable core wasm code
+(including from any `callback`) assumes `context.get` returns the same value.
+Thus, if any *non*-entry-trampoline code calls `context.set`, it is the
+responsibility of *that code* to restore this default assumption before
+allowing control flow to escape into the wild.
+
+For more information, see [`context.get`] in the AST explainer.
+
+### Blocking
+
+When a thread calls an import using the async ABI, the Component Model
+guarantees that if the callee [task](#threads-and-tasks) **blocks**, control
+flow is immediately returned back to the caller's thread. When the callee is
+implemented by the *host*, what counts as "blocking" is up to the host; e.g.,
+the host can arbitrarily determine whether file I/O "blocks" or not depending on
+whether the host is implemented using traditional synchronous OS syscalls or an
+asynchronous `io_uring`. However, when the callee is implemented by another
+component, the Component Model defines what counts as "blocking".
+
+There are several ways for a task to potentially "block":
+* synchronously calling an `async` function that transitively blocks
+  or hits [backpressure](#backpressure)
+* suspending the current thread via the
+  [`thread.suspend{,-then-promote}`](#thread-built-ins) built-ins
+* cooperatively yielding (e.g., during a long-running computation) via the
+  [`thread.yield{,-then-promote}`](#thread-built-ins) built-ins or, when
+  using the stackless `callback` ABI, returning with the `YIELD` code
+* waiting for one of a set of concurrent operations to complete via the
+  [`waitable-set.wait`](#waitables-and-waitable-sets) built-in or, when
+  using the stackless `callback` ABI, returning with the `WAIT` code
+* synchronously waiting for a stream or future operation to complete via the
+  [`{stream,future}.{,cancel-}{read,write}`](#streams-and-futures) built-ins
+* synchronously waiting for a subtask to cooperatively cancel itself via the
+  [`subtask.cancel`](#cancellation) built-in
+
+Since Component Model concurrency is [specified in terms of] the Core WebAssembly
+[stack-switching] proposal, each of the above represents a point where the
+[current thread](#current-thread-and-task) may suspend with the `$block` effect.
+Each of these points also serves as a **cooperative yield point** where the host
+may nondeterministically switch to another thread. However, just because the
+current thread *suspends* doesn't mean that the *task* has officially "blocked":
+what happens next depends on the state of the task and the declared function
+type:
+
+If the task has already [returned](#returning) a value to the caller, then
+control flow returns to the caller and, from the caller's perspective, the call
+returns normally without blocking. The callee's threads can continue executing,
+but what happens with these threads no longer matters to the caller.
+
+If instead the task has *not* yet returned a value and the callee's function
+type declares the `async` effect, control flow returns directly to the
+caller. If the caller used the *async* ABI, then control flow returns to Core
+WebAssembly, indicating that the call "blocked" by returning the non-zero index
+of a new [subtask](#subtasks-and-supertasks). If the caller used the *sync* ABI,
+then the caller immediately suspends with the `$block` effect and this process
+repeats recursively up the stack.
+
+Lastly, if the task has not yet returned a value and the callee's function type
+does *not* declare the `async` effect, then the task is not allowed to "block"
+and will trap if it ends up blocking. However, just because the *current thread*
+has suspended doesn't mean that the overall *task* is blocked: if there are any
+other threads in the callee's component instance that are in the ["ready to
+run"](#thread-built-ins) state, progressing them may unblock returning a value
+(e.g., by releasing a lock or computing a dependency) and so the Component Model
+repeatedly resumes threads that are ready to run until either the task returns a
+value or there are no more eligible ready threads (and the call traps).
+See the end of [`canon_lift`] in the Canonical ABI Explainer for more details.
+
+These rules achieve expressive parity with what would otherwise be possible
+using a CPS transform like [Asyncify] to implement a synchronous function. For
+example, they allow synchronous functions to be implemented by pthreads that
+switch and make progress at cooperative yield points. And if there is only a
+single pthread, since `thread.yield` always leaves the calling thread in a
+"ready to run" state, `thread.yield` effectively becomes a no-op (until a value
+is returned).
+
+
+### Waitables and Waitable Sets
+
+When an `async`-typed function is called with the async ABI and the call
+[blocks](#blocking) before returning a value, the return value to the Core
+WebAssembly caller is the index of a newly-created **subtask** representing the
+concurrent execution of the callee. Subtasks are a kind of **waitable**.
+Multiple waitables can be added to a **waitable set** to wait for one of them
+to make progress. Waitable sets work like a simplified version of [`epoll`] and
+are designed to avoid the O(N) cost associated with traditional
+[`select`]-style primitives.
+
+Specifically, waitable sets are created and used via the following built-ins:
+* [`waitable-set.new`]: return a new empty waitable set
+* [`waitable.join`]: add, move, or remove a given waitable to/from a given
+  waitable set
+* [`waitable-set.wait`]: wait until one of the waitables in the given set
+  has a pending event and then return that event
+* [`waitable-set.poll`]: if any of the waitables in the given set has a pending
+  event, return that event; otherwise return a sentinel "none" value
+
+In addition to subtasks, (the readable and writable ends of) [streams and
+futures](#streams-and-futures) are *also* waitables, which means that a single
+waitable set can uniformly wait on all the kinds of heterogeneous I/O available
+in the Component Model.
+
+### Streams and Futures
+
+Streams and Futures have two "ends": a *readable end* and *writable end*. When
+*consuming* a `stream` or `future` value as a parameter (of an export call with
+a `stream` or `future` somewhere in the parameter types) or result (of an
+import call with a `stream` or `future` somewhere in the result type), the
+receiver always gets *unique ownership* of the *readable end* of the `stream`
+or `future`. When *producing* a `stream` or `future` value as a parameter (of
+an import call) or result (of an export call), the producer can *transfer
+ownership* of a readable end that it has either been given by the outside world
+or freshly created via `{stream,future}.new` (which also return a fresh paired
+writable end).
+
+Based on this, `stream<T>` and `future<T>` values can be passed between
+functions as if they were synchronous `list<T>` and `T` values, resp. For
+example, given `f` and `g` with types:
+```wit
+f: func(x: whatever) -> stream<T>;
+g: func(s: stream<T>) -> stuff;
+```
+Given this, `g(f(x))` works as you might hope, concurrently streaming the
+results of `f` into `g`.
+
+Given the readable or writable end of a stream, core wasm code can call the
+imported `stream.read` or `stream.write` canonical built-ins, resp., passing the
+pointer and length of a linear-memory buffer to write-into or read-from, resp.
+These built-ins can either return immediately if >0 elements were able to be
+written or read immediately (without blocking) or return a sentinel "blocked"
+value indicating that the read or write will execute concurrently. The readable
+and writable ends of streams and futures can then be
+[waited](#waitables-and-waitable-sets) on to make progress. Notification of
+progress signals *completion* of a read or write (i.e., the bytes have already
+been copied into the buffer). Additionally, *readiness* (to perform a read or
+write in the future) can be queried and signalled by performing a `0`-length
+read or write (see the [Stream and Future State] section in the Canonical ABI
+explainer for details).
+
+As a temporary limitation, if a `read` and `write` for a single stream or
+future occur from within the same component and the element type is a
+non-empty, non-number type, there is a trap. In the future this limitation will
+be removed.
+
+The `T` element type of streams and futures is optional, such that `future` and
+`stream` can be written in WIT without a trailing `<T>`. In this case, the
+asynchronous "values(s)" being delivered are effectively meaningless [unit]
+values. However, the *timing* of delivery is meaningful and thus `future` and
+`stream` can used to convey timing-related information. Note that, since
+functions are asynchronous by default, a plain `f: func()` conveys completion
+without requiring an explicit `future` return type. Thus, a function like
+`f2: func() -> future` would convey *two* events: first, the return of `f2`, at
+which point the caller receives the readable end of a `future` that, when
+successfully read, conveys the completion of a second event.
+
+Given the readable end of one stream/future and the writable end of another, the
+`{stream,future}.forward` built-ins can be called to efficiently forward all
+remaining values from the readable end into the writable end, avoiding any
+intermediate copies. Doing so relinquishes ownership of both handles, allowing
+the calling component instance to be eagerly torn down while the forwarding is
+in progress.
+
+The [Stream and Future State] section describes the runtime state maintained for
+streams and futures by the Canonical ABI.
+
+### Stream Readiness
+
+When passed a non-zero-length buffer, the `stream.read` and `stream.write`
+built-ins are "completion-based" (in the style of, e.g., [Overlapped I/O] or
+[`io_uring`]) in that they complete only once one or more values have been
+copied to or from the memory buffer passed in at the start of the operation.
+In a Component Model context, completion-based I/O avoids intermediate copies
+and enables a greater degree of concurrency in a number of cases and thus
+language producer toolchains should attempt to pass non-zero-length buffers
+whenever possible.
+
+Given completion-based `stream.{read,write}` built-ins, "readiness-based" APIs
+(in the style of, e.g., [`select`] or [`epoll`] used in combination with
+[`O_NONBLOCK`]) can be implemented by passing an intermediate non-zero-length
+memory buffer to `stream.{read,write}` and signalling "readiness" once the
+operation completes. However, this approach incurs extra copying overhead. To
+avoid this overhead in a best-effort manner, `stream.{read,write}` allow the
+buffer length to be zero in which case "completion" of the operation is allowed
+(but not required) to wait to complete until the other end is "ready". As the
+"but not required" caveat suggests, after a zero-length `stream.{read,write}`
+completes, there is *no* guarantee that a subsequent non-zero-length
+`stream.{read,write}` call will succeed without blocking. This lack of
+guarantee is due to practical externalities and because readiness may simply
+not be possible to implement given certain underlying host APIs.
+
+As an example, to implement `select()` and non-blocking `write()` in
+[wasi-libc], the following implementation strategy could be used (a symmetric
+scheme is also possible for `read()`):
+* The libc-internal file descriptor table tracks whether there is currently a
+  pending write and whether `select()` has indicated that this file descriptor
+  is ready to write.
+* When `select()` is called to wait for a stream-backed file descriptor to be
+  writable:
+  * `select()` starts a zero-length write if there is not already a pending
+    write in progress and then [waits](#waitables-and-waitable-sets) on the
+    stream (along with the other `select()` arguments).
+  * If the pending write completes, `select()` updates the file descriptor and
+    returns that the file descriptor is ready.
+* When `write()` is called for an `O_NONBLOCKING` file descriptor:
+  * If there is already a pending `stream.write` for this file descriptor,
+    `write()` immediately returns `EWOULDBLOCK`.
+  * Otherwise:
+    * `write()` calls `stream.write`, forwarding the caller's buffer.
+    * If `stream.write` returns that it successfully copied some bytes without
+      blocking, `write()` returns success.
+    * Otherwise, to avoid blocking:
+      * `write()` calls [`stream.cancel-write`] to regain ownership of the
+        caller's buffer.
+      * If `select()` has *not* indicated that this file descriptor is ready,
+        `write()` starts a zero-length write and returns `EWOULDBLOCK`.
+      * Otherwise, to avoid the potential infinite loop:
+        * `write()` copies the contents of the caller's buffer into an
+          internal buffer, starts a new `stream.write` to complete in the
+          background using the internal buffer, and then returns success.
+        * The above logic implicitly waits for this background `stream.write`
+          to complete before the file descriptor is considered ready again.
+
+The fallback path for when the zero-length write does not accurately signal
+readiness resembles the buffering normally performed by the kernel for a
+`write` syscall and reflects the fact that streams do not perform internal
+buffering between the readable and writable ends.
+
+### Backpressure
+
+Once a component exports functions using the async ABI, multiple concurrent
+export calls can start piling up, each consuming some of the component's finite
+private resources (like linear memory), requiring the component to be able to
+exert *backpressure* to allow some tasks to finish (and release private
+resources) before admitting new async export calls. To do this, a component may
+call the [`backpressure.inc`] built-in to increment a component-instance-wide
+"backpressure" counter until resources are freed and then call
+[`backpressure.dec`] to decrement the counter. When the backpressure counter is
+greater than zero, new export calls immediately return in the "starting" state
+without calling the component's Core WebAssembly code. By using a counter
+instead of a boolean flag, unrelated pieces of code can report backpressure for
+distinct limited resources without prior coordination.
+
+In addition to *explicit* backpressure set by wasm code, there is also an
+*implicit* source of backpressure to ensure [Component Invariant] #2. In
+particular, when an `async`-typed export is lifted with the sync ABI or the
+stackless async ABI, a component-instance-wide lock is implicitly acquired every
+time core wasm is executed. By returning to the event loop after every event
+(instead of once at the end of the task), stackless async exports release the
+lock between every event, allowing a higher degree of concurrency than
+synchronous exports. Stackful async exports ignore the lock entirely and thus
+achieve the highest degree of (cooperative) concurrency.
+
+Since non-`async` functions are not allowed to block (including due to
+backpressure) and also don't pile up like `async` functions, non-`async`
+functions ignore backpressure (explicit and implicit) entirely. If a component
+exports a mix of `async` and non-`async` functions, code generation must
+therefore be prepared to handle non-`async` functions executing at any core wasm
+import call to a `canon` definition (with the exception of select non-reentrant
+built-ins like `resource.rep`).
+
+Once a task is allowed to start according to these backpressure rules, its
+arguments are lowered into the callee's linear memory and the task is in
+the "started" state.
+
+### Returning
+
+The way an `async` export returns its value using the async ABI is by calling
+[`task.return`], passing the core values that are to be lifted as *parameters*.
+When using the async ABI, *any* of the threads contained by a task can call
+`task.return`; there is no "main thread" of a task. When the last thread of a
+task returns, there is a trap if `task.return` has not been called. Thus, *some*
+thread (either the thread created implicitly for the initial export call or some
+thread transitively created by that thread) must call `task.return`.
+
+Returning values by calling `task.return` allows a task to continue executing
+even after it has passed its initial results to the caller. This is also
+possible even with the sync ABI by using cooperative threads. Continuing
+to execute after returning a value can be useful for various finalization tasks
+(freeing memory or performing logging, billing or metrics operations) that don't
+need to be on the critical path of returning a value to the caller, but the
+major use of executing code after `task.return` is to continue to read and write
+from streams and futures. For example, a stream transformer function of type
+`func(in: stream<T>) -> stream<U>` will immediately `task.return` a stream
+created via `stream.new` and then sit in a loop interleaving `stream.read`s (of
+the readable end passed for `in`) and `stream.write`s (of the writable end it
+`stream.new`ed) before exiting the task.
+
+Once `task.return` is called, the task is in the "returned" state. Calling
+`task.return` when not in the "started" state traps.
+
+### Borrows
+
+Component Model async support is careful to ensure that `borrow`ed handles work
+as expected in an asynchronous setting, extending the dynamic enforcement used
+for synchronous code:
+
+When a caller initially lends an `own`ed or `borrow`ed handle to a callee, a
+`num_lends` counter on the lent handle is incremented when the subtask starts
+and decremented when the caller is notified that the subtask has
+[returned](#returning). If the caller tries to drop a handle while the handle's
+`num_lends` is greater than zero, the caller traps. Symmetrically, each
+`borrow` handle passed to a callee increments a `num_borrows` counter on the
+callee task that is decremented when the `borrow` handle is dropped. If a
+callee task attempts to return when its `num_borrows` is greater than zero, the
+callee traps.
+
+In an asynchronous setting, since there can be multiple overlapping async tasks
+executing in a component instance, a borrowed handle must track *which* task's
+`num_borrow`s was incremented so that the correct counter can be decremented
+and there is a trap upon `task.return` if `num_borrows` is nonzero.
+
+### Cancellation
+
+Once an async call has started, blocked and been added to the caller's table,
+the caller may decide that it no longer needs the results or effects of the
+subtask. In this case, the caller may **cancel** the subtask by calling the
+[`subtask.cancel`] built-in.
+
+Once cancellation is requested, since the subtask may have already racily
+returned a value, the caller may still receive a return value. However, the
+caller may also be notified that the subtask is in one of two additional
+terminal states:
+* the subtask was **cancelled before it started**, in which case the caller's
+  arguments were not passed to the callee (in particular, owned handles were
+  not transferred); or
+* the subtask was **cancelled before it returned**, in which case the arguments
+  were passed, but no values were returned. However, all borrowed handles lent
+  during the call have been dropped.
+
+Thus there are *three* terminal states for a subtask: returned,
+cancelled-before-started and cancelled-before-returned. A subtask in one of
+these terminal states is said to be **resolved**. A resolved subtask has always
+dropped all the borrowed handles that it was lent during the call.
+
+Cancellation is *cooperative*, delivering a *request* for cancellation and then
+allowing the subtask to continue executing for an arbitrary amount of time
+(calling imports, performing I/O and everything else) until the subtask decides
+to call [`task.cancel`] to confirm the cancellation or, for whatever reason,
+call `task.return` as-if there had been no cancellation. `task.cancel` enforces
+the same "all borrowed handles dropped" rule as `task.return`, so that once a
+subtask is resolved, the caller knows its lent handles have been returned.
+
+If the subtask was waiting to start due to [backpressure](#backpressure), the
+subtask is immediately aborted without running the callee at all, returning
+cancelled-before-started. Otherwise, `subtask.cancel` records the "pending
+cancellation request" in the subtask and attempts to resume execution in the
+subtask's component instance in the hopes that the subtask will quickly resolve
+itself. However, if there are no ready threads or, if there are, at least one
+thread is resumed and then blocks or exits without having resolved the subtask,
+the host is free to declare that cancellation has blocked. In this case,
+asynchronous calls to `subtask.cancel` will immediately return a "blocked" code
+and the caller must wait for progress using a waitable set. Synchronous calls to
+`subtask.cancel` simply block until the subtask is resolved.
+
+The ready threads resumed by cancellation can be ready for all the normal
+reasons described above (yielding, I/O progress, etc). However, implicit threads
+using the `callback` ABI will *additionally* become ready due to the pending
+cancellation request itself (as long as the run-to-completion rules mentioned
+above are satisfied). If resumed, the `callback` will be passed a "task
+cancelled" event code to indicate that cancellation has been requested and that
+`task.cancel` may be called (instead of `task.return`). In the [future](#TODO),
+before the stackful ABI is released, other cancellation delivery mechanisms will
+be added so that threads waiting via `waitable-set.wait` can also become ready
+and receive "task cancelled". Until then, `waitable-set.wait` will never return
+"task cancelled".
+
+The Component Model does not provide a mechanism to force prompt termination of
+threads as this can lead to leaks and corrupt state in a still-live component
+instance. In the future, prompt termination could be added as part of a "[blast
+zone]" feature that promptly destroys whole component instances, automatically
+dropping all handles held by the destroyed instance, thereby avoiding the leak
+and corruption hazards.
+
+### Nondeterminism
+
+Component Model concurrency support necessarily introduces a degree of
+nondeterminism. However, until Core WebAssembly adds
+[shared-everything-threads], Component Model concurrency is [cooperative],
+which means that nondeterministic behavior can only be observed at well-defined
+points in the program. Once [shared-everything-threads] is added,
+WebAssembly's full [weak memory model] will be observable, but only within
+components that use the new `shared` attribute on functions.
+
+One inherent source of potential nondeterminism that is independent of the
+Component Model is the behavior of host-defined import and export calls.
+Component Model concurrency extends this host-dependent nondeterminism to the
+behavior of the `read` and `write` built-ins called on `stream`s and `future`s
+that have been passed to and from the host. However, just as with import and
+export calls, it is possible for a host to define a deterministic ordering of
+`stream` and `future` `read` and `write` behavior such that overall component
+execution is deterministic.
+
+In addition to the inherent host-dependent nondeterminism, the Component Model
+adds several internal sources of nondeterministic behavior that are described
+next. However, each of these sources of nondeterminism can be removed by a host
+implementing the WebAssembly [Deterministic Profile], maintaining the ability for
+a host to provide spec-defined deterministic component execution for components.
+
+The following sources of nondeterminism arise via internal built-in operations
+defined by the Component Model:
+* If there are multiple waitables with a pending event in a waitable set that
+  is being waited on or polled, there is a nondeterministic choice of which
+  waitable's event is delivered first.
+* If multiple threads wait on or poll the same waitable set at the same time,
+  the distribution of events to threads is nondeterministic.
+* Whenever a thread yields or waits on a waitable set with an already
+  pending event, whether or not the thread blocks and transfers execution to an
+  async caller or another thread is nondeterministic.
+* If multiple threads that previously blocked can be resumed at the same
+  time, the order in which they are resumed is nondeterministic.
+* If multiple tasks are blocked by backpressure and the backpressure is
+  disabled, the order in which these pending tasks start, along with how
+  they interleave with new tasks, is nondeterministic.
+* When `subtask.cancel` is called for a task that has started (i.e., passed the
+  backpressure gate), the choice of which ready thread to resume (if there are
+  multiple) and how many times to resume (if the first resumption blocks without
+  resolving the subtask) is nondeterministic.
+
+Despite the above, the following scenarios do behave deterministically:
+* If a component `a` asynchronously calls the export of another component `b`,
+  control flow deterministically transfers to `b` and then back to `a` when
+  `b` returns or blocks.
+* If a component `a` asynchronously cancels a subtask in another component `b`
+  that was blocked before starting due to backpressure, cancellation completes
+  deterministically and immediately.
+* When both ends of a stream or future are owned by wasm components, the
+  behavior of all read, write, cancel and drop operations is deterministic
+  (modulo any nondeterministic execution that determines the ordering in which
+  the operations are performed).
+
+### Reentrance
+
+In general, whenever a component calls an imported function, the component must
+assume that before the import call returns, the callee may **reenter** the
+caller's component instance by recursively calling an exported function. For
+example, if `component.wasm` has type:
+```wat
+(component
+  (import "imp" (func))
+  (export "exp" (func))
+)
+```
+using the [JS API], reentrance is possible via:
+```js
+function imp() {
+  instance.exports.exp();
+}
+var { instance } = await WebAssembly.instantiateStreaming(fetch('component.wasm'), { imp });
+instance.exports.exp();
+```
+Pure component-to-component reentrance is also possible via [donut wrapping],
+using `call_indirect` and the parent's mutable function table to close the loop.
+
+If `component.wasm` is changed to have type:
+```wat
+(component
+  (import "imp" (func async))
+  (export "exp" (func async))
+)
+```
+the same kind of recursion is possible if the above JS code is modified to use
+`async`/`await`:
+```js
+async function imp() {
+  await instance.exports.exp();
+}
+var { instance } = await WebAssembly.instantiateStreaming(fetch('component.wasm'), { imp });
+await instance.exports.exp();
+```
+However, this call will deadlock if `component.wasm` implements `exp` using the
+sync or stackless async ABI and calls `imp` synchronously. This is due to the
+[automatic backpressure](#backpressure) mentioned above that is necessary to
+preserve the run-to-completion semantics of [Component Invariant] #2. However,
+if `imp` is called asynchronously and `exp` doesn't wait for the result, there
+is no deadlock (the outer task completes, backpressure is disabled, and the
+inner task can start). Alternatively, if `exp` is implemented using the
+*stackful* async ABI, there is no automatic backpressure and it's up to the
+guest to handle the recursion without deadlock (as with the preceding
+synchronous case). Consequently, a host or parent component must be careful to
+only perform recursive reentrance on components when explicitly supported by the
+component's documented API.
+
+Setting aside recursive reentrance, with concurrency support, a new kind of
+*non-recursive* reentrance is also possible where a call to `exp`
+[blocks](#blocking) and the caller reenters the callee with a second call
+to `exp` that runs concurrently with the first. From JS code this looks like:
+```js
+async function imp() {
+  await ... some I/O ...
+}
+var { instance } = await WebAssembly.instantiateStreaming(fetch('component.wasm'), { imp });
+let results = await Promise.all([
+  instance.exports.exp(),
+  instance.exports.exp()
+]);
+```
+Unlike recursive reentrance, this non-recursive reentrance is expected to be
+commonplace and enabling it is one of the primary goals of having native
+concurrency support in the Component Model. Moreover, because the two `exp`
+tasks above are *siblings* in the [async call stack](#subtasks-and-supertasks),
+there shouldn't be any deadlock hazards unless there is implicit synchronization
+between the siblings (e.g., through their shared linear memory). Thus, while
+reentrance is possible both with and without `async`, `async` "dials up" the
+expected degree of reentrance but also "dials down" the hazards associated with
+reentrance.
+
+Since recursive reentrance is hazardous while non-recursive reentrance is far
+less so, a reasonable question is whether there could be some form of opt-in at
+the component and WIT level (enforced by traps in the ABI). Unfortunately, due
+to the dynamism of task dependency and the open-ended nature of host embeddings,
+there is no reliable way to eagerly distinguish the two cases without
+introducing significant false positives and negatives.
+
+## Interaction with the start function
+
+All start functions (both component-level and Core WebAssembly start functions
+called via `core instance` definition) implicitly have the component-level
+function type `func()`, i.e., they are synchronous and take and return no
+arguments. Based on the above description of synchronous functions, this means
+that start functions may not block before returning. However, if a
+component-level start function is lifted using the async ABI, it *may* block
+after calling `task.return`, and may thus serve as a long-running "background
+task" to which work can be dispatched (e.g., via the `setInterval()` or
+`requestIdleCallback()` JavaScript APIs). From the perspective of [structured
+concurrency], these background tasks are new task tree roots (siblings to the
+roots created when component exports are called by the host).
+
+As a post-0.3.0 follow-up [TODO](#TODO), component type definitions should be
+extended to allow an `async` effect that declares that component instantiation
+is allowed to [block](#blocking). This would be necessary to implement, e.g.,
+JS [top-level `await`] or I/O in C++ constructors executing during `start`.
+
+
+## Async ABI
+
+At an ABI level, native async in the Component Model defines for every
+`async`-typed function a non-blocking core function signature that can be
+used instead of or in addition to the existing ([WASI] 0.2) synchronous
+core function signature. This non-blocking core function signature is intended
+to be called or implemented by generated bindings which then map the low-level
+core async protocol to the languages' higher-level native concurrency features.
+
+### Async Import ABI
+
+Given these imported WIT functions (using the fixed-length-list feature 🔧):
+```wit
+world w {
+  import foo: async func(s: string) -> u32;
+  import bar: async func(s: string) -> string;
+  import baz: async func(t: list<u64; 5>) -> string;
+  import quux: async func(t: list<u32; 17>) -> string;
+}
+```
+the default/synchronous lowered import function signatures (assuming 32-bit memories) are:
+```wat
+;; sync
+(func $foo (param $s-ptr i32) (param $s-len i32) (result i32))
+(func $bar (param $s-ptr i32) (param $s-len i32) (param $out-ptr i32))
+(func $baz (param i64 i64 i64 i64 i64) (param $out-ptr i32))
+(func $quux (param $in-ptr i32) (param $out-ptr i32))
+```
+Here: `foo`, `bar` and `baz` pass their parameters as "flattened" core value
+types while `quux` passes its parameters via the `$in-ptr` linear memory
+pointer (due to the Canonical ABI limitation of 16 maximum flattened
+parameters). Similarly, `foo` returns its result as a single core value while
+`bar`, `baz` and `quux` return their results via the `$out-ptr` linear memory
+pointer (due to the current Canonical ABI limitation of 1 maximum flattened
+result).
+
+The corresponding asynchronous lowered import function signatures are:
+```wat
+;; async
+(func $foo (param $s-ptr i32) (param $s-len i32) (param $out-ptr i32) (result i32))
+(func $bar (param $s-ptr i32) (param $s-len i32) (param $out-ptr i32) (result i32))
+(func $baz (param $in-ptr i32) (param $out-ptr i32) (result i32))
+(func $quux (param $in-ptr i32) (param $out-ptr i32) (result i32))
+```
+Comparing signatures, the differences are:
+* Async-lowered functions have a maximum of 4 flat parameters (not 16).
+* Async-lowered functions always return their value via linear memory pointer.
+* Async-lowered functions always have a single `i32` "status" code.
+
+Additionally, *when* the parameter and result pointers are read/written depends
+on the status code:
+* If the low 4 bits of the status are `0`, the call didn't even start and so
+  `$in-ptr` hasn't been read and `$out-ptr` hasn't been written and the high
+  28 bits are the index of a new async subtask to wait on.
+* If the low 4 bits of the status are `1`, the call started, `$in-ptr` was
+  read, but `$out-ptr` hasn't been written and the high 28 bits are the index
+  of a new async subtask to wait on.
+* If the low 4 bits of the status are `2`, the call returned and so `$in-ptr`
+  and `$out-ptr` have been read/written and the high 28 bits are `0` because
+  there is no async subtask to wait on.
+
+When a parameter/result pointer hasn't yet been read/written, the async caller
+must take care to keep the region of memory allocated to the call until
+receiving an event indicating that the async subtask has started/returned.
+
+Other example asynchronous lowered signatures:
+
+| WIT function type                  | Async ABI             |
+| ---------------------------------- | --------------------- |
+| `async func()`                     | `(func (result i32))` |
+| `async func() -> string`           | `(func (param $out-ptr i32) (result i32))` |
+| `async func(x: f32) -> f32`        | `(func (param $x f32) (param $out-ptr i32) (result i32))` |
+| `async func(s: string, t: string)` | `(func (param $s-ptr i32) (param $s-len i32) (param $t-ptr i32) (param $t-len i32) (result i32))` |
+
+`future` and `stream` can appear anywhere in the parameter or result types. For example:
+```wit
+async func(s1: stream<future<string>>, s2: list<stream<string>>) -> result<stream<string>, stream<error>>
+```
+In *both* the sync and async ABIs, a `future` or `stream` in the WIT-level type
+translates to a single `i32` in the ABI.  This `i32` is an index into the
+current component instance's handle table. For example, for the WIT function type:
+```wit
+async func(f: future<string>) -> future<u32>
+```
+the synchronous ABI has signature:
+```wat
+(func (param $f i32) (result i32))
+```
+and the asynchronous ABI has the signature:
+```wat
+(func (param $f i32) (param $out-ptr i32) (result i32))
+```
+where `$f` is the index of a future (not a pointer to one) while while
+`$out-ptr` is a pointer to a linear memory location that will receive an `i32`
+index.
+
+For the runtime semantics of this `i32` index, see `lift_stream`,
+`lift_future`, `lower_stream` and `lower_future` in the [Canonical ABI
+Explainer]. For a complete description of how async imports work, see
+[`canon_lower`] in the Canonical ABI Explainer.
+
+
+#### Async Export ABI
+
+Given an exported WIT function:
+```wit
+world w {
+  export foo: async func(s: string) -> string;
+}
+```
+
+The default sync export function signature for export `foo` is:
+```wat
+;; sync
+(func (param $s-ptr i32) (param $s-len i32) (result $retp i32))
+```
+where (working around the continued lack of multi-return support throughout
+the core wasm toolchain) `$retp` must be a 4-byte-aligned pointer into linear
+memory from which the 8-byte (pointer, length) of the string result can be
+loaded.
+
+The async export ABI provides two flavors: stackful and stackless.
+
+##### Stackful Async Exports
+
+The stackful ABI is currently gated by the 🚟 feature.
+
+The async stackful export function signature for export `foo` (defined above
+in world `w`) is:
+```wat
+;; async, no callback
+(func (param $s-ptr i32) (param $s-len i32))
+```
+
+The parameters work just like synchronous parameters.
+
+There is no core function result because a callee [returns](#returning) their
+value by *calling* the *imported* `task.return` function which has signature:
+```wat
+;; task.return
+(func (param $ret-ptr i32) (param $ret-len i32))
+```
+
+The parameters of `task.return` work the same as if the WIT return type was the
+WIT parameter type of a synchronous function. For example, if more than 16
+core parameters would be needed, a single `i32` pointer into linear memory is
+used.
+
+##### Stackless Async Exports
+
+The async stackless export function signature for export `foo` (defined above
+in world `w`) is:
+```wat
+;; async, callback
+(func (param $s-ptr i32) (param $s-len i32) (result i32))
+```
+
+The parameters also work just like synchronous parameters. The callee returns
+their value by calling `task.return` just like the stackful case.
+
+The `(result i32)` lets the core function return what it wants the runtime to do next:
+* If the low 4 bits are `0`, the callee completed (and called `task.return`)
+  without blocking.
+* If the low 4 bits are `1`, the callee wants to yield, allowing other code
+  to run, but resuming thereafter without waiting on anything else.
+* If the low 4 bits are `2`, the callee wants to wait for an event to occur in
+  the waitable set whose index is stored in the high 28 bits.
+
+When an async stackless function is exported, a companion "callback" function
+must also be exported with signature:
+```wat
+(func (param i32 i32 i32) (result i32))
+```
+
+The `(result i32)` has the same interpretation as the stackless export function
+and the runtime will repeatedly call the callback until a value of `0` is
+returned. The `i32` parameters describe what happened that caused the callback
+to be called again.
+
+For a complete description of how async exports work, see [`canon_lift`] in the
+Canonical ABI Explainer.
+
+
+## Examples
+
+For a list of working examples expressed as executable WebAssembly Test (WAST)
+files, see [this directory](../../test/async).
+
+This rest of this section sketches the shape of a component that uses `async`
+to lift and lower its imports and exports with both the stackful and stackless
+ABI options.
+
+### Stackful ABI example
+
+Starting with the stackful ABI, the meat of this example component is replaced
+with `...` to focus on the overall flow of function calls:
+```wat
+(component
+  (import "fetch" (func $fetch async (param "url" string) (result (list u8))))
+  (core module $Libc
+    (memory (export "mem") 1)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) ...)
+    ...
+  )
+  (core module $Main
+    (import "" "mem" (memory 1))
+    (import "" "realloc" (func (param i32 i32 i32 i32) (result i32)))
+    (import "" "fetch" (func $fetch (param i32 i32 i32) (result i32)))
+    (import "" "waitable-set.new" (func $new_waitable_set (result i32)))
+    (import "" "waitable-set.wait" (func $wait (param i32 i32) (result i32)))
+    (import "" "waitable.join" (func $join (param i32 i32)))
+    (import "" "task.return" (func $task_return (param i32 i32)))
+    (global $wsi (mut i32))
+    (func $start
+      (global.set $wsi (call $new_waitable_set))
+    )
+    (start $start)
+    (func (export "summarize") (param i32 i32)
+      ...
+      loop
+        ...
+        call $fetch      ;; pass a string pointer, string length and pointer-to-list-of-bytes outparam
+        ...              ;; ... and receive the index of a new async subtask
+        global.get $wsi
+        call $join       ;; ... and add it to the waitable set
+        ...
+      end
+      loop               ;; loop as long as there are any subtasks
+        ...
+        global.get $wsi
+        call $wait       ;; wait for a subtask in the waitable set to make progress
+        ...
+      end
+      ...
+      call $task_return  ;; return the string result (pointer,length)
+      ...
+    )
+  )
+  (core instance $libc (instantiate $Libc))
+  (alias $libc "mem" (core memory $mem))
+  (alias $libc "realloc" (core func $realloc))
+  ;; requires 🚟 for the stackful abi
+  (canon lower $fetch async (memory $mem) (realloc $realloc) (core func $fetch'))
+  (canon waitable-set.new (core func $new))
+  (canon waitable-set.wait (memory $mem) (core func $wait))
+  (canon waitable.join (core func $join))
+  (canon task.return (result string) (memory $mem) (core func $task_return))
+  (core instance $main (instantiate $Main (with "" (instance
+    (export "mem" (memory $mem))
+    (export "realloc" (func $realloc))
+    (export "fetch" (func $fetch'))
+    (export "waitable-set.new" (func $new))
+    (export "waitable-set.wait" (func $wait))
+    (export "waitable.join" (func $join))
+    (export "task.return" (func $task_return))
+  ))))
+  (canon lift (core func $main "summarize")
+    async (memory $mem) (realloc $realloc)
+    (func $summarize async (param "urls" (list string)) (result string)))
+  (export "summarize" (func $summarize))
+)
+```
+Because the imported `fetch` function is `canon lower`ed with `async`, its core
+function type (shown in the first import of `$Main`) takes pointers to the
+parameter and results (which are asynchronously read-from and written-to) and
+returns the index of a new subtask. `summarize` calls `waitable-set.wait`
+repeatedly until all `fetch` subtasks have finished, noting that
+`waitable-set.wait` can return intermediate progress (as subtasks transition
+from "starting" to "started" to "returned") which tell the surrounding core
+wasm code that it can reclaim the memory passed arguments or use the results
+that have now been written to the outparam memory.
+
+Because the `summarize` function is `canon lift`ed with `async`, its core
+function type has no results; results are passed out via `task.return`. It also
+means that multiple `summarize` calls can be active at once: once the first
+call to `waitable-set.wait` blocks, the runtime will suspend its callstack
+(fiber) and start a new stack for the new call to `summarize`. Thus,
+`summarize` must be careful to allocate a separate linear-memory stack in its
+entry point and store it in context-local storage (via `context.set`) instead
+of simply using a `global`, as in a synchronous function.
+
+Note that removing `async` from the type of `summarize` specified in the `canon
+lift` definition would cause the above component to trap when it attempted to
+call `waitable-set.wait`.
+
+### Stackless ABI example
+
+The stackful example can be re-written to use the `callback` immediate (thereby
+avoiding the need for fibers) as follows.
+
+Note that the internal structure of this component is almost the same as the
+previous one (other than that `summarize` is now lifted from *two* core wasm
+functions instead of one) and the public signature of this component is
+the exact same.
+
+Thus, the difference is just about whether the stack is cleared by the
+core wasm code between events, not externally-visible behavior.
+
+```wat
+(component
+  (import "fetch" (func $fetch async (param "url" string) (result (list u8))))
+  (core module $Libc
+    (memory (export "mem") 1)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) ...)
+    ...
+  )
+  (core module $Main
+    (import "" "mem" (memory 1))
+    (import "" "realloc" (func (param i32 i32 i32 i32) (result i32)))
+    (import "" "fetch" (func $fetch (param i32 i32 i32) (result i32)))
+    (import "" "waitable-set.new" (func $new_waitable_set (result i32)))
+    (import "" "waitable.join" (func $join (param i32 i32)))
+    (import "" "task.return" (func $task_return (param i32 i32)))
+    (global $wsi (mut i32))
+    (func $start
+      (global.set $wsi (call $new_waitable_set))
+    )
+    (start $start)
+    (func (export "summarize") (param i32 i32) (result i32)
+      ...
+      loop
+        ...
+        call $fetch           ;; pass a string pointer, string length and pointer-to-list-of-bytes outparam
+        ...                   ;; ... and receive the index of a new async subtask
+        global.get $wsi
+        call $join            ;; ... and add it to the waitable set
+        ...
+      end
+      (i32.or                 ;; return (WAIT | ($wsi << 4))
+        (i32.const 2)         ;; 2 -> WAIT
+        (i32.shl
+          (global.get $wsi)
+          (i32.const 4)))
+    )
+    (func (export "cb") (param $event i32) (param $p1 i32) (param $p2 i32)
+      ...
+      if (result i32)         ;; if subtasks remain:
+        (i32.or               ;; return (WAIT | ($wsi << 4))
+          (i32.const 2)
+          (i32.shl
+            (global.get $wsi)
+            (i32.const 4)))
+      else                    ;; if no subtasks remain:
+        ...
+        call $task_return     ;; return the string result (pointer,length)
+        ...
+        i32.const 0           ;; return EXIT
+      end
+    )
+  )
+  (core instance $libc (instantiate $Libc))
+  (alias $libc "mem" (core memory $mem))
+  (alias $libc "realloc" (core func $realloc))
+  (canon lower $fetch async (memory $mem) (realloc $realloc) (core func $fetch'))
+  (canon waitable-set.new (core func $new))
+  (canon waitable.join (core func $join))
+  (canon task.return (result string) (memory $mem) (core func $task_return))
+  (core instance $main (instantiate $Main (with "" (instance
+    (export "mem" (memory $mem))
+    (export "realloc" (func $realloc))
+    (export "fetch" (func $fetch'))
+    (export "waitable-set.new" (func $new))
+    (export "waitable.join" (func $join))
+    (export "task.return" (func $task_return))
+  ))))
+  (canon lift (core func $main "summarize")
+    async (callback (core func $main "cb")) (memory $mem) (realloc $realloc)
+    (func $summarize async (param "urls" (list string)) (result string)))
+  (export "summarize" (func $summarize))
+)
+```
+For an explanation of the bitpacking of the `i32` callback return value,
+see [`unpack_callback_result`] in the Canonical ABI explainer.
+
+While this example spawns all the subtasks in the initial call to `summarize`,
+subtasks can also be spawned from `cb` (even after the call to `task.return`).
+It's also possible for `summarize` to call `task.return` called eagerly in the
+initial core `summarize` call.
+
+The `$event`, `$p1` and `$p2` parameters passed to `cb` are the same as the
+return values from `waitable-set.wait` in the previous example. The precise meaning of
+these values is defined by the Canonical ABI.
+
+
+## Component Instance Lifetime
+
+In settings like [service workers] and [serverless computing], a single
+component instance may handle multiple independent host events by having its
+exported functions called repeatedly (and, if they're `async`, concurrently). In
+settings like these, the number and lifetime of component instances and the
+degree of reuse is determined by host policies based on factors like
+utilization, available parallelism and security. However, when component
+instance lifetimes are flexible in this manner and don't have an obvious end
+(as opposed to a traditional CLI setting, where a component instance's lifetime
+conventionally ends right after `main()` returns), the host still needs to
+understand the expectations of component authors to enable portability.
+
+Before the addition of native concurrency support in [WASI] 0.3, a natural
+expectation is that, in the absence of atypical scenarios like timeouts or quota
+exhaustion, a component author can expect that their component instance will not
+be abruptly terminated during the execution of contained Core WebAssembly code.
+But other than that, component authors must conservatively assume that their
+component instance will be torn down at any time.
+
+With the addition of native concurrency support, these expectations must be
+nuanced to account for asynchronous Core WebAssembly execution. In particular,
+when using the stackless `async callback` ABI, an active task may have no active
+Core WebAssembly function invocation while it is `WAIT`ing on a Waitable Set.
+Analogously, when using the stackful `async` ABI, a Core WebAssembly function
+invocation will be suspended (as-if by the [stack-switching] proposal's
+`suspend` instruction) when it calls `waitable-set.wait` so that there is also
+no Core WebAssembly code actively executing (only a continuation stored in the
+component instance's table of threads).
+
+Now, before a task has [returned](#returning) its value, there is still a
+natural expectation that, even if there is *currently* no active Core
+WebAssembly execution, the task is still *logically* executing and thus the
+component instance will not be terminated (under normal circumstances; timeout
+or quota exhaustion could still abruptly terminate the instance). Furthermore,
+even if a component instance has no active tasks that haven't returned a value,
+if a component instance is holding the readable or writable end of a stream or
+future that the host holds the other end of, there is also a natural expectation
+that the host will keep the component instance alive until all the futures and
+streams have reached a closed state.
+
+As an example, even after `wasi:http/handler`'s `handle` function *returns* a
+`response` resource, the `handle` function's component instance is expected to
+be kept alive as long as it's holding the un-closed writable end of the
+`stream<u8>` contained by the returned `response`. If, on the other hand, the
+`stream<u8>` was forwarded from the return value of a host import, and so the
+component instance is not holding any writable end, this expectation doesn't
+apply and so all other conditions being met, the component instance can be
+eagerly torn down.
+
+The interesting question is what happens once all tasks have returned their
+values *and* all incoming and outgoing streams and futures have been closed if
+the component instance still contains live [threads](#threads-and-tasks) that
+are currently suspended (and so not actively executing Core WebAssembly code)
+but may potentially be resumed in the future to do important post-return work
+(like performing logging, billing or metrics operations that have been taken off
+the pre-return critical path for peformance reasons).
+
+If the component instance is conservatively kept alive (until a hard timeout),
+this may end up wasting resources for periodic background activities that run in
+an infinite (waiting) loop. In particular, cooperative threads used to implement
+pthreads are expected to sometimes be used in this manner. On the other hand,
+immediately tearing down a component instance as soon as the last byte of an
+outgoing stream is written and active Core WebAssembly execution returns or
+blocks will break the abovementioned post-return use cases if they involve
+waiting on `async` operations to complete.
+
+To resolve this tension, threads are implicitly distinguished by a "keep-alive"
+flag that determines whether the expectation is that the existence of the thread
+is intended to keep the containing component instance alive. In [WASI] 0.3,
+this "keep-alive" flag is default *set* for the [implicit thread](#summary)
+created for a task and default *cleared* for the explicit threads created by
+`thread.new-indirect`. In particular, this means that an
+`async callback`-lifted function will keep its containing component instance
+alive until it returns the `EXIT` code (`0`).
+
+As an example, in JavaScript, the Service Worker API's [`waitUntil`] method
+would delay returning the `EXIT` code. In 0.3.0, without cooperative threads
+(🧵), [`setInterval`] would also unfortunately delay
+returning the `EXIT` code and thus, without guest code intervention, would keep
+component instances alive until timeout limits were hit. The release of
+cooperative threads would offer a solution to this problem, but an awkward one.
+Instead, the [intention](#TODO) is to add new built-in functions that would
+provide guest code more direct, dynamic control over its own keep-alive
+flags, thereby allowing the JS event loop to clear its keep-alive flag once all
+`waitUntil` promises resolved, thereby allowing `setInterval` callbacks to keep
+running (while the host wants to keep the instance warm), but still indicating
+to the host that destruction is welcome at any time.
+
+Lastly, the above discussion refers to component *instances*, however the host
+cannot tear down independent component instances when they are linked together
+(as this would leave dangling function imports). In general, components must be
+instantiated and destroyed as *trees*, where the host can only choose when to
+instantiate or destroy the *root* component of the tree, and all other child
+instances are instantiated/destroyed along with the root. Thus, when the above
+rules set an expectation that any component instance in a tree be kept alive,
+the whole tree would be kept alive.
+
+
+## TODO
+
+Native async support is being added incrementally. Beyond what's currently
+specified, the following features are being considered for addition to complete
+the concurrency story:
+* remove the temporary trap mentioned above that occurs when a `read` and
+  `write` of a stream/future happen from within the same component instance
+* allow `async` functions using the stackful ABI to be notified of
+  cancellation
+* allow the `stream<char>` type to validate; make it use `string-encoding`
+  and not split code points
+* add built-ins providing guest code more control over its containing
+  [component instance's lifetime](#component-instance-lifetime)
+* some way to say "no more elements are coming for a while"
+* add an `async` effect on `component` type definitions allowing a component
+  type to block during instantiation
+* add an `async` effect on `resource` type definitions allowing a resource
+  type to block during its destructor
+* allow a parent component to perform [JSPI]-like suspension of the sync calls
+  of its child components, thereby allowing the parent to implement the child's
+  sync import calls in terms of the parent's `async` imports.
+* allow a [donut wrapping] parent component to ask which of a child's export
+  calls a particular child import call is associated with (e.g., for logging
+  purposes).
+* add a `strict-callback` option that adds extra trapping conditions to
+  provide the semantic guarantees needed for engines to statically avoid
+  fiber creation at component-to-component `async` call boundaries
+* allow function closures to be passed as first-class values, supporting the
+  "callback" pattern in many pre-existing APIs, including Web APIs
+* allow pipelining multiple `stream.read`/`write` calls
+* allow chaining multiple async calls together ("promise pipelining")
+* integrate with `shared`: define how to lift and lower functions `async` *and*
+  `shared`
+
+
+[Color]: https://journal.stuffwithstuff.com/2015/02/01/what-color-is-your-function/
+[What Color Is Your Function?]: https://journal.stuffwithstuff.com/2015/02/01/what-color-is-your-function/
+[Weak Memory Model]: https://people.mpi-sws.org/~rossberg/papers/Watt,%20Rossberg,%20Pichon-Pharabod%20-%20Weakening%20WebAssembly%20[Extended].pdf
+
+[Fiber]: https://en.wikipedia.org/wiki/Fiber_(computer_science)
+[Effect Type]: https://en.wikipedia.org/wiki/Effect_system
+[CPS Transform]: https://en.wikipedia.org/wiki/Continuation-passing_style
+[Asyncify]: https://emscripten.org/docs/porting/asyncify.html
+[Session Type]: https://en.wikipedia.org/wiki/Session_type
+[Structured Concurrency]: https://en.wikipedia.org/wiki/Structured_concurrency
+[Unit]: https://en.wikipedia.org/wiki/Unit_type
+[FS or GS Segment Base Address]: https://docs.kernel.org/arch/x86/x86_64/fsgs.html
+[Green Thread]: https://en.wikipedia.org/wiki/Green_thread
+[Kernel Thread]: https://en.wikipedia.org/wiki/Thread_(computing)#kernel_thread
+[Cooperative]: https://en.wikipedia.org/wiki/Cooperative_multitasking
+[Cooperatively]: https://en.wikipedia.org/wiki/Cooperative_multitasking
+[Multithreading]: https://en.wikipedia.org/wiki/Multithreading_(computer_architecture)
+[Overlapped I/O]: https://en.wikipedia.org/wiki/Overlapped_I/O
+[`io_uring`]: https://en.wikipedia.org/wiki/Io_uring
+[`epoll`]: https://en.wikipedia.org/wiki/Epoll
+[Serverless Computing]: https://en.wikipedia.org/wiki/Serverless_computing
+
+[`select`]: https://pubs.opengroup.org/onlinepubs/007908799/xsh/select.html
+[`O_NONBLOCK`]: https://pubs.opengroup.org/onlinepubs/7908799/xsh/open.html
+[`pthread_create`]: https://pubs.opengroup.org/onlinepubs/7908799/xsh/pthread_create.html
+
+[Service Workers]: https://developer.mozilla.org/en-US/docs/Web/API/Service_Worker_API
+[`waitUntil`]: https://developer.mozilla.org/en-US/docs/Web/API/ExtendableEvent/waitUntil
+[`setInterval`]: https://developer.mozilla.org/en-US/docs/Web/API/Window/setInterval
+
+[AST Explainer]: Explainer.md
+[Canonical Built-in]: Explainer.md#canonical-built-ins
+[Component Invariant]: Explainer.md#component-invariants
+[`context.get`]: Explainer.md#-contextget
+[`context.set`]: Explainer.md#-contextset
+[`backpressure.inc`]: Explainer.md#-backpressureinc-and-backpressuredec
+[`backpressure.dec`]: Explainer.md#-backpressureinc-and-backpressuredec
+[`task.return`]: Explainer.md#-taskreturn
+[`task.cancel`]: Explainer.md#-taskcancel
+[`subtask.cancel`]: Explainer.md#-subtaskcancel
+[`waitable-set.new`]: Explainer.md#-waitable-setnew
+[`waitable-set.wait`]: Explainer.md#-waitable-setwait
+[`waitable-set.poll`]: Explainer.md#-waitable-setpoll
+[`waitable.join`]: Explainer.md#-waitablejoin
+[`thread.index`]: Explainer.md#-threadindex
+[`thread.new-indirect`]: Explainer.md#-threadnew-indirect
+[`thread.resume-later`]: Explainer.md#-threadresume-later
+[`thread.suspend`]: Explainer.md#-threadsuspend
+[`thread.yield`]: Explainer.md#-threadyield
+[`thread.suspend-then-resume`]: Explainer.md#-threadsuspend-then-resume
+[`thread.yield-then-resume`]: Explainer.md#-threadyield-then-resume
+[`thread.suspend-then-promote`]: Explainer.md#-threadsuspend-then-promote
+[`thread.yield-then-promote`]: Explainer.md#-threadyield-then-promote
+[`{stream,future}.new`]: Explainer.md#-streamnew-and-futurenew
+[`{stream,future}.{read,write}`]: Explainer.md#-streamread-and-streamwrite
+[`stream.cancel-write`]: Explainer.md#-streamcancel-read-streamcancel-write-futurecancel-read-and-futurecancel-write
+[Donut Wrapping]: Linking.md#higher-order-shared-nothing-linking-aka-donut-wrapping
+
+[Canonical ABI Explainer]: CanonicalABI.md
+[specified in terms of]: CanonicalABI.md#stack-switching
+[`canon_lift`]: CanonicalABI.md#canon-lift
+[`unpack_callback_result`]: CanonicalABI.md#canon-lift
+[`canon_lower`]: CanonicalABI.md#canon-lower
+[`Store`]: CanonicalABI.md#embedding
+[`ComponentInstance`]: CanonicalABI.md#component-instances
+[`Thread`]: CanonicalABI.md#threads
+[`Task`]: CanonicalABI.md#tasks
+[Stream and Future State]: CanonicalABI.md#stream-and-future-state
+
+[Binary Format]: Binary.md
+[WIT]: WIT.md
+[Blast Zone]: FutureFeatures.md#blast-zones
+[`start`]: Explainer.md#start-definitions
+[JS API]: Explainer.md#JS-API
+
+[Store]: https://webassembly.github.io/spec/core/exec/runtime.html#syntax-store
+[Deterministic Profile]: https://webassembly.github.io/spec/versions/core/WebAssembly-3.0-draft.pdf#subsubsection*.798
+
+[stack-switching]: https://github.com/WebAssembly/stack-switching/
+[JSPI]: https://github.com/WebAssembly/js-promise-integration/
+[shared-everything-threads]: https://github.com/webAssembly/shared-everything-threads
+[memory64]: https://github.com/webAssembly/memory64
+[wasm-gc]: https://github.com/WebAssembly/gc/blob/main/proposals/gc/MVP.md
+[wasi-libc]: https://github.com/WebAssembly/wasi-libc
+
+[WASI]: https://github.com/WebAssembly/WASI
+[Runtime Instantiation]: https://github.com/WebAssembly/component-model/issues/423
+
+[Top-level `await`]: https://github.com/tc39/proposal-top-level-await

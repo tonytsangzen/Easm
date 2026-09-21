@@ -1,0 +1,24 @@
+version = 1
+
+[[suite]]
+name = "WASI Rust tests [wasm32-wasip3]"
+
+# Inbound request scheme / authority are not always set, see:
+# - https://github.com/WebAssembly/WASI/issues/788
+# - https://github.com/bytecodealliance/wasmtime/issues/11571
+[[suite.test]]
+name = "http-service-uri"
+expected = "fail"
+
+# `path-with-query: none` is documented as an empty path and query, but sending
+# one fails with `HTTP-request-URI-invalid`, see:
+# - https://github.com/WebAssembly/WASI/issues/949
+[[suite.test]]
+name = "http-client-path-none"
+expected = "fail"
+
+# `new`'s transmission future reports `Ok` for a request that was never sent, see:
+# - https://github.com/bytecodealliance/wasmtime/issues/14112
+[[suite.test]]
+name = "http-client-sent"
+expected = "fail"

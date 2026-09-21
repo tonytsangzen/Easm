@@ -1,0 +1,17 @@
+# build outputs
+build/
+*.o
+*.a
+*.out
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# local scratch
+*.log
+core
+core.*

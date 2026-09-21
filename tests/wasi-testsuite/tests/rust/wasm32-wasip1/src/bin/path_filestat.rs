@@ -1,0 +1,123 @@
+use std::{env, process};
+use wasi_tests::{assert_errno, create_tmp_dir, root_directory};
+use wasip1 as wasi;
+
+unsafe fn test_path_filestat(dir_fd: wasi::Fd) {
+    let mut fdstat = wasi::fd_fdstat_get(dir_fd).expect("fd_fdstat_get");
+    assert_ne!(
+        fdstat.fs_rights_base & wasi::RIGHTS_PATH_FILESTAT_GET,
+        0,
+        "the scratch directory should have RIGHT_PATH_FILESTAT_GET as base right",
+    );
+
+    // Create a file in the scratch directory.
+    let open_file = |fdflags| -> Result<wasi::Fd, wasi::Errno> {
+        let rights = wasi::RIGHTS_FD_READ | wasi::RIGHTS_FD_WRITE | wasi::RIGHTS_PATH_FILESTAT_GET;
+        return wasi::path_open(dir_fd, 0, "file", wasi::OFLAGS_CREAT, rights, 0, fdflags);
+    };
+
+    let (file_fd, fdflags) = match open_file(wasi::FDFLAGS_APPEND | wasi::FDFLAGS_SYNC) {
+        Ok(fd) => (fd, wasi::FDFLAGS_APPEND | wasi::FDFLAGS_SYNC),
+        Err(wasi::ERRNO_NOTSUP) => (
+            open_file(wasi::FDFLAGS_APPEND).expect("opening file"),
+            wasi::FDFLAGS_APPEND,
+        ),
+        Err(err) => {
+            eprintln!("error opening file: {}", err);
+            process::exit(1);
+        }
+    };
+
+    assert!(
+        file_fd > libc::STDERR_FILENO as wasi::Fd,
+        "file descriptor range check",
+    );
+
+    fdstat = wasi::fd_fdstat_get(file_fd).expect("fd_fdstat_get");
+    assert_eq!(
+        fdstat.fs_flags & wasi::FDFLAGS_APPEND,
+        wasi::FDFLAGS_APPEND,
+        "file should have the APPEND fdflag used to create the file"
+    );
+    if (fdflags & wasi::FDFLAGS_SYNC) != 0 {
+        assert_eq!(
+            fdstat.fs_flags & wasi::FDFLAGS_SYNC,
+            wasi::FDFLAGS_SYNC,
+            "file should have the SYNC fdflag used to create the file"
+        );
+    }
+
+    // Check file size
+    let file_stat = wasi::path_filestat_get(dir_fd, 0, "file").expect("reading file stats");
+    assert_eq!(file_stat.size, 0, "file size should be 0");
+
+    // Check path_filestat_set_times
+    let new_mtim = file_stat.mtim - 100;
+    wasi::path_filestat_set_times(dir_fd, 0, "file", 0, new_mtim, wasi::FSTFLAGS_MTIM)
+        .expect("path_filestat_set_times should succeed");
+
+    let modified_file_stat = wasi::path_filestat_get(dir_fd, 0, "file")
+        .expect("reading file stats after path_filestat_set_times");
+    assert_eq!(modified_file_stat.mtim, new_mtim, "mtim should change");
+
+    assert_errno!(
+        wasi::path_filestat_set_times(
+            dir_fd,
+            0,
+            "file",
+            0,
+            new_mtim,
+            wasi::FSTFLAGS_MTIM | wasi::FSTFLAGS_MTIM_NOW,
+        )
+        .expect_err("MTIM and MTIM_NOW can't both be set"),
+        wasi::ERRNO_INVAL
+    );
+
+    // check if the times were untouched
+    let unmodified_file_stat = wasi::path_filestat_get(dir_fd, 0, "file")
+        .expect("reading file stats after ERRNO_INVAL fd_filestat_set_times");
+    assert_eq!(
+        unmodified_file_stat.mtim, new_mtim,
+        "mtim should not change"
+    );
+
+    // Invalid arguments to set_times:
+    assert_errno!(
+        wasi::path_filestat_set_times(
+            dir_fd,
+            0,
+            "file",
+            0,
+            0,
+            wasi::FSTFLAGS_ATIM | wasi::FSTFLAGS_ATIM_NOW,
+        )
+        .expect_err("ATIM & ATIM_NOW can't both be set"),
+        wasi::ERRNO_INVAL
+    );
+
+    wasi::fd_close(file_fd).expect("closing a file");
+    wasi::path_unlink_file(dir_fd, "file").expect("removing a file");
+}
+fn main() {
+    let base_dir_fd = match root_directory() {
+        Ok(dir_fd) => dir_fd,
+        Err(err) => {
+            eprintln!("{}", err);
+            process::exit(1)
+        }
+    };
+
+    const DIR_NAME: &str = "path_filestat_dir.cleanup";
+    let dir_fd;
+    unsafe {
+        dir_fd = create_tmp_dir(base_dir_fd, DIR_NAME);
+    }
+
+    // Run the tests.
+    unsafe { test_path_filestat(dir_fd) }
+
+    unsafe {
+        wasi::fd_close(dir_fd).unwrap();
+    }
+    unsafe { wasi::path_remove_directory(base_dir_fd, DIR_NAME).expect("failed to remove dir") }
+}
