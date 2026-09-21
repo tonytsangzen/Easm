@@ -614,6 +614,14 @@ memsum 0.003）：这批内核为访存带宽受限，省下的 ALU 指令本就
    值生命周期（操作数间隔其他 producer 时无法驻留，如 fmul; local.get;
    fadd），需要虚拟寄存器 + 线性扫描。信号式 OOB 已就位（迭代 17），
    寄存器分配后无需再为检查指令留窗口。
+   **否定结果（迭代 18，未合入）**：单槽/6 槽（x19-x24）局部变量
+   dirty-cache（控制流边界 flush、调用失效）实现后 bench 五内核全部
+   持平——frame 访存为 L1 命中且不在关键路径，6 槽方案在循环回边
+   flush 6 条 stur 抵消了省下的 load；sum 循环 3.2 cyc/iter 为发射
+   带宽受限。结论：HIR 的收益必须来自操作数栈槽位的寄存器分配
+   （binop push/pop 链，数量远大于 frame 访存），而非局部缓存；
+   另一待查项：wasmtime sum 0.6 cyc/iter 暗示其做了循环变换
+   （展开/归纳变量强化），值得反汇编确认后补齐。
    驻留）。(a) 可独立先行：guard page + SIGSEGV handler 方案。
 2. call_indirect 类型检查改为解码期缓存 canonical id（现为每次比较重建等价栈）。
 3. br_table / v128 的 JIT lowering；浮点参数直接 S/D 寄存器往返。
