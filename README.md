@@ -34,7 +34,7 @@ baseline JIT** 为主执行引擎，不能降级的指令形态自动回退解�
 ## 目录结构
 
 ```
-src/            运行时源码（C11，~11.5k 行）
+src/            运行时源码（C11 + ObjC，~13.5k 行）
   decode.c        二进制解码（含 GC/exceptions 指令与 rec/sub 类型）
   validate.c      校验器 + canonical 类型等价/子类型
   runtime.c       store / 实例化 / invoke
@@ -43,8 +43,14 @@ src/            运行时源码（C11，~11.5k 行）
   a64_emit.h      ARM64 指令编码器（63 条编码用例对照 llvm-mc 全对）
   arith.c         数值指令
   simd_exec.c     v128 指令（解释器执行）
+  wasi.c          WASI Preview 1 核心（21 syscall，fd 表 + 路径解析）
+  wasi_posix.c    POSIX 后端（macOS / Linux）
+  wasi_win.c      Win32 后端（Windows，UTF-16 宽 API）
+  wasi_ewok.c     ewokos 后端（HAL vtable + RAM 文件系统）
+  wasi.h / wasi_platform.h  WASI 接口与平台抽象层
+  easm_gui.m      AppKit GUI 查看器（Objective-C）
   wast.c          wast2json 测试驱动（含 module definition / instance 命令）
-  main.c          CLI
+  main.c          CLI（run / wasi / wast 命令）
 tools/          run_spec.py（覆盖率）、run_bench.py（基准）、wast_convert.py
                 （wast2json 失败时的自制转换兜底）
 tests/          官方 spec 测试集快照 + 提案测试 + WASI 测试集
@@ -55,12 +61,21 @@ PROGRESS.md     阶段报告：优化迭代记录、与 wasmtime 的对比数据
 ## 构建
 
 ```bash
-make -j8          # 产物 build/easm（约 240KB）
+make -j8          # 产物 build/easm（约 260KB）
 make clean
 ```
 
 依赖：clang（Apple Silicon 自带）、macOS（JIT 使用 `MAP_JIT` +
-`pthread_jit_write_protect_np`）。基准内核的重建另需 wabt 与 LLVM：
+`pthread_jit_write_protect_np`）。GUI 查看器构建：
+
+```bash
+clang -x objective-c src/easm_gui.m src/decode.c src/validate.c \
+  src/runtime.c src/interp.c src/arith.c src/util.c \
+  src/wasi.c src/wasi_posix.c src/wasi_ewok.c \
+  -framework AppKit -framework Foundation -ldl -O1 -o build/easm_gui
+```
+
+基准内核的重建另需 wabt 与 LLVM：
 
 ```bash
 /opt/homebrew/opt/llvm/bin/clang --target=wasm32 -O2 -nostdlib \
@@ -92,7 +107,7 @@ python3 tools/run_spec.py -j 8 --jit    # JIT 模式（逐文件结果与解释�
 python3 tools/run_bench.py all          # JIT / 解释器 / wasmtime / node 对比
 ```
 
-### 当前状态（2026-09-21，详见 [PROGRESS.md](PROGRESS.md)）
+### 当前状态（2026-09-22，详见 [PROGRESS.md](PROGRESS.md)）
 
 **覆盖率**（官方 spec 套件，258 个 wast 文件）：
 
@@ -130,6 +145,14 @@ V8/node 的 1/20；磁盘足迹 ~240KB vs wasmtime 48.5MB。
 
 ## WASI 运行时
 
+三平台移植层通过 `EaWasiPlat` vtable 抽象，宿主集成者只需实现平台回调：
+
+| 后端 | 目标平台 | 文件系统 | 时钟 | 随机 | 验证 |
+|---|---|---|---|---|---|
+| POSIX | macOS / Linux | open/read/write/seek/mkdir/unlink | clock_gettime | /dev/urandom | ✓ 全功能 |
+| Win32 | Windows | CreateFileW/ReadFile（UTF-16 双宽） | QueryPerformanceCounter | rand() | mingw 编译 ✓ |
+| ewokos | 嵌入式 RTOS | RAM-fs（64KB/文件，flat 目录） | 1ms fake clock | LCG | ✓ 全功能 |
+
 ```bash
 # CLI demo（POSIX 后端）
 build/easm wasi demos/wasi_echo.wasm hello easm-world
@@ -146,6 +169,10 @@ build/easm_gui demos/wasi_gui.wasm
 # 验证矩阵（15 项：3 后端 × echo/file + GUI）
 bash tools/test_wasi.sh
 ```
+
+**验证结果**：15/15 通过（POSIX echo 5 项 + EWOK echo 2 项 +
+POSIX file 4 项 + EWOK file 3 项 + GUI 1 项），覆盖 argv 传递、
+clock 读取、path_open 创建/写入/关闭/重开/读回/内容校验、GUI 帧渲染。
 
 ## License
 
