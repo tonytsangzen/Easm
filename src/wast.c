@@ -503,6 +503,7 @@ static void load_module_file(Driver *d, const char *json_path, const char *filen
         return;
     }
     free(buf);
+    if (getenv("EA_JIT")) ea_jit_compile_module(m);
     d->cur_mod = m;
 }
 
@@ -851,6 +852,33 @@ static int run_wast_inner(const char *json_path, int verbose) {
             }
             if (all_ok) d.passed++;
             else d.failed++;
+        } else if (strcmp(type, "assert_exception") == 0) {
+            // the action must raise an uncaught wasm exception (not a trap)
+            JV *action = jobj(cmd, "action");
+            WVal args[64];
+            uint32_t n_args = 0;
+            JV *argsj = jobj(action, "args");
+            if (argsj) {
+                for (uint32_t i = 0; i < argsj->n && i < 64; i++) {
+                    JV *a = argsj->items[i];
+                    const char *ty = jstr(a, "type");
+                    if (ty && strcmp(ty, "v128") == 0) parse_v128(a, args[n_args].v128);
+                    else args[n_args] = parse_val(a);
+                    n_args++;
+                }
+            }
+            WVal results[64];
+            memset(results, 0, sizeof(results));
+            EaTrap trap = TRAP_NONE;
+            EaInstance *used = NULL;
+            int rc = run_action(&d, action, args, n_args, results, 64, &trap, &used);
+            if (rc == 0 || trap != TRAP_NONE || !ea_store_take_pending_exn(d.store)) {
+                d.failed++;
+                printf("line %d: assert_exception: expected uncaught exception, got %s\n",
+                       (int)line, rc == 0 ? "success" : ea_trap_msg(trap));
+                continue;
+            }
+            d.passed++;
         } else if (strcmp(type, "assert_trap") == 0 || strcmp(type, "assert_exhaustion") == 0) {
             JV *action = jobj(cmd, "action");
             const char *text_exp = jstr(cmd, "text");

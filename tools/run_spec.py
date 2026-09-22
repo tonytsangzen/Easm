@@ -54,12 +54,15 @@ def convert(wast: Path, outdir: Path) -> Path | None:
     return json_path
 
 
-def run_one(easm: Path, json_path: Path, timeout: float) -> tuple[str, str, str]:
+def run_one(easm: Path, json_path: Path, timeout: float, jit: bool = False) -> tuple[str, str, str]:
     """Returns (status, summary, detail). status in ok/fail/crash."""
     try:
+        env = dict(os.environ)
+        if jit:
+            env["EA_JIT"] = "1"
         r = subprocess.run(
             [str(easm), "wast", str(json_path)],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, timeout=timeout, env=env,
         )
     except subprocess.TimeoutExpired:
         return "fail", "TIMEOUT", ""
@@ -118,7 +121,7 @@ def main() -> int:
 
     results = {}
     with futures.ThreadPoolExecutor(max_workers=args.j) as ex:
-        futs = {ex.submit(run_one, easm, jp, args.timeout): w for w, jp in conv_ok.items()}
+        futs = {ex.submit(run_one, easm, jp, args.timeout, args.jit): w for w, jp in conv_ok.items()}
         for i, fut in enumerate(futures.as_completed(futs)):
             w = futs[fut]
             results[w] = fut.result()

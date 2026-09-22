@@ -603,14 +603,14 @@ static inline void a64_ucvtf(Em *e, uint32_t rd, uint32_t rn, int dstb, int srcb
     em_word(e, base | (rn << 5) | rd);
 }
 static inline void a64_fcvtzs(Em *e, uint32_t rd, uint32_t rn, int srcb, int dstb) {
-    // FCVTZS Wd/Xd, Sn/Dn
-    uint32_t base = srcb == 8 ? (dstb == 8 ? 0x9E780000u : 0x9E380000u)
-                              : (dstb == 8 ? 0x1E780000u : 0x1E380000u);
+    // FCVTZS Wd/Xd, Sn/Dn  (sf = dstb==8, type: 00=S, 01=D)
+    uint32_t base = srcb == 8 ? (dstb == 8 ? 0x9E780000u : 0x1E780000u)
+                              : (dstb == 8 ? 0x9E380000u : 0x1E380000u);
     em_word(e, base | (rn << 5) | rd);
 }
 static inline void a64_fcvtzu(Em *e, uint32_t rd, uint32_t rn, int srcb, int dstb) {
-    uint32_t base = srcb == 8 ? (dstb == 8 ? 0x9E790000u : 0x9E390000u)
-                              : (dstb == 8 ? 0x1E790000u : 0x1E390000u);
+    uint32_t base = srcb == 8 ? (dstb == 8 ? 0x9E790000u : 0x1E790000u)
+                              : (dstb == 8 ? 0x9E390000u : 0x1E390000u);
     em_word(e, base | (rn << 5) | rd);
 }
 static inline void a64_fmov_gpr_fpr(Em *e, uint32_t rd, uint32_t rn, int to_fpr, int b) {

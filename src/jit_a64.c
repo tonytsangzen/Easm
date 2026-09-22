@@ -43,7 +43,9 @@ static void ea_jit_trap_now(EaExec *ex, uint32_t code) {
     ea_trap(ex, (EaTrap)code);
 }
 
-static void ea_jit_call_interp(EaExec *ex, EaFuncInst *fi, WVal *args) {
+// returns 0 on success, 1 when the callee left an uncaught exception in
+// ex->pending_exn (the JIT call site then runs its own handler search)
+static uint64_t ea_jit_call_interp(EaExec *ex, EaFuncInst *fi, WVal *args) {
     if (fi->is_host) { // host function: bridge the arg/result buffers directly
         WVal la[16], lr[16];
         uint32_t np = fi->type->n_params < 16 ? fi->type->n_params : 16;
@@ -51,7 +53,7 @@ static void ea_jit_call_interp(EaExec *ex, EaFuncInst *fi, WVal *args) {
         fi->host_fn(fi->host_user, la, lr);
         uint32_t nr = fi->type->n_results < 16 ? fi->type->n_results : 16;
         for (uint32_t k = 0; k < nr; k++) args[k] = lr[k];
-        return;
+        return 0;
     }
     uint32_t n = fi->type->n_params;
     uint32_t r = fi->type->n_results;
@@ -60,15 +62,141 @@ static void ea_jit_call_interp(EaExec *ex, EaFuncInst *fi, WVal *args) {
     ex->depth++;
     ea_interp_exec_function(ex, fi);
     ex->depth--;
+    // the callee could not handle an exception: leave the machine sp alone and
+    // signal the caller frame (marker x0 == 1) to run its own handler search
+    if (ex->pending_exn) return 1;
     // write results back where a JIT callee would leave them: result i at
     // [entry - (i+1)*16] = args[n-1-i]; r > n extends below the args block,
     // which is free red-zone space
     for (uint32_t i = 0; i < r; i++)
         args[(int32_t)n - 1 - (int32_t)i] = ex->stack[ex->sp - 1 - i];
     ex->sp -= r;
+    return 0;
 }
 
 uint64_t ea_h_popcnt64(uint64_t x) { return __builtin_popcountll(x); }
+
+// ---------------------------------------------------------------- exception handling
+// Handler stack discipline: each JIT frame's try_tables push entries with the
+// frame's fp; the throw helpers only match entries of the CURRENT frame and
+// leave caller entries alone.  When no entry of this frame matches, generated
+// code returns a marker (x0 == 1) to its caller, whose call site resumes the
+// search with its own fp — exceptions therefore chain frame by frame, and
+// interpreter frames in between keep using their own ctl-stack unwinding.
+static EaEhRet eh_dispatch(EaExec *ex, EaExnInst *exn, void *fp) {
+    EaEhRet r = {NULL, 0};
+    if (getenv("EA_EHDBG"))
+        fprintf(stderr, "[EH] dispatch fp=%p top=%u\n", fp, ex->eh_top);
+    while (ex->eh_top) {
+        EaEhEntry *h = &ex->eh[ex->eh_top - 1];
+        if (getenv("EA_EHDBG"))
+            fprintf(stderr, "[EH]   entry fp=%p sp0=%p desc=%p\n", h->fp, (void *)h->sp0, (void *)h->desc);
+        if (h->fp != fp) break; // entries of caller frames stay live
+        ex->eh_top--;
+        for (uint32_t ci = 0; ci < h->desc->n_clauses; ci++) {
+            EaEhClause *cc = &h->desc->c[ci];
+            bool match = false;
+            uint32_t ncarry = 0;
+            if (cc->kind <= 1) {
+                EaTagInst *want = &h->inst->tags[cc->tag_idx];
+                if (exn->tag->ident == want->ident) {
+                    match = true;
+                    ncarry = exn->n_vals + (cc->kind == 1 ? 1 : 0);
+                }
+            } else if (cc->kind == 2) {
+                match = true;
+            } else {
+                match = true;
+                ncarry = 1;
+            }
+            if (!match) continue;
+            // land exactly where a `br` to the clause's label would: sp at the
+            // target label depth, payload (+exnref) pushed on top of it.
+            // sp_f[0] is the TOP slot = the LAST payload value (the operand
+            // stack grows down), matching the interpreter's S[h+q] = vals[q]
+            WVal *sp_t = h->sp0 + cc->delta_up;
+            WVal *sp_f = sp_t - ncarry;
+            // sp_f[0] is the TOP slot: the exnref (if any) sits on top of the
+            // payload, matching the interpreter's S[h+q] = vals[q] layout
+            for (uint32_t q = 0; q < exn->n_vals; q++)
+                sp_f[ncarry - 1 - q] = exn->vals[q];
+            if (cc->want_ref) sp_f[0].ref = exn;
+            ex->pending_exn = NULL;
+            r.sp = sp_f;
+            r.target = cc->target;
+            if (getenv("EA_EHDBG"))
+                fprintf(stderr, "[EH] catch kind=%u sp=%p target=%p\n", cc->kind,
+                        (void *)sp_f, cc->target);
+            return r;
+        }
+    }
+    ex->pending_exn = exn;
+    if (getenv("EA_EHDBG")) fprintf(stderr, "[EH] propagate exn=%p fp=%p\n", (void *)exn, fp);
+    return r;
+}
+
+void ea_jit_eh_push(EaExec *ex, EaInstance *inst, EaEhDesc *desc, WVal *sp0, void *fp) {
+    if (ex->eh_top == ex->eh_cap) {
+        uint32_t cap = ex->eh_cap ? ex->eh_cap * 2 : 32;
+        EaEhEntry *eh = (EaEhEntry *)realloc(ex->eh, cap * sizeof(EaEhEntry));
+        if (!eh) ea_trap(ex, TRAP_STACK_EXHAUSTED);
+        ex->eh = eh;
+        ex->eh_cap = cap;
+    }
+    EaEhEntry *h = &ex->eh[ex->eh_top++];
+    h->sp0 = sp0;
+    h->fp = fp;
+    h->inst = inst;
+    h->desc = desc;
+    if (getenv("EA_EHDBG"))
+        fprintf(stderr, "[EH] push fp=%p sp0=%p desc=%p nc=%u\n", fp, (void *)sp0,
+                (void *)desc, desc ? desc->n_clauses : 0);
+}
+
+void ea_jit_eh_pop(EaExec *ex) {
+    if (ex->eh_top) ex->eh_top--;
+}
+
+void ea_jit_eh_popn(EaExec *ex, uint32_t n) {
+    if (n > ex->eh_top) n = ex->eh_top;
+    ex->eh_top -= n;
+}
+
+void ea_jit_eh_pop_frame(EaExec *ex, void *fp) {
+    while (ex->eh_top && ex->eh[ex->eh_top - 1].fp == fp) ex->eh_top--;
+}
+
+EaEhRet ea_jit_eh_throw(EaExec *ex, EaInstance *inst, uint32_t tag_idx, WVal *sp, void *fp) {
+    (void)inst;
+    if (tag_idx >= inst->n_tags) ea_trap(ex, TRAP_INDIRECT_CALL); // validator prevents this
+    EaTagInst *tag = &inst->tags[tag_idx];
+    uint32_t n = tag->type->n_params;
+    EaExnInst *exn = (EaExnInst *)ea_malloc(sizeof(EaExnInst) +
+        (n ? n : 1) * sizeof(WVal));
+    exn->tag = tag;
+    exn->n_vals = n;
+    // payload sits at [sp, sp + n*16); vals[j] is the (n-1-j)-th slot
+    for (uint32_t q = 0; q < n; q++) exn->vals[q] = sp[n - 1 - q];
+    return eh_dispatch(ex, exn, fp);
+}
+
+EaEhRet ea_jit_eh_throw_ref(EaExec *ex, EaInstance *inst, EaExnInst *exn, void *fp) {
+    if (!exn) ea_trap(ex, TRAP_NULL_REF);
+    return eh_dispatch(ex, exn, fp);
+}
+
+EaEhRet ea_jit_eh_resume(EaExec *ex, EaInstance *inst, void *fp) {
+    (void)inst;
+    EaExnInst *px = ex->pending_exn;
+    if (getenv("EA_EHDBG"))
+        fprintf(stderr, "[EH] resume fp=%p pending=%p\n", fp, (void *)px);
+    if (!px) {
+        EaEhRet r = {NULL, 0};
+        return r;
+    }
+    ex->pending_exn = NULL;
+    return eh_dispatch(ex, px, fp);
+}
 void ea_h_wdump6(uint64_t fp, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
     // fp points at the JIT frame; locals live at [fp-32-16*(nloc-k)] — we
     // don't know nloc here, so dump the raw fp-relative window too
@@ -105,8 +233,9 @@ EaFuncInst *ea_jit_callee_lookup(EaExec *ex, EaInstance *inst, uint32_t table_id
 static WVal *ea_h_memory_size(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t memidx) {
     (void)ex;
     EaMemInst *mem = inst->memories[memidx];
-    if (mem->is64) sp[0].i64 = mem->pages; else sp[0].i32 = (uint32_t)mem->pages;
-    return sp + 1;
+    // 0 args, 1 result: the result occupies the slot BELOW the incoming sp
+    if (mem->is64) sp[-1].i64 = mem->pages; else sp[-1].i32 = (uint32_t)mem->pages;
+    return sp - 1;
 }
 static WVal *ea_h_memory_grow(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t memidx) {
     (void)inst;
@@ -151,9 +280,12 @@ static WVal *ea_h_memory_init(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t m
     if (n) memcpy(mem->base + dv, inst->module->owned_bytes + d->data_off + sv, n);
     return sp - 3;
 }
-static void ea_h_data_drop(EaExec *ex, EaInstance *inst, uint32_t dataidx) {
+static WVal *ea_h_data_drop(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t dataidx, uint32_t unused) {
     (void)ex;
+    (void)sp;
+    (void)unused;
     inst->data_alive[dataidx] = 0;
+    return sp;
 }
 static WVal *ea_h_table_get(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t tidx) {
     EaTableInst *t = &inst->tables[tidx];
@@ -173,8 +305,8 @@ static WVal *ea_h_table_set(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t tid
 static WVal *ea_h_table_size(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t tidx) {
     (void)ex;
     EaTableInst *t = &inst->tables[tidx];
-    if (t->is64) sp[0].i64 = t->size; else sp[0].i32 = (uint32_t)t->size;
-    return sp + 1;
+    if (t->is64) sp[-1].i64 = t->size; else sp[-1].i32 = (uint32_t)t->size;
+    return sp - 1;
 }
 static WVal *ea_h_table_grow(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t tidx) {
     EaTableInst *t = &inst->tables[tidx];
@@ -234,21 +366,24 @@ static WVal *ea_h_table_init(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t ti
     }
     return sp - 3;
 }
-static void ea_h_elem_drop(EaExec *ex, EaInstance *inst, uint32_t eidx) {
+static WVal *ea_h_elem_drop(EaExec *ex, EaInstance *inst, WVal *sp, uint32_t eidx, uint32_t unused) {
     (void)ex;
+    (void)sp;
+    (void)unused;
     inst->elem_alive[eidx] = 0;
+    return sp;
 }
 static uint32_t ea_h_f32_min(uint32_t ab, uint32_t bb) {
     float a, b, r;
     memcpy(&a, &ab, 4);
     memcpy(&b, &bb, 4);
-    if (a != a) return ab;
-    if (b != b) return bb;
+    if (a != a) return ab | 0x00400000u; // quiet the NaN (spec: arithmetic nan)
+    if (b != b) return bb | 0x00400000u;
     if (a == 0.0f && b == 0.0f) {
         uint32_t ua, ub, rr;
         memcpy(&ua, &ab, 4);
         memcpy(&ub, &bb, 4);
-        rr = ((ua | ub) >> 31) ? 0xFF800000u : 0;
+        rr = ((ua | ub) >> 31) ? 0x80000000u : 0; // min(+0,-0) = -0
         return rr;
     }
     r = a < b ? a : b;
@@ -258,13 +393,13 @@ static uint32_t ea_h_f32_max(uint32_t ab, uint32_t bb) {
     float a, b, r;
     memcpy(&a, &ab, 4);
     memcpy(&b, &bb, 4);
-    if (a != a) return ab;
-    if (b != b) return bb;
+    if (a != a) return ab | 0x00400000u; // quiet the NaN (spec: arithmetic nan)
+    if (b != b) return bb | 0x00400000u;
     if (a == 0.0f && b == 0.0f) {
         uint32_t ua, ub, rr;
         memcpy(&ua, &ab, 4);
         memcpy(&ub, &bb, 4);
-        rr = ((ua & ub) >> 31) ? 0xFF800000u : 0;
+        rr = ((ua & ub) >> 31) ? 0x80000000u : 0; // max(+0,-0) = +0 unless both -0
         return rr;
     }
     r = a > b ? a : b;
@@ -274,13 +409,13 @@ static uint64_t ea_h_f64_min(uint64_t ab, uint64_t bb) {
     double a, b, r;
     memcpy(&a, &ab, 8);
     memcpy(&b, &bb, 8);
-    if (a != a) return ab;
-    if (b != b) return bb;
+    if (a != a) return ab | 0x0008000000000000ull; // quiet the NaN
+    if (b != b) return bb | 0x0008000000000000ull;
     if (a == 0.0 && b == 0.0) {
         uint64_t ua, ub, rr;
         memcpy(&ua, &ab, 8);
         memcpy(&ub, &bb, 8);
-        rr = ((ua | ub) >> 63) ? 0xFFF0000000000000ull : 0;
+        rr = ((ua | ub) >> 63) ? 0x8000000000000000ull : 0; // min(+0,-0) = -0
         return rr;
     }
     r = a < b ? a : b;
@@ -290,13 +425,13 @@ static uint64_t ea_h_f64_max(uint64_t ab, uint64_t bb) {
     double a, b, r;
     memcpy(&a, &ab, 8);
     memcpy(&b, &bb, 8);
-    if (a != a) return ab;
-    if (b != b) return bb;
+    if (a != a) return ab | 0x0008000000000000ull; // quiet the NaN
+    if (b != b) return bb | 0x0008000000000000ull;
     if (a == 0.0 && b == 0.0) {
         uint64_t ua, ub, rr;
         memcpy(&ua, &ab, 8);
         memcpy(&ub, &bb, 8);
-        rr = ((ua & ub) >> 63) ? 0xFFF0000000000000ull : 0;
+        rr = ((ua & ub) >> 63) ? 0x8000000000000000ull : 0; // max(+0,-0) = +0 unless both -0
         return rr;
     }
     r = a > b ? a : b;
@@ -402,6 +537,9 @@ int ea_jit_call(EaExec *ex, EaFuncInst *fi) {
         for (uint32_t i = 0; i < nr + 3 && i < 8; i++)
             fprintf(stderr, "  buf[%u]=%016llx\n", i, (unsigned long long)buf[i].i64);
     }
+    // exception marker: the callee threw and found no handler in its frame;
+    // ex->pending_exn carries the exception for the interpreter's ctl unwinder
+    if (ex->pending_exn) return 1;
     for (uint32_t i = 0; i < nr; i++) ex->stack[ex->sp++] = buf[i];
     return 0;
 }
@@ -431,6 +569,7 @@ typedef struct {
         uint32_t height, arity, rarity, arity_in;
         uint32_t end_idx, else_idx, block_idx;
         uint8_t is_loop;
+        uint8_t is_try;
     } ctrl[256];
     uint32_t csp;
     uint32_t depth;
@@ -461,6 +600,15 @@ typedef struct {
     uint32_t wl_em0, wl_nfx0, wl_ntfx0;
     int16_t wl_want[6];
     uint32_t wl_n_want;
+    // exception handling: shared cold stubs (emitted before the body, so all
+    // references from the body are backward and need no fixups)
+    uint8_t eh_calls;          // call sites must check the exception marker
+    uint8_t has_throw, has_throwref;
+    uint32_t throw_stub_at, throwref_stub_at, eh_resume_at, eh_prop_at, eh_ret_at;
+    EaEhDesc **eh_descs;       // descs of this function (patched at publish)
+    uint32_t n_eh_descs, cap_eh_descs;
+    struct EhFx { EaEhDesc *desc; uint32_t clause; uint32_t tpc; uint8_t func_level; } *eh_fx;
+    uint32_t n_eh_fx, cap_eh_fx;
     char why[80];
     bool failed;
 } JC;
@@ -500,6 +648,8 @@ static void fix_to_pc(JC *c, uint32_t target_pc) {
     }
     c->fx[c->nfx].at = c->em.len - 1;
     c->fx[c->nfx].target_pc = target_pc;
+    c->fx[c->nfx].cond = false; // realloc'd slots are garbage: must be explicit
+    c->fx[c->nfx].ccode = 0;
     c->nfx++;
 }
 static void fix_cond_to_pc(JC *c, uint32_t target_pc, uint32_t ccode) {
@@ -594,9 +744,14 @@ static bool is_def_producer(uint32_t op) {
     return op == EA_OP_I32_CONST || op == EA_OP_I64_CONST || op == EA_OP_LOCAL_GET;
 }
 static bool defer1_possible(JC *c, uint32_t pc, uint32_t n) {
+    // a parked producer emits no code, so any branch target whose emit
+    // position co-locates with the consumer would skip the park and read a
+    // stale register: no target may sit at the producer or right before it
+    if (c->is_target[pc] || (pc > 0 && c->is_target[pc - 1])) return false;
     return pc + 1 < n && !c->is_target[pc + 1] && def_consumes(c->f->code.v[pc + 1].opcode);
 }
 static bool defer2_possible(JC *c, uint32_t pc, uint32_t n) {
+    if (c->is_target[pc] || (pc > 0 && c->is_target[pc - 1])) return false;
     return pc + 2 < n && !c->is_target[pc + 1] && !c->is_target[pc + 2] &&
            is_def_producer(c->f->code.v[pc + 1].opcode) &&
            def_consumes(c->f->code.v[pc + 2].opcode);
@@ -891,9 +1046,25 @@ static void emit_load(JC *c, EaInstr *in) {
         else pop_w(&c->em, R16); // 32-bit slots only carry 4 clean bytes
     }
     uint64_t off = in->imm.ma.offset;
+    // effective address = 0-extended addr + offset, NO 32-bit wrap: the
+    // bounds decision uses the full sum (spec), and out-of-range addresses
+    // fault inside the 12 GiB reservation
     if (off) {
         if (off < 4096) a64_add_imm64(&c->em, R16, R16, (uint32_t)off);
         else { a64_mov64_imm(&c->em, R17, off); a64_add_reg64(&c->em, R16, R16, R17); }
+    }
+    // multi-memory: x25/x26 hold memories[0]; load this memory's regs on
+    // demand into the dedicated x14/x15 scratch (untouched by everything else)
+    uint32_t mem_base = R25, mem_limit = R26;
+    if (in->imm.ma.memidx != 0) {
+        a64_ldr_imm64(&c->em, R14, R28, __builtin_offsetof(EaInstance, memories));
+        a64_ldr_imm64(&c->em, R14, R14, (int64_t)in->imm.ma.memidx * 8);
+        a64_ldr_imm64(&c->em, R14, R14, __builtin_offsetof(EaMemInst, base));
+        a64_ldr_imm64(&c->em, R15, R28, __builtin_offsetof(EaInstance, memories));
+        a64_ldr_imm64(&c->em, R15, R15, (int64_t)in->imm.ma.memidx * 8);
+        a64_ldr_imm64(&c->em, R15, R15, __builtin_offsetof(EaMemInst, size));
+        mem_base = R14;
+        mem_limit = R15;
     }
     uint64_t nat;
     switch (in->opcode) {
@@ -909,32 +1080,38 @@ static void emit_load(JC *c, EaInstr *in) {
     // PROT_NONE reservation and the signal handler raises the trap, so no
     // explicit check is needed.  64-bit memories have no such bound.
     if (c->m->memories[in->imm.ma.memidx].is64) {
-        a64_sub_imm64(&c->em, R17, R26, (uint32_t)nat);
+        a64_sub_imm64(&c->em, R17, mem_limit, (uint32_t)nat);
         a64_cmp_reg64(&c->em, R16, R17);
         trap_if(c, TRAP_OOB_MEMORY, CC_HI);
     }
     if (in->opcode == EA_OP_F32_LOAD || in->opcode == EA_OP_F64_LOAD) {
         int b = in->opcode == EA_OP_F64_LOAD ? 8 : 4;
-        a64_ldr_reg_fpr(&c->em, V0, R25, R16, b);
+        a64_ldr_reg_fpr(&c->em, V0, mem_base, R16, b);
         push_result_f(c, b);
         return;
     }
     switch (in->opcode) {
-    case EA_OP_I32_LOAD: a64_ldr_reg32(&c->em, R16, R25, R16); break;
-    case EA_OP_I64_LOAD: a64_ldr_reg64(&c->em, R16, R25, R16); break;
-    case EA_OP_I32_LOAD8_S: a64_ldrsb_reg32(&c->em, R16, R25, R16); break;
-    case EA_OP_I32_LOAD8_U: a64_ldrb_reg32(&c->em, R16, R25, R16); break;
-    case EA_OP_I32_LOAD16_S: a64_ldrsh_reg32(&c->em, R16, R25, R16); break;
-    case EA_OP_I32_LOAD16_U: a64_ldrh_reg32(&c->em, R16, R25, R16); break;
-    case EA_OP_I64_LOAD8_S: a64_ldrsb_reg64(&c->em, R16, R25, R16); break;
-    case EA_OP_I64_LOAD8_U: a64_ldrb_reg32(&c->em, R16, R25, R16); break;
-    case EA_OP_I64_LOAD16_S: a64_ldrsh_reg64(&c->em, R16, R25, R16); break;
-    case EA_OP_I64_LOAD16_U: a64_ldrh_reg32(&c->em, R16, R25, R16); break;
-    case EA_OP_I64_LOAD32_S: em_word(&c->em, 0xB8A06800 | (R16 << 16) | (R25 << 5) | R16); break;
-    case EA_OP_I64_LOAD32_U: a64_ldr_reg32(&c->em, R16, R25, R16); break;
-    default: a64_ldr_reg64(&c->em, R16, R25, R16); break;
+    case EA_OP_I32_LOAD: a64_ldr_reg32(&c->em, R16, mem_base, R16); break;
+    case EA_OP_I64_LOAD: a64_ldr_reg64(&c->em, R16, mem_base, R16); break;
+    case EA_OP_I32_LOAD8_S: a64_ldrsb_reg32(&c->em, R16, mem_base, R16); break;
+    case EA_OP_I32_LOAD8_U: a64_ldrb_reg32(&c->em, R16, mem_base, R16); break;
+    case EA_OP_I32_LOAD16_S: a64_ldrsh_reg32(&c->em, R16, mem_base, R16); break;
+    case EA_OP_I32_LOAD16_U: a64_ldrh_reg32(&c->em, R16, mem_base, R16); break;
+    case EA_OP_I64_LOAD8_S: a64_ldrsb_reg64(&c->em, R16, mem_base, R16); break;
+    case EA_OP_I64_LOAD8_U: a64_ldrb_reg32(&c->em, R16, mem_base, R16); break;
+    case EA_OP_I64_LOAD16_S: a64_ldrsh_reg64(&c->em, R16, mem_base, R16); break;
+    case EA_OP_I64_LOAD16_U: a64_ldrh_reg32(&c->em, R16, mem_base, R16); break;
+    case EA_OP_I64_LOAD32_S: em_word(&c->em, 0xB8A06800 | (R16 << 16) | (mem_base << 5) | R16); break;
+    case EA_OP_I64_LOAD32_U: a64_ldr_reg32(&c->em, R16, mem_base, R16); break;
+    default: a64_ldr_reg64(&c->em, R16, mem_base, R16); break;
     }
-    push_result_w(c);
+    // i64-result loads must push the full 8-byte slot (push_w would leave the
+    // upper half stale for any 8-byte consumer, including the return copy)
+    if (in->opcode == EA_OP_I64_LOAD ||
+        (in->opcode >= EA_OP_I64_LOAD8_S && in->opcode <= EA_OP_I64_LOAD32_U))
+        push_result_x(c);
+    else
+        push_result_w(c);
 }
 static void emit_store(JC *c, EaInstr *in) {
     if (in->opcode == EA_OP_F32_STORE || in->opcode == EA_OP_F64_STORE) {
@@ -956,12 +1133,24 @@ static void emit_store(JC *c, EaInstr *in) {
             if (foff < 4096) a64_add_imm64(&c->em, R16, R16, (uint32_t)foff);
             else { a64_mov64_imm(&c->em, R17, foff); a64_add_reg64(&c->em, R16, R16, R17); }
         }
+        // multi-memory: load this memory's base/limit on demand (x14/x15)
+        uint32_t mem_base = R25, mem_limit = R26;
+        if (in->imm.ma.memidx != 0) {
+            a64_ldr_imm64(&c->em, R14, R28, __builtin_offsetof(EaInstance, memories));
+            a64_ldr_imm64(&c->em, R14, R14, (int64_t)in->imm.ma.memidx * 8);
+            a64_ldr_imm64(&c->em, R14, R14, __builtin_offsetof(EaMemInst, base));
+            a64_ldr_imm64(&c->em, R15, R28, __builtin_offsetof(EaInstance, memories));
+            a64_ldr_imm64(&c->em, R15, R15, (int64_t)in->imm.ma.memidx * 8);
+            a64_ldr_imm64(&c->em, R15, R15, __builtin_offsetof(EaMemInst, size));
+            mem_base = R14;
+            mem_limit = R15;
+        }
         if (c->m->memories[in->imm.ma.memidx].is64) {
-            a64_sub_imm64(&c->em, R17, R26, (uint32_t)b);
+            a64_sub_imm64(&c->em, R17, mem_limit, (uint32_t)b);
             a64_cmp_reg64(&c->em, R16, R17);
             trap_if(c, TRAP_OOB_MEMORY, CC_HI);
         }
-        a64_str_reg_fpr(&c->em, vsrc, R25, R16, b);
+        a64_str_reg_fpr(&c->em, vsrc, mem_base, R16, b);
         return;
     }
     pop_x(&c->em, R17); // value
@@ -980,21 +1169,33 @@ static void emit_store(JC *c, EaInstr *in) {
     case EA_OP_I32_STORE: case EA_OP_F32_STORE: case EA_OP_I64_STORE32: nat = 4; break;
     default: nat = 8; break;
     }
+    // multi-memory: load this memory's base/limit on demand (x14/x15)
+    uint32_t mem_base = R25, mem_limit = R26;
+    if (in->imm.ma.memidx != 0) {
+        a64_ldr_imm64(&c->em, R14, R28, __builtin_offsetof(EaInstance, memories));
+        a64_ldr_imm64(&c->em, R14, R14, (int64_t)in->imm.ma.memidx * 8);
+        a64_ldr_imm64(&c->em, R14, R14, __builtin_offsetof(EaMemInst, base));
+        a64_ldr_imm64(&c->em, R15, R28, __builtin_offsetof(EaInstance, memories));
+        a64_ldr_imm64(&c->em, R15, R15, (int64_t)in->imm.ma.memidx * 8);
+        a64_ldr_imm64(&c->em, R15, R15, __builtin_offsetof(EaMemInst, size));
+        mem_base = R14;
+        mem_limit = R15;
+    }
     if (c->m->memories[in->imm.ma.memidx].is64) {
         // keep the value; recompute in a free scratch (x0 is free here)
         a64_mov_reg64(&c->em, R0, R17);
-        a64_sub_imm64(&c->em, R17, R26, (uint32_t)nat);
+        a64_sub_imm64(&c->em, R17, mem_limit, (uint32_t)nat);
         a64_cmp_reg64(&c->em, R16, R17);
         trap_if(c, TRAP_OOB_MEMORY, CC_HI);
         a64_mov_reg64(&c->em, R17, R0);
     }
     switch (in->opcode) {
     case EA_OP_I32_STORE: case EA_OP_F32_STORE: case EA_OP_I64_STORE32:
-        a64_str_reg32(&c->em, R17, R25, R16);
+        a64_str_reg32(&c->em, R17, mem_base, R16);
         break;
-    case EA_OP_I32_STORE8: case EA_OP_I64_STORE8: a64_strb_reg32(&c->em, R17, R25, R16); break;
-    case EA_OP_I32_STORE16: case EA_OP_I64_STORE16: a64_strh_reg32(&c->em, R17, R25, R16); break;
-    default: a64_str_reg64(&c->em, R17, R25, R16); break;
+    case EA_OP_I32_STORE8: case EA_OP_I64_STORE8: a64_strb_reg32(&c->em, R17, mem_base, R16); break;
+    case EA_OP_I32_STORE16: case EA_OP_I64_STORE16: a64_strh_reg32(&c->em, R17, mem_base, R16); break;
+    default: a64_str_reg64(&c->em, R17, mem_base, R16); break;
     }
 }
 
@@ -1034,6 +1235,151 @@ static void emit_return(JC *c) {
     a64_ret(&c->em);
 }
 
+// ---------------------------------------------------------------- exception codegen
+// exception clause descriptors live in the executable region so handler-push
+// code can embed their final addresses; carve them from a per-module arena
+static uint8_t *g_eh_cursor = NULL, *g_eh_end = NULL;
+
+static EaEhDesc *eh_desc_alloc(JC *c, uint32_t nc) {
+    size_t sz = sizeof(EaEhDesc) + (nc ? nc : 1) * sizeof(EaEhClause);
+    sz = (sz + 15) & ~(size_t)15;
+    if (!g_eh_cursor || g_eh_cursor + sz > g_eh_end) { jfail(c, "eh arena exhausted"); return NULL; }
+    EaEhDesc *d = (EaEhDesc *)(void *)g_eh_cursor;
+    memset(d, 0, sz);
+    g_eh_cursor += sz;
+    if (c->n_eh_descs == c->cap_eh_descs) {
+        c->cap_eh_descs = c->cap_eh_descs ? c->cap_eh_descs * 2 : 8;
+        c->eh_descs = (EaEhDesc **)realloc(c->eh_descs, c->cap_eh_descs * sizeof(*c->eh_descs));
+        if (!c->eh_descs) { jfail(c, "oom"); return NULL; }
+    }
+    c->eh_descs[c->n_eh_descs++] = d;
+    return d;
+}
+
+static void eh_fixup(JC *c, EaEhDesc *desc, uint32_t clause, uint32_t tpc, uint8_t func_level) {
+    if (c->n_eh_fx == c->cap_eh_fx) {
+        c->cap_eh_fx = c->cap_eh_fx ? c->cap_eh_fx * 2 : 8;
+        c->eh_fx = (struct EhFx *)realloc(c->eh_fx, c->cap_eh_fx * sizeof(*c->eh_fx));
+        if (!c->eh_fx) { jfail(c, "oom"); return; }
+    }
+    c->eh_fx[c->n_eh_fx].desc = desc;
+    c->eh_fx[c->n_eh_fx].clause = clause;
+    c->eh_fx[c->n_eh_fx].tpc = tpc;
+    c->eh_fx[c->n_eh_fx].func_level = func_level;
+    c->n_eh_fx++;
+}
+
+// plain branch to an already-emitted (backward) stub address
+static void eh_b_to(Em *e, uint32_t target_at) {
+    int64_t off = (int64_t)target_at - (int64_t)e->len;
+    em_word(e, 0x14000000 | ((uint32_t)off & 0x3FFFFFF));
+}
+
+// number of live try_table handlers a branch to label l exits: everything
+// above the target frame — the target frame's own pop lives at its landing
+// point (its end), and function-level labels exit them all
+static uint32_t eh_crossings(JC *c, uint32_t l) {
+    uint32_t n = 0;
+    if (l >= c->csp) {
+        for (uint32_t i = 0; i < c->csp; i++) n += c->ctrl[i].is_try;
+        return n;
+    }
+    for (uint32_t i = c->csp - l; i < c->csp; i++) n += c->ctrl[i].is_try;
+    return n;
+}
+
+static void eh_emit_pops(JC *c, uint32_t n) {
+    if (!n) return;
+    a64_mov_reg64(&c->em, R0, R27);
+    a64_movz32(&c->em, R1, n & 0xFFFF);
+    if (n > 0xFFFF) a64_movk32(&c->em, R1, n >> 16);
+    call_helper(c, (const void *)ea_jit_eh_popn);
+}
+
+// cold stubs shared by every throw/resume site of the function; emitted right
+// after the prologue so all references from the body are backward
+static void eh_emit_stubs(JC *c) {
+    Em *e = &c->em;
+    uint32_t prop_at = 0;
+    if (c->has_throw) {
+        c->throw_stub_at = e->len;
+        // reserve scratch below the operand stack: the helper writes the
+        // landing payload into [sp_f, sp_t), which lies BELOW the current sp
+        // and must not overlap the C helper's own frame
+        a64_mov_from_sp(e, R3);          // payload base (w2 = tag, set at site)
+        a64_mov_reg64(e, R4, FP);
+        a64_sub_imm64(e, SP, SP, 512);   // helper-frame scratch, below the payload
+        a64_mov_reg64(e, R0, R27);
+        a64_mov_reg64(e, R1, R28);
+        call_helper(c, (const void *)ea_jit_eh_throw);
+        a64_cmp_imm32(e, R1, 0);
+        em_bcond_label(e, 0, CC_EQ);
+        uint32_t prop_b = e->len - 1;
+        a64_mov_sp_from(e, R0);
+        a64_br_reg(e, R1);
+        if (!prop_at) prop_at = e->len;
+        c->em.buf[prop_b] = 0x54000000 | CC_EQ | (((prop_at - prop_b) & 0x7FFFF) << 5);
+        // bare frame restore + marker; sp is left meaningless — every marker
+        // path recomputes sp from the handler entry or its own frame
+        a64_mov_sp_from(e, FP);
+        a64_ldp_post64(e, FP, LR, SP, 32);
+        a64_movz32(e, R0, 1);
+        a64_ret(e);
+        c->eh_prop_at = prop_at;
+    }
+    if (c->has_throwref) {
+        c->throwref_stub_at = e->len;
+        a64_mov_reg64(e, R0, R27);
+        a64_mov_reg64(e, R1, R28);
+        a64_mov_reg64(e, R3, FP);        // x2 = exnref, popped at the site
+        call_helper(c, (const void *)ea_jit_eh_throw_ref);
+        a64_cmp_imm32(e, R1, 0);
+        em_bcond_label(e, 0, CC_EQ);
+        uint32_t prop_b = e->len - 1;
+        a64_mov_sp_from(e, R0);
+        a64_br_reg(e, R1);
+        if (!prop_at) prop_at = e->len;
+        c->em.buf[prop_b] = 0x54000000 | CC_EQ | (((prop_at - prop_b) & 0x7FFFF) << 5);
+        a64_mov_sp_from(e, FP);
+        a64_ldp_post64(e, FP, LR, SP, 32);
+        a64_movz32(e, R0, 1);
+        a64_ret(e);
+        c->eh_prop_at = prop_at;
+    }
+    if (c->eh_calls) {
+        if (!prop_at) {
+            // a function may only propagate (no own throws): the bare return
+            // tail is still needed below the resume stub
+            prop_at = e->len;
+            a64_mov_sp_from(e, FP);
+            a64_ldp_post64(e, FP, LR, SP, 32);
+            a64_movz32(e, R0, 1);
+            a64_ret(e);
+        }
+        c->eh_prop_at = prop_at;
+        c->eh_resume_at = e->len;
+        // reserve scratch below the call-site sp: the landing payload lies
+        // below it and must not overlap this C helper's frame
+        a64_sub_imm64(e, SP, SP, 512);
+        a64_mov_reg64(e, R0, R27);
+        // this frame's instance was saved below the locals by the prologue
+        int32_t so = -32 - (int32_t)c->n_locals * 16 - 16;
+        a64_mov64_imm(e, R16, (uint64_t)(int64_t)so);
+        a64_add_reg64(e, R28, FP, R16);
+        a64_ldr_imm64(e, R28, R28, 0);
+        load_mem_regs(e);
+        a64_mov_reg64(e, R1, R28);
+        a64_mov_reg64(e, R2, FP);
+        call_helper(c, (const void *)ea_jit_eh_resume);
+        a64_cmp_imm32(e, R1, 0);
+        em_bcond_label(e, 0, CC_EQ);
+        uint32_t prop_b = e->len - 1;
+        c->em.buf[prop_b] = 0x54000000 | CC_EQ | (((prop_at - prop_b) & 0x7FFFF) << 5);
+        a64_mov_sp_from(e, R0);
+        a64_br_reg(e, R1);
+    }
+}
+
 static void emit_call_static(JC *c, EaInstr *in) {
     uint32_t callee = in->imm.u32;
     uint32_t a = 0, r = 0;
@@ -1067,18 +1413,34 @@ static void emit_call_static(JC *c, EaInstr *in) {
         a64_mov_reg64(&c->em, R28, R0);
         load_mem_regs(&c->em);
         a64_blr(&c->em, R1);
+        // exception marker from the callee (x0 == 1, pending_exn set)?
+        if (c->eh_calls) {
+            a64_cmp_imm32(&c->em, R0, 1);
+            em_bcond_label(&c->em, 0, CC_EQ);
+            uint32_t mb = c->em.len - 1;
+            c->em.buf[mb] = 0x54000000 | CC_EQ | (((uint32_t)(c->eh_resume_at - mb) & 0x7FFFF) << 5);
+        }
         // callee left sp = entry - R*16 with results at [sp, sp+R*16); skip the bridge
         em_b_label(&c->em, 0);
         uint32_t skip_at = c->em.len - 1;
         uint32_t join = c->em.len;
         c->em.buf[patch_insn] = 0x54000000 | CC_EQ | (((uint32_t)(join - patch_insn) & 0x7FFFF) << 5);
-        // interpreted callee path (sp = args_base here)
+        // interpreted callee path (sp = args_base here).  When the callee
+        // returns more results than it took args, reserve the extra result
+        // slots below the args block first — the bridge must not write into
+        // its own frame (the red zone is NOT free: it holds the saved lr)
+        a64_mov_from_sp(&c->em, R2);           // args base
+        if (r > a) a64_sub_imm64(&c->em, SP, SP, (r - a) * SLOT);
         a64_mov_reg64(&c->em, R0, R27);
         a64_mov_reg64(&c->em, R1, R17);
-        a64_mov_from_sp(&c->em, R2);
         call_helper(c, (const void *)ea_jit_call_interp);
+        if (c->eh_calls) {
+            a64_cmp_imm32(&c->em, R0, 1);
+            em_bcond_label(&c->em, 0, CC_EQ);
+            uint32_t mb = c->em.len - 1;
+            c->em.buf[mb] = 0x54000000 | CC_EQ | (((uint32_t)(c->eh_resume_at - mb) & 0x7FFFF) << 5);
+        }
         if (a > r) a64_add_imm64(&c->em, SP, SP, (a - r) * SLOT);
-        else if (r > a) a64_sub_imm64(&c->em, SP, SP, (r - a) * SLOT);
         uint32_t join2 = c->em.len;
         c->em.buf[skip_at] = 0x14000000 | ((join2 - skip_at) & 0x3FFFFFF);
         reload_ctx(c);
@@ -1107,20 +1469,35 @@ static void emit_call_indirect(JC *c, EaInstr *in) {
     {
         em_bcond_label(&c->em, 0, CC_EQ);
         uint32_t patch_insn = c->em.len - 1;
+        // JIT path: pop the args into the call transition (entry sp = args_end)
+        a64_add_imm64(&c->em, SP, SP, a * SLOT);
         a64_mov_reg64(&c->em, R28, R0);
         load_mem_regs(&c->em);
         a64_blr(&c->em, R1);
+        // exception marker from the callee (x0 == 1, pending_exn set)?
+        if (c->eh_calls) {
+            a64_cmp_imm32(&c->em, R0, 1);
+            em_bcond_label(&c->em, 0, CC_EQ);
+            uint32_t mb = c->em.len - 1;
+            c->em.buf[mb] = 0x54000000 | CC_EQ | (((uint32_t)(c->eh_resume_at - mb) & 0x7FFFF) << 5);
+        }
         // callee left sp = entry - R*16 with results at [sp, sp+R*16); skip the bridge
         em_b_label(&c->em, 0);
         uint32_t skip_at = c->em.len - 1;
         uint32_t join = c->em.len;
         c->em.buf[patch_insn] = 0x54000000 | CC_EQ | (((uint32_t)(join - patch_insn) & 0x7FFFF) << 5);
+        a64_mov_from_sp(&c->em, R2);           // args base
+        if (r > a) a64_sub_imm64(&c->em, SP, SP, (r - a) * SLOT);
         a64_mov_reg64(&c->em, R0, R27);
         a64_mov_reg64(&c->em, R1, R17);
-        a64_mov_from_sp(&c->em, R2);
         call_helper(c, (const void *)ea_jit_call_interp);
+        if (c->eh_calls) {
+            a64_cmp_imm32(&c->em, R0, 1);
+            em_bcond_label(&c->em, 0, CC_EQ);
+            uint32_t mb = c->em.len - 1;
+            c->em.buf[mb] = 0x54000000 | CC_EQ | (((uint32_t)(c->eh_resume_at - mb) & 0x7FFFF) << 5);
+        }
         if (a > r) a64_add_imm64(&c->em, SP, SP, (a - r) * SLOT);
-        else if (r > a) a64_sub_imm64(&c->em, SP, SP, (r - a) * SLOT);
         uint32_t join2 = c->em.len;
         c->em.buf[skip_at] = 0x14000000 | ((join2 - skip_at) & 0x3FFFFFF);
         reload_ctx(c);
@@ -1128,6 +1505,7 @@ static void emit_call_indirect(JC *c, EaInstr *in) {
 }
 
 static void emit_fcmp32(JC *c, uint32_t cond, bool use_nan_true) {
+    flush_deferred(c);
     pop_s(&c->em, V1);
     pop_s(&c->em, V0);
     a64_fcmp(&c->em, V0, V1, 4);
@@ -1144,6 +1522,7 @@ static void emit_fcmp32(JC *c, uint32_t cond, bool use_nan_true) {
     cmp_result_w(c, fcond);
 }
 static void emit_fcmp64(JC *c, uint32_t cond) {
+    flush_deferred(c);
     pop_d(&c->em, V1);
     pop_d(&c->em, V0);
     a64_fcmp(&c->em, V0, V1, 8);
@@ -1229,7 +1608,8 @@ static bool compile_function(JC *c) {
     if (c->is_target)
         for (uint32_t i = 0; i < n; i++) {
             EaInstr *ti = &code->v[i];
-            if (ti->opcode == EA_OP_BLOCK || ti->opcode == EA_OP_LOOP || ti->opcode == EA_OP_IF) {
+            if (ti->opcode == EA_OP_BLOCK || ti->opcode == EA_OP_LOOP ||
+                ti->opcode == EA_OP_IF || ti->opcode == EA_OP_TRY_TABLE) {
                 if (ti->end_idx <= n) c->is_target[ti->end_idx] = 1;
                 if (ti->opcode == EA_OP_LOOP && i + 1 <= n) c->is_target[i + 1] = 1;
                 if (ti->opcode == EA_OP_IF && ti->else_idx != UINT32_MAX && ti->else_idx + 1 <= n)
@@ -1239,9 +1619,18 @@ static bool compile_function(JC *c) {
     c->is_target[n] = 1;
 
     Em *e = &c->em;
-    // prologue: skip past the incoming args area, and when R > A also reserve
-    // slots for the results (they land at [entry_sp-R*16, entry_sp), which
-    // would otherwise overlap this frame); then build our frame below it
+    // prologue: native stack bound first (deep recursion traps instead of
+    // overflowing the C stack), then skip past the incoming args area, and
+    // when R > A also reserve slots for the results (they land at
+    // [entry_sp-R*16, entry_sp), which would otherwise overlap this frame);
+    // then build our frame below it
+    {
+        // (cmp cannot read sp in the plain register encoding — go via x17)
+        a64_mov_from_sp(e, R17);
+        a64_ldr_imm64(e, R16, R27, __builtin_offsetof(EaExec, jit_stack_limit));
+        a64_cmp_reg64(e, R17, R16);
+        trap_if(c, TRAP_STACK_EXHAUSTED, CC_LS);
+    }
     {
         int32_t skip = (int32_t)c->n_params * SLOT;
         if (c->n_res > c->n_params) skip += (int32_t)(c->n_res - c->n_params) * SLOT;
@@ -1275,6 +1664,17 @@ static bool compile_function(JC *c) {
             a64_str_imm64(e, 31, FP, local_off(c, i));
     }
 
+    // cold exception stubs (throw / throw_ref / resume / propagate) sit before
+    // the body so every reference from the body is a backward branch; the
+    // entry path branches over them
+    uint32_t eh_skip_b = e->len;
+    em_word(e, 0x14000000); // b over the stubs (offset patched below)
+    eh_emit_stubs(c);
+    {
+        int64_t off = (int64_t)e->len - (int64_t)eh_skip_b;
+        c->em.buf[eh_skip_b] = 0x14000000 | ((uint32_t)off & 0x3FFFFFF);
+    }
+
     uint32_t pc = 0;
     while (pc < n) {
         if (c->skip_next) { // result stored straight to a local slot
@@ -1294,6 +1694,7 @@ static bool compile_function(JC *c) {
         case EA_OP_RETURN_CALL: case EA_OP_RETURN_CALL_INDIRECT:
         case EA_OP_RETURN_CALL_REF:
         case EA_OP_BLOCK: case EA_OP_LOOP: case EA_OP_IF:
+        case EA_OP_TRY_TABLE:
         case EA_OP_ELSE: case EA_OP_END:
             flush_cache(c);
             break;
@@ -1311,7 +1712,8 @@ static bool compile_function(JC *c) {
         }
         if (c->skip_depth >= 0) {
             // skipping unreachable code
-            if (op == EA_OP_BLOCK || op == EA_OP_LOOP || op == EA_OP_IF) {
+            if (op == EA_OP_BLOCK || op == EA_OP_LOOP || op == EA_OP_IF ||
+                op == EA_OP_TRY_TABLE) {
                 c->skip_depth++;
                 pc++;
                 continue;
@@ -1352,7 +1754,11 @@ static bool compile_function(JC *c) {
         }
         switch (op) {
         case EA_OP_NOP: break;
-        case EA_OP_UNREACHABLE: c->skip_depth = 0; c->reachable = false; break;
+        case EA_OP_UNREACHABLE:
+            b_trap(c, TRAP_UNREACHABLE); // must actually trap at runtime
+            c->skip_depth = 0;
+            c->reachable = false;
+            break;
         case EA_OP_BLOCK:
             c->ctrl[c->csp].height = in->height;
             c->ctrl[c->csp].arity = in->arity_out;
@@ -1362,8 +1768,77 @@ static bool compile_function(JC *c) {
             c->ctrl[c->csp].else_idx = UINT32_MAX;
             c->ctrl[c->csp].block_idx = pc;
             c->ctrl[c->csp].is_loop = 0;
+            c->ctrl[c->csp].is_try = 0;
             c->csp++;
             break;
+        case EA_OP_TRY_TABLE: {
+            // handler installation: the descriptor captures, per clause, the
+            // tag to match and how far the landing sp sits above this
+            // try_table's label sp.  Catch labels resolve OUTSIDE the
+            // try_table frame (validator: outer_csp); the JIT ctrl stack has
+            // no synthetic function frame, so label == outer_csp here means
+            // the function-level label (branch to the implicit end).
+            uint32_t outer_csp = c->csp;
+            EaEhDesc *desc = eh_desc_alloc(c, in->n_catches);
+            if (!desc) break;
+            desc->n_clauses = in->n_catches;
+            for (uint32_t k = 0; k < in->n_catches; k++) {
+                EaCatch *cc = &in->catches[k];
+                EaEhClause *ec = &desc->c[k];
+                ec->kind = cc->kind;
+                ec->want_ref = (cc->kind == 1 || cc->kind == 3) ? 1 : 0;
+                ec->tag_idx = (cc->kind <= 1) ? cc->tag : UINT32_MAX;
+                if (cc->label > outer_csp) { jfail(c, "eh label"); break; }
+                if (cc->label == outer_csp) {
+                    // function-level label: land on the private return stub
+                    ec->height = 0;
+                    ec->delta_up = c->depth;
+                    eh_fixup(c, desc, k, c->n_pc, 1);
+                } else {
+                    uint32_t tf = outer_csp - 1 - cc->label;
+                    ec->height = c->ctrl[tf].height;
+                    ec->delta_up = c->depth - c->ctrl[tf].height;
+                    uint32_t tpc = c->ctrl[tf].is_loop ? c->ctrl[tf].block_idx + 1
+                                                       : c->ctrl[tf].end_idx;
+                    eh_fixup(c, desc, k, tpc, 0);
+                }
+            }
+            if (c->failed) break;
+            // interpreter parity: try label arity == result arity
+            c->ctrl[c->csp].height = in->height;
+            c->ctrl[c->csp].arity = in->arity_res;
+            c->ctrl[c->csp].rarity = in->arity_res;
+            c->ctrl[c->csp].arity_in = in->arity_in;
+            c->ctrl[c->csp].end_idx = in->end_idx;
+            c->ctrl[c->csp].else_idx = UINT32_MAX;
+            c->ctrl[c->csp].block_idx = pc;
+            c->ctrl[c->csp].is_loop = 0;
+            c->ctrl[c->csp].is_try = 1;
+            c->csp++;
+            a64_mov_reg64(e, R0, R27);
+            a64_mov_reg64(e, R1, R28);   // inst (tag identity owner)
+            a64_mov64_imm(e, R2, (uint64_t)desc);
+            a64_mov_from_sp(e, R3);      // sp0 = this try_table's label sp
+            a64_mov_reg64(e, R4, FP);
+            call_helper(c, (const void *)ea_jit_eh_push);
+            break;
+        }
+        case EA_OP_THROW: {
+            // payload stays where it is; the helper reads [sp, sp + n*16)
+            a64_movz32(e, R2, in->imm.u32 & 0xFFFF);
+            if (in->imm.u32 > 0xFFFF) a64_movk32(e, R2, in->imm.u32 >> 16);
+            eh_b_to(e, c->throw_stub_at);
+            c->skip_depth = 0;
+            c->reachable = false;
+            break;
+        }
+        case EA_OP_THROW_REF: {
+            pop_x(e, R2);                // exnref
+            eh_b_to(e, c->throwref_stub_at);
+            c->skip_depth = 0;
+            c->reachable = false;
+            break;
+        }
         case EA_OP_LOOP:
             // warm-loop two-pass: correct on the spec suite but a stale-value
             // hole remains for >6-live-local unrolled bodies (bench kernels);
@@ -1417,6 +1892,14 @@ static bool compile_function(JC *c) {
             continue;                          // skip pc++ (label recorded next iteration)
         case EA_OP_END:
             if (c->csp > 0) {
+                // normal exit of a try_table: drop its handler.  Branch
+                // landings at insn_at[end_idx] (recorded before this) run this
+                // pop too — `br` to the try's own label therefore counts only
+                // crossings ABOVE this frame, keeping exactly one pop per exit.
+                if (c->ctrl[c->csp - 1].is_try) {
+                    a64_mov_reg64(e, R0, R27);
+                    call_helper(c, (const void *)ea_jit_eh_pop);
+                }
                 c->depth = c->ctrl[c->csp - 1].height + c->ctrl[c->csp - 1].rarity;
                 c->csp--;
             }
@@ -1483,6 +1966,7 @@ static bool compile_function(JC *c) {
             }
             if (c->wl_pass && tpc == c->wl_head_pc) warm_backedge(c);
             else flush_cache(c);
+            eh_emit_pops(c, eh_crossings(c, l));
             emit_br_to(c, c->depth, theight + tarity, tarity);
             em_b_label(e, 0);
             fix_to_pc(c, tpc);
@@ -1524,6 +2008,9 @@ static bool compile_function(JC *c) {
             }
             em_bcond_label(e, 0, cc);
             fix_cond_to_pc(c, pc + 1, cc); // fallthrough when zero/false
+            // pops belong to the TAKEN path only, after the flag-consuming
+            // branch (the helper clobbers flags)
+            eh_emit_pops(c, eh_crossings(c, l));
             emit_br_to(c, c->depth - 1, theight + tarity, tarity); // cond already popped
             em_b_label(e, 0);
             fix_to_pc(c, tpc);
@@ -1550,6 +2037,7 @@ static bool compile_function(JC *c) {
                 uint32_t case_at = c->em.len, th, ta, tpc;
                 bool tl;
                 br_label_target(c, pool[base + i], &th, &ta, &tl, &tpc);
+                eh_emit_pops(c, eh_crossings(c, pool[base + i]));
                 emit_br_to(c, c->depth - 1, th + ta, ta);
                 em_b_label(e, 0);
                 fix_to_pc(c, tpc);
@@ -1559,6 +2047,7 @@ static bool compile_function(JC *c) {
                 uint32_t case_at = c->em.len, th, ta, tpc;
                 bool tl;
                 br_label_target(c, pool[base + ntbl], &th, &ta, &tl, &tpc);
+                eh_emit_pops(c, eh_crossings(c, pool[base + ntbl]));
                 emit_br_to(c, c->depth - 1, th + ta, ta);
                 em_b_label(e, 0);
                 fix_to_pc(c, tpc);
@@ -1570,16 +2059,19 @@ static bool compile_function(JC *c) {
             break;
         }
         case EA_OP_RETURN:
+            eh_emit_pops(c, eh_crossings(c, UINT32_MAX));
             emit_return(c);
             c->skip_depth = 0;
             c->reachable = false;
             break;
         case EA_OP_RETURN_CALL:
+            eh_emit_pops(c, eh_crossings(c, UINT32_MAX));
             emit_tail_call(c, false, in);
             c->skip_depth = 0;
             c->reachable = false;
             break;
         case EA_OP_RETURN_CALL_INDIRECT:
+            eh_emit_pops(c, eh_crossings(c, UINT32_MAX));
             emit_tail_call(c, true, in);
             c->skip_depth = 0;
             c->reachable = false;
@@ -1608,7 +2100,9 @@ static bool compile_function(JC *c) {
             pop_x(e, R17);
             pop_x(e, R0);
             a64_cmp_imm32(e, R16, 0);
-            em_word(e, 0x9EA00C00 | (R0 << 16) | (CC_NE << 12) | (R17 << 5) | R17);
+            // one 64-bit csel covers every select_t payload (int bits, float
+            // bit patterns, references)
+            a64_csel64(e, R17, R0, R17, CC_NE);
             push_x(e, R17);
             break;
         case EA_OP_LOCAL_GET:
@@ -1739,6 +2233,12 @@ static bool compile_function(JC *c) {
         c->insn_at[n] = e->len;
         emit_return(c);
     }
+    // private return sequence for catch clauses that target the function-level
+    // label (they land here with the payload as the results)
+    if (c->n_eh_fx > 0) {
+        c->eh_ret_at = e->len;
+        emit_return(c);
+    }
     return true;
 }
 
@@ -1796,6 +2296,10 @@ static void emit_tail_call(JC *c, bool indirect, EaInstr *in) {
     // pop this frame: x29/x30 restored, sp = fp + 32
     a64_mov_sp_from(e, FP);
     a64_ldp_post64(e, FP, LR, SP, 32);
+    // keep the caller's return address in x20 (callee-saved, survives the C
+    // bridge below — the blr for the bridge would otherwise clobber x30 and
+    // the final ret would jump back into this sequence)
+    a64_mov_reg64(e, R20, LR);
     {
         int32_t below = (c->n_res > c->n_params) ? (int32_t)(c->n_res - c->n_params) * SLOT : 0;
         int64_t net = (int64_t)c->n_params * SLOT + below; // land at sum_entry
@@ -1807,23 +2311,43 @@ static void emit_tail_call(JC *c, bool indirect, EaInstr *in) {
     a64_cmp_imm32(e, R2, 0);
     em_bcond_label(e, 0, CC_EQ);
     uint32_t patch_insn = c->em.len - 1;
-    // JIT callee: set its context and tail-jump
+    // JIT callee: set its context and tail-jump (both fields read before
+    // load_mem_regs clobbers x17)
     a64_ldr_imm64(e, R0, R17, __builtin_offsetof(EaFuncInst, inst));
+    a64_ldr_imm64(e, R1, R17, __builtin_offsetof(EaFuncInst, jit_entry));
     a64_mov_reg64(e, R28, R0);
     load_mem_regs(e);
-    a64_ldr_imm64(e, R1, R17, __builtin_offsetof(EaFuncInst, jit_entry));
     a64_br_reg(e, R1);
     uint32_t join = c->em.len;
     c->em.buf[patch_insn] = 0x54000000 | CC_EQ | (((uint32_t)(join - patch_insn) & 0x7FFFF) << 5);
     // interpreted callee: bridge runs it; results land at [entry-r*16, entry);
-    // x20 survives the C call (callee-saved) so we can still ret to our caller
+    // x20 survives the C call (callee-saved) so we can still ret to our caller.
+    // The bridge expects sp at the args BASE (call sites keep args pushed),
+    // so pop them here first — the sp adjust below then lands the caller at
+    // entry - r*16 exactly as a JIT callee would
+    a64_sub_imm64(e, SP, SP, a * SLOT);    // sp = args base
+    a64_mov_from_sp(e, R2);
+    if (r > a) a64_sub_imm64(e, SP, SP, (r - a) * SLOT); // reserve results
     a64_mov_reg64(e, R0, R27);
     a64_mov_reg64(e, R1, R17);
-    a64_mov_from_sp(e, R2);
     call_helper(c, (const void *)ea_jit_call_interp);
     if (a > r) a64_add_imm64(e, SP, SP, (a - r) * SLOT);
-    else if (r > a) a64_sub_imm64(e, SP, SP, (r - a) * SLOT);
+    a64_mov_reg64(e, LR, R20); // restore the caller's return address
     a64_ret(e);
+}
+
+// trunc_sat input: consume a parked float operand from v1 when the deferral
+// window left one there, else pop the stack into v0
+static uint32_t trunc_sat_src(JC *c, int b) {
+    uint8_t want = b == 8 ? 3 : 2;
+    if (c->def_count == 1 && c->def_kind1 == want) {
+        c->def_count = 0;
+        return V1;
+    }
+    if (c->def_count) flush_deferred(c);
+    pop_x(&c->em, R16);
+    fmov_to_fpr(c, 0, R16, b);
+    return V0;
 }
 
 static bool compile_scalar_op(JC *c, EaInstr *in) {
@@ -2050,14 +2574,14 @@ static bool compile_scalar_op2(JC *c, EaInstr *in) {
     case EA_OP_F64_CONVERT_I64_U: pop_x(e, R16); a64_ucvtf(e, 0, R16, 8, 8); fmov_to_gpr(c, R16, 0, 8); push_x(e, R16); return true;
     case EA_OP_F32_DEMOTE_F64: pop_x(e, R16); fmov_to_fpr(c, 0, R16, 8); a64_fcvt_ds(e, 0, 0); fmov_to_gpr(c, R16, 0, 4); push_x(e, R16); return true;
     case EA_OP_F64_PROMOTE_F32: pop_x(e, R16); fmov_to_fpr(c, 0, R16, 4); a64_fcvt_sd(e, 0, 0); fmov_to_gpr(c, R16, 0, 8); push_x(e, R16); return true;
-    case EA_OP_I32_TRUNC_SAT_F32_S: pop_x(e, R16); fmov_to_fpr(c, 0, R16, 4); a64_fcvtzs(e, R16, 0, 4, 4); push_w(e, R16); return true;
-    case EA_OP_I32_TRUNC_SAT_F32_U: pop_x(e, R16); fmov_to_fpr(c, 0, R16, 4); a64_fcvtzu(e, R16, 0, 4, 4); push_w(e, R16); return true;
-    case EA_OP_I32_TRUNC_SAT_F64_S: pop_x(e, R16); fmov_to_fpr(c, 0, R16, 8); a64_fcvtzs(e, R16, 0, 8, 4); push_w(e, R16); return true;
-    case EA_OP_I32_TRUNC_SAT_F64_U: pop_x(e, R16); fmov_to_fpr(c, 0, R16, 8); a64_fcvtzu(e, R16, 0, 8, 4); push_w(e, R16); return true;
-    case EA_OP_I64_TRUNC_SAT_F32_S: pop_x(e, R16); fmov_to_fpr(c, 0, R16, 4); a64_fcvtzs(e, R16, 0, 4, 8); push_x(e, R16); return true;
-    case EA_OP_I64_TRUNC_SAT_F32_U: pop_x(e, R16); fmov_to_fpr(c, 0, R16, 4); a64_fcvtzu(e, R16, 0, 4, 8); push_x(e, R16); return true;
-    case EA_OP_I64_TRUNC_SAT_F64_S: pop_x(e, R16); fmov_to_fpr(c, 0, R16, 8); a64_fcvtzs(e, R16, 0, 8, 8); push_x(e, R16); return true;
-    case EA_OP_I64_TRUNC_SAT_F64_U: pop_x(e, R16); fmov_to_fpr(c, 0, R16, 8); a64_fcvtzu(e, R16, 0, 8, 8); push_x(e, R16); return true;
+    case EA_OP_I32_TRUNC_SAT_F32_S: { uint32_t v = trunc_sat_src(c, 4); a64_fcvtzs(e, R16, v, 4, 4); push_w(e, R16); return true; }
+    case EA_OP_I32_TRUNC_SAT_F32_U: { uint32_t v = trunc_sat_src(c, 4); a64_fcvtzu(e, R16, v, 4, 4); push_w(e, R16); return true; }
+    case EA_OP_I32_TRUNC_SAT_F64_S: { uint32_t v = trunc_sat_src(c, 8); a64_fcvtzs(e, R16, v, 8, 4); push_w(e, R16); return true; }
+    case EA_OP_I32_TRUNC_SAT_F64_U: { uint32_t v = trunc_sat_src(c, 8); a64_fcvtzu(e, R16, v, 8, 4); push_w(e, R16); return true; }
+    case EA_OP_I64_TRUNC_SAT_F32_S: { uint32_t v = trunc_sat_src(c, 4); a64_fcvtzs(e, R16, v, 4, 8); push_x(e, R16); return true; }
+    case EA_OP_I64_TRUNC_SAT_F32_U: { uint32_t v = trunc_sat_src(c, 4); a64_fcvtzu(e, R16, v, 4, 8); push_x(e, R16); return true; }
+    case EA_OP_I64_TRUNC_SAT_F64_S: { uint32_t v = trunc_sat_src(c, 8); a64_fcvtzs(e, R16, v, 8, 8); push_x(e, R16); return true; }
+    case EA_OP_I64_TRUNC_SAT_F64_U: { uint32_t v = trunc_sat_src(c, 8); a64_fcvtzu(e, R16, v, 8, 8); push_x(e, R16); return true; }
     // ---- trapping truncations via helpers
     case EA_OP_I32_TRUNC_F32_S: emit_trunc(c, ea_h_trunc_i32_f32); return true;
     case EA_OP_I32_TRUNC_F32_U: emit_trunc(c, ea_h_trunc_u32_f32); return true;
@@ -2082,6 +2606,7 @@ static void emit_f32_bin(JC *c, uint32_t opc) {
         c->def_count = 0;
         pop_s(&c->em, V0);
     } else {
+        flush_deferred(c); // parked int operands must reach the stack first
         pop_s(&c->em, V1); pop_s(&c->em, V0);
     }
     switch (opc) {
@@ -2097,6 +2622,7 @@ static void emit_f64_bin(JC *c, uint32_t opc) {
         c->def_count = 0;
         pop_d(&c->em, V0);
     } else {
+        flush_deferred(c); // parked int operands must reach the stack first
         pop_d(&c->em, V1); pop_d(&c->em, V0);
     }
     switch (opc) {
@@ -2182,8 +2708,7 @@ static void emit_div32(JC *c, bool signed_div, bool want_rem) {
         uint32_t j1 = e->len - 1;
         a64_mov32_imm(e, R1, 0xFFFFFFFFu);
         a64_cmp_reg32(e, R17, R1);
-        em_bcond_label(e, 0, CC_EQ);
-        fix_to_trap(c, TRAP_INT_OVERFLOW);
+        trap_if(c, TRAP_INT_OVERFLOW, CC_EQ);
         uint32_t L1 = e->len;
         e->buf[j1] = 0x54000000 | CC_NE | (((uint32_t)(L1 - j1) & 0x7FFFF) << 5);
         a64_sdiv32(e, R16, R16, R17);
@@ -2216,8 +2741,7 @@ static void emit_div64(JC *c, bool signed_div, bool want_rem) {
         uint32_t j1 = e->len - 1;
         a64_mov64_imm(e, R1, 0xFFFFFFFFFFFFFFFFull);
         a64_cmp_reg64(e, R17, R1);
-        em_bcond_label(e, 0, CC_EQ);
-        fix_to_trap(c, TRAP_INT_OVERFLOW);
+        trap_if(c, TRAP_INT_OVERFLOW, CC_EQ);
         uint32_t L1 = e->len;
         e->buf[j1] = 0x54000000 | CC_NE | (((uint32_t)(L1 - j1) & 0x7FFFF) << 5);
         a64_sdiv64(e, R16, R16, R17);
@@ -2286,11 +2810,62 @@ static bool compile_one_function(JC *c) {
         else
             c->em.buf[at] |= ((uint32_t)off & 0x3FFFFFF);
     }
+    // resolve exception clause targets to machine word offsets (absolutized
+    // at publish time, once the code block has its final address)
+    for (uint32_t i = 0; i < c->n_eh_fx; i++) {
+        struct EhFx *fx = &c->eh_fx[i];
+        uint32_t eoff = fx->func_level ? c->eh_ret_at : c->insn_at[fx->tpc];
+        if (eoff == UINT32_MAX) return false;
+        fx->desc->c[fx->clause].target_off = eoff;
+    }
     return true;
 }
 
+// once any module uses exception handling, later-compiled modules get checked
+// call sites too: their imports may resolve to throwing functions compiled
+// earlier (import linking forces the source module to be compiled first)
+static bool g_any_eh_jit = false;
+
 void ea_jit_compile_module(EaModule *m) {
-    if (m->feat.exceptions) return;
+    // call sites need the marker check when exceptions are in play anywhere
+    bool any_indirect = false;
+    for (uint32_t fi = 0; fi < m->n_funcs && !any_indirect; fi++) {
+        EaFunc *f = &m->funcs[fi];
+        if (f->code.n == 0) continue;
+        for (uint32_t q = 0; q < f->code.n; q++) {
+            uint32_t op = f->code.v[q].opcode;
+            if (op == EA_OP_CALL_INDIRECT || op == EA_OP_CALL_REF) { any_indirect = true; break; }
+        }
+    }
+    bool eh_calls = m->feat.exceptions || g_any_eh_jit || any_indirect;
+    // size the exception clause descriptor arena and place it in the code
+    // region (final addresses are needed at handler-push emission time)
+    // the whole compile writes into the region (descriptors, code blocks):
+    // make it writable, restore exec-only when done (execution toggles are
+    // per-thread and ea_jit_call leaves the region write-protected)
+    pthread_jit_write_protect_np(0);
+    g_eh_cursor = g_eh_end = NULL;
+    size_t eh_bytes = 0;
+    if (m->feat.exceptions) {
+        g_any_eh_jit = true;
+        for (uint32_t fi = 0; fi < m->n_funcs; fi++) {
+            EaFunc *f = &m->funcs[fi];
+            if (f->code.n == 0) continue;
+            for (uint32_t q = 0; q < f->code.n; q++)
+                if (f->code.v[q].opcode == EA_OP_TRY_TABLE) {
+                    size_t sz = sizeof(EaEhDesc) +
+                        (f->code.v[q].n_catches ? f->code.v[q].n_catches : 1) * sizeof(EaEhClause);
+                    eh_bytes += (sz + 15) & ~(size_t)15;
+                }
+        }
+    }
+    if (eh_bytes) {
+        uint8_t *arena = region_alloc(eh_bytes);
+        if (arena) {
+            g_eh_cursor = arena;
+            g_eh_end = arena + eh_bytes;
+        }
+    }
     for (uint32_t fi = 0; fi < m->n_funcs; fi++) {
         EaFunc *f = &m->funcs[fi];
         if (f->code.n == 0) continue; // imported
@@ -2304,8 +2879,19 @@ void ea_jit_compile_module(EaModule *m) {
         c.n_locals = f->n_locals;
         c.n_params = c.ft->n_params;
         c.n_res = c.ft->n_results;
+        c.eh_calls = eh_calls;
+        for (uint32_t q = 0; q < f->code.n; q++) {
+            uint32_t op = f->code.v[q].opcode;
+            if (op == EA_OP_THROW) c.has_throw = 1;
+            else if (op == EA_OP_THROW_REF) c.has_throwref = 1;
+        }
         uint64_t fsz = 48 + (uint64_t)c.n_locals * 16 + ((uint64_t)f->max_stack + 8) * 16;
-        if (fsz >= (1 << 20)) { em_free(&c.em); continue; }
+        if (fsz >= (1 << 20)) {
+            em_free(&c.em);
+            free(c.eh_fx);
+            free(c.eh_descs);
+            continue;
+        }
         c.frame_size = (uint32_t)((fsz + 15) & ~15u);
         if (!compile_one_function(&c) || c.failed) {
             if (getenv("EA_JIT_STATS"))
@@ -2316,14 +2902,31 @@ void ea_jit_compile_module(EaModule *m) {
             free(c.tfx);
             free(c.insn_at);
             free(c.is_target);
+            free(c.eh_fx);
+            free(c.eh_descs);
             continue;
         }
         if (getenv("EA_JIT_STATS"))
             fprintf(stderr, "JIT ok func %u -> %u insns\n", fi, (uint32_t)c.em.len);
         uint8_t *dst = region_alloc(c.em.len * 4);
-        if (!dst) { em_free(&c.em); free(c.fx); free(c.tfx); free(c.insn_at); free(c.is_target); continue; }
+        if (!dst) {
+            em_free(&c.em);
+            free(c.fx); free(c.tfx); free(c.insn_at); free(c.is_target);
+            free(c.eh_fx); free(c.eh_descs);
+            continue;
+        }
             pthread_jit_write_protect_np(0);
         memcpy(dst, c.em.buf, c.em.len * 4);
+        // absolutize exception clause targets now that the code is placed
+        for (uint32_t i = 0; i < c.n_eh_fx; i++) {
+            struct EhFx *fx = &c.eh_fx[i];
+            fx->desc->c[fx->clause].target = dst + (size_t)fx->desc->c[fx->clause].target_off * 4;
+            if (getenv("EA_LDBG"))
+                fprintf(stderr, "[LDBG] publish f%u dst=%p off=%u target=%p\n",
+                        c.fn_idx, (void *)dst, fx->desc->c[fx->clause].target_off,
+                        (void *)fx->desc->c[fx->clause].target);
+        }
+
         if (getenv("EA_JIT_DUMP")) {
             fprintf(stderr, "JIT DUMP func %u (%u insns):\n", fi, c.em.len);
             for (uint32_t k = 0; k < c.em.len; k++)
@@ -2338,5 +2941,8 @@ void ea_jit_compile_module(EaModule *m) {
         free(c.tfx);
         free(c.insn_at);
         free(c.is_target);
+        free(c.eh_fx);
+        free(c.eh_descs);
     }
+    pthread_jit_write_protect_np(1); // exec-only again for execution
 }

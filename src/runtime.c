@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <setjmp.h>
 #include <sys/mman.h>
+#include <pthread.h>
 
 // ---------------------------------------------------------------- store
 typedef struct {
@@ -71,6 +72,14 @@ int ea_instance_export_n(EaInstance *inst, const char *name, uint32_t name_len, 
 // ---------------------------------------------------------------- trap plumbing
 const char *ea_store_last_trap_msg(EaStore *s) {
     return s->exec.trap_msg[0] ? s->exec.trap_msg : ea_trap_msg(s->exec.trap);
+}
+
+// for the wast driver's assert_exception: is an uncaught wasm exception in
+// flight? consumes it (clears) either way
+bool ea_store_take_pending_exn(EaStore *s) {
+    struct EaExnInst *px = s->exec.pending_exn;
+    s->exec.pending_exn = NULL;
+    return px != NULL;
 }
 
 void ea_trap(EaExec *ex, EaTrap code) {
@@ -565,6 +574,15 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
         }
     }
 
+    // JIT fast-path fields — set BEFORE element/data init and the start
+    // function: an instantiation that fails partway still leaks funcinsts
+    // into imported tables (spec: prior writes persist), and those must
+    // stay callable from JIT frames, whose prologue loads these unconditionally
+    {
+        static EaMemInst g_dummy_mem; // base=NULL,size=0: any access traps
+        inst->jit_mem0 = n_mems ? inst->memories[0] : &g_dummy_mem;
+    }
+    inst->jit_globals = inst->globals;
     // ---- element segments
     for (uint32_t i = 0; i < m->n_elems; i++) {
         EaElem *e = &m->elems[i];
@@ -625,12 +643,6 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
         if (d->data_len) memcpy(mi->base + off, m->owned_bytes + d->data_off, d->data_len);
     }
 
-    // JIT fast-path fields
-    {
-        static EaMemInst g_dummy_mem; // base=NULL,size=0: any access traps
-        inst->jit_mem0 = n_mems ? inst->memories[0] : &g_dummy_mem;
-    }
-    inst->jit_globals = inst->globals;
     *out = inst;
     if (inst->start_func != UINT32_MAX) {
         EaTrap t = TRAP_NONE;
@@ -639,6 +651,8 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
             if (trap) *trap = t;
             if (err_msg && !*err_msg)
                 *err_msg = ea_strndup("start function trapped", 22);
+            if (getenv("EA_LDBG"))
+                fprintf(stderr, "[LDBG] start-trap inst=%p jit_mem0=%p\n", (void *)inst, (void *)inst->jit_mem0);
             return 2;
         }
     }
@@ -663,6 +677,15 @@ int ea_instance_invoke(EaStore *s, EaInstance *inst, uint32_t func_idx,
     EaExec *saved_fault_exec = g_fault_exec;
     g_fault_exec = ex; // in-bounds faults during this invoke become traps
     ex->trap = TRAP_NONE;
+    ex->pending_exn = NULL; // stale state from a previous invoke must not leak
+    uint32_t eh_base = ex->eh_top; // traps longjmp past JIT handler pops
+    // native stack floor for JIT'd frames: recursion that would run past the
+    // thread stack traps as TRAP_STACK_EXHAUSTED instead of faulting
+    {
+        void *sp0 = (void *)&ex;
+        size_t ssz = pthread_get_stacksize_np(pthread_self());
+        ex->jit_stack_limit = (char *)sp0 - ssz + 256 * 1024;
+    }
     jmp_buf jb;
     jmp_buf *saved = (jmp_buf *)ex->jb;
     ex->jb = &jb;
@@ -715,6 +738,7 @@ int ea_instance_invoke(EaStore *s, EaInstance *inst, uint32_t func_idx,
         if (trap) *trap = ex->trap;
         ret = 1;
     }
+    ex->eh_top = eh_base; // trapped unwind skips generated handler pops
     g_fault_exec = saved_fault_exec;
     return ret;
 }
