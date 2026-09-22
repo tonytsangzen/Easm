@@ -700,3 +700,11 @@ static inline void a64_neon_umov(Em *e, uint32_t se, uint32_t lane, uint32_t rd,
     em_word(e, ((se == 8 ? 1u : 0u) << 30) | 0x0E003C00u | (a64_neon_imm5(se, lane) << 16) | (vn << 5) | rd);
 }
 static inline void a64_neon_movi0(Em *e, uint32_t rd) { em_word(e, 0x4F00E400u | rd); }
+
+// three-same op with the lane width patched: sample calibrated at .16b
+// (size 00) for integer ops or .4s (size 00) for FP; width 0/1/2/3 selects
+// 16b/8h/4s/2d (FP: 4s/2d = 0/1)
+static inline void a64_neon_w(Em *e, uint32_t sample16b, uint32_t width,
+                              uint32_t rd, uint32_t rn, uint32_t rm) {
+    em_word(e, (sample16b & ~0x00C00000u) | (width << 22) | (rm << 16) | (rn << 5) | rd);
+}

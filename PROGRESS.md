@@ -901,8 +901,14 @@ v128 从「函数级回退解释器」升级为**原生 NEON 执行**（第一�
   尾调用参数搬运按 callee 类型 16 字节、br 携带升级 16 字节 ldp/stp
   （类型保持，标量陈旧高半区不外泄）；SELECT/SELECT_T 仍为 8 字节 csel，
   含它们的 v128 函数保留 bail（显式扫描门控）。
-- 批 3 候选：FP 算术（NaN 规范化）、min/max、比较全宽度、移位、
-  load/store lane 变体、select 的 16 字节形式。
+- **批 3（已合入）**：全宽度整数比较（eq/ne/lt/gt/le/ge × s/u × b/h/s/d，
+  经操作数交换复用 cmgt/cmge/cmhi/cmhs）、f32x4/f64x2 比较（fcmeq/fcmge/
+  fcmgt + 交换 + mvn）、f32x4/f64x2 add/sub/mul/div（NEON 传播语义直接
+  满足套件 NaN 断言）、整数 min/max（smin/umin/smax/umax × b/h/s）、
+  可变移位 ×12（sshl/ushl 寄存器形式：计数 mod esize，右移取负——
+  **不是**立即数形式的 esize-shift 约定）。simd_splat 180/0。
+- 批 4 候选：load/store lane 与 load_splat/zero 变体、abs/neg/popcnt、
+  any_true/all_true、narrow/extend、select 的 16 字节形式。
 
 ### 三、排查方法备忘
 

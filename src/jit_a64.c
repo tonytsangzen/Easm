@@ -2651,6 +2651,189 @@ static bool v128_batch1(JC *c, EaInstr *in) {
         return true;
     }
     }
+    // ---- batch 3: comparisons, shifts, FP arith, int min/max ----
+    // integer lane width: 16b/8h/4s/2d -> 0/1/2/3
+    uint32_t w;
+    switch (in->opcode) {
+    case EA_OP_I8X16_EQ: case EA_OP_I8X16_NE: case EA_OP_I8X16_LT_S:
+    case EA_OP_I8X16_LE_S: case EA_OP_I8X16_GT_S: case EA_OP_I8X16_GE_S:
+    case EA_OP_I8X16_LT_U: case EA_OP_I8X16_LE_U: case EA_OP_I8X16_GT_U:
+    case EA_OP_I8X16_GE_U: case EA_OP_I8X16_ADD: case EA_OP_I8X16_SUB:
+    case EA_OP_I8X16_MIN_S: case EA_OP_I8X16_MIN_U: case EA_OP_I8X16_MAX_S:
+    case EA_OP_I8X16_MAX_U:
+    case EA_OP_I8X16_SHL: case EA_OP_I8X16_SHR_S: case EA_OP_I8X16_SHR_U:
+        w = 0; break;
+    case EA_OP_I16X8_EQ: case EA_OP_I16X8_NE: case EA_OP_I16X8_LT_S:
+    case EA_OP_I16X8_LE_S: case EA_OP_I16X8_GT_S: case EA_OP_I16X8_GE_S:
+    case EA_OP_I16X8_LT_U: case EA_OP_I16X8_LE_U: case EA_OP_I16X8_GT_U:
+    case EA_OP_I16X8_GE_U: case EA_OP_I16X8_ADD: case EA_OP_I16X8_SUB:
+    case EA_OP_I16X8_MUL: case EA_OP_I16X8_MIN_S: case EA_OP_I16X8_MIN_U:
+    case EA_OP_I16X8_MAX_S: case EA_OP_I16X8_MAX_U:
+    case EA_OP_I16X8_SHL: case EA_OP_I16X8_SHR_S: case EA_OP_I16X8_SHR_U:
+        w = 1; break;
+    case EA_OP_I32X4_EQ: case EA_OP_I32X4_NE: case EA_OP_I32X4_LT_S:
+    case EA_OP_I32X4_LE_S: case EA_OP_I32X4_GT_S: case EA_OP_I32X4_GE_S:
+    case EA_OP_I32X4_LT_U: case EA_OP_I32X4_LE_U: case EA_OP_I32X4_GT_U:
+    case EA_OP_I32X4_GE_U: case EA_OP_I32X4_ADD: case EA_OP_I32X4_SUB:
+    case EA_OP_I32X4_MUL: case EA_OP_I32X4_MIN_S: case EA_OP_I32X4_MIN_U:
+    case EA_OP_I32X4_MAX_S: case EA_OP_I32X4_MAX_U:
+    case EA_OP_I32X4_SHL: case EA_OP_I32X4_SHR_S: case EA_OP_I32X4_SHR_U:
+        w = 2; break;
+    case EA_OP_I64X2_EQ: case EA_OP_I64X2_NE: case EA_OP_I64X2_ADD:
+    case EA_OP_I64X2_SUB:
+        w = 3; break;
+    default: return false;
+    }
+    // three-same samples calibrated at .16b (integer) / .4s (FP)
+    static const uint32_t cmeq_b = 0x6E318E10u, cmgt_b = 0x4E313610u,
+                          cmge_b = 0x4E313E10u, cmhi_b = 0x6E313610u,
+                          cmhs_b = 0x6E313E10u, smin_b = 0x4E316E10u,
+                          umin_b = 0x6E316E10u, smax_b = 0x4E316610u,
+                          umax_b = 0x6E316610u, sshl_b = 0x4E314610u,
+                          ushl_b = 0x6E314610u, mvn_s   = 0x6E205A10u;
+    static const uint32_t fcmeq_s = 0x4E31E610u, fcmge_s = 0x6E31E610u,
+                          fcmgt_s = 0x6EB1E610u, fadd_s  = 0x4E31D610u,
+                          fsub_s  = 0x4EB1D610u, fmul_s  = 0x6E31DE10u,
+                          fdiv_s  = 0x6E31FE10u;
+    switch (in->opcode) {
+    case EA_OP_I8X16_EQ: case EA_OP_I16X8_EQ: case EA_OP_I32X4_EQ:
+    case EA_OP_I64X2_EQ:
+        pop_q(c, V17); pop_q(c, V16);
+        a64_neon_w(e, cmeq_b, w, V16, V16, V17);
+        push_q(c, V16);
+        return true;
+    case EA_OP_I8X16_NE: case EA_OP_I16X8_NE: case EA_OP_I32X4_NE:
+    case EA_OP_I64X2_NE:
+        pop_q(c, V17); pop_q(c, V16);
+        a64_neon_w(e, cmeq_b, w, V16, V16, V17);
+        a64_neon(e, mvn_s, V16, V16, 0);
+        push_q(c, V16);
+        return true;
+    case EA_OP_I8X16_GT_S: case EA_OP_I16X8_GT_S: case EA_OP_I32X4_GT_S:
+    case EA_OP_I8X16_LT_S: case EA_OP_I16X8_LT_S: case EA_OP_I32X4_LT_S:
+    case EA_OP_I8X16_GE_S: case EA_OP_I16X8_GE_S: case EA_OP_I32X4_GE_S:
+    case EA_OP_I8X16_LE_S: case EA_OP_I16X8_LE_S: case EA_OP_I32X4_LE_S:
+    case EA_OP_I8X16_GT_U: case EA_OP_I16X8_GT_U: case EA_OP_I32X4_GT_U:
+    case EA_OP_I8X16_LT_U: case EA_OP_I16X8_LT_U: case EA_OP_I32X4_LT_U:
+    case EA_OP_I8X16_GE_U: case EA_OP_I16X8_GE_U: case EA_OP_I32X4_GE_U:
+    case EA_OP_I8X16_LE_U: case EA_OP_I16X8_LE_U: case EA_OP_I32X4_LE_U: {
+        // a OP b via the direct or operand-swapped compare:
+        //   gt_s: cmgt(a,b)  lt_s: cmgt(b,a)  ge_s: cmge(a,b)  le_s: cmge(b,a)
+        //   gt_u: cmhi(a,b)  lt_u: cmhi(b,a)  ge_u: cmhs(a,b)  le_u: cmhs(b,a)
+        uint32_t sample; bool swap;
+        switch (in->opcode) {
+        case EA_OP_I8X16_GT_S: case EA_OP_I16X8_GT_S: case EA_OP_I32X4_GT_S:
+            sample = cmgt_b; swap = false; break;
+        case EA_OP_I8X16_LT_S: case EA_OP_I16X8_LT_S: case EA_OP_I32X4_LT_S:
+            sample = cmgt_b; swap = true; break;
+        case EA_OP_I8X16_GE_S: case EA_OP_I16X8_GE_S: case EA_OP_I32X4_GE_S:
+            sample = cmge_b; swap = false; break;
+        case EA_OP_I8X16_LE_S: case EA_OP_I16X8_LE_S: case EA_OP_I32X4_LE_S:
+            sample = cmge_b; swap = true; break;
+        case EA_OP_I8X16_GT_U: case EA_OP_I16X8_GT_U: case EA_OP_I32X4_GT_U:
+            sample = cmhi_b; swap = false; break;
+        case EA_OP_I8X16_LT_U: case EA_OP_I16X8_LT_U: case EA_OP_I32X4_LT_U:
+            sample = cmhi_b; swap = true; break;
+        case EA_OP_I8X16_GE_U: case EA_OP_I16X8_GE_U: case EA_OP_I32X4_GE_U:
+            sample = cmhs_b; swap = false; break;
+        default: sample = cmhs_b; swap = true; break;
+        }
+        pop_q(c, V17); pop_q(c, V16);
+        if (swap) a64_neon_w(e, sample, w, V16, V17, V16);
+        else      a64_neon_w(e, sample, w, V16, V16, V17);
+        push_q(c, V16);
+        return true;
+    }
+    case EA_OP_I8X16_MIN_S: case EA_OP_I16X8_MIN_S: case EA_OP_I32X4_MIN_S:
+    case EA_OP_I8X16_MIN_U: case EA_OP_I16X8_MIN_U: case EA_OP_I32X4_MIN_U:
+    case EA_OP_I8X16_MAX_S: case EA_OP_I16X8_MAX_S: case EA_OP_I32X4_MAX_S:
+    case EA_OP_I8X16_MAX_U: case EA_OP_I16X8_MAX_U: case EA_OP_I32X4_MAX_U: {
+        pop_q(c, V17); pop_q(c, V16);
+        uint32_t sample;
+        switch (in->opcode) {
+        case EA_OP_I8X16_MIN_S: case EA_OP_I16X8_MIN_S: case EA_OP_I32X4_MIN_S: sample = smin_b; break;
+        case EA_OP_I8X16_MIN_U: case EA_OP_I16X8_MIN_U: case EA_OP_I32X4_MIN_U: sample = umin_b; break;
+        case EA_OP_I8X16_MAX_S: case EA_OP_I16X8_MAX_S: case EA_OP_I32X4_MAX_S: sample = smax_b; break;
+        default: sample = umax_b; break;
+        }
+        a64_neon_w(e, sample, w, V16, V16, V17);
+        push_q(c, V16);
+        return true;
+    }
+    case EA_OP_I8X16_SHL: case EA_OP_I16X8_SHL: case EA_OP_I32X4_SHL:
+    case EA_OP_I8X16_SHR_S: case EA_OP_I16X8_SHR_S: case EA_OP_I32X4_SHR_S:
+    case EA_OP_I8X16_SHR_U: case EA_OP_I16X8_SHR_U: case EA_OP_I32X4_SHR_U:
+    case EA_OP_I64X2_SHL: case EA_OP_I64X2_SHR_S: case EA_OP_I64X2_SHR_U: {
+        // variable-count vector shift via sshl/ushl: the count is masked to
+        // the lane width (right shifts encode a negative count)
+        bool is_shl = in->opcode == EA_OP_I8X16_SHL || in->opcode == EA_OP_I16X8_SHL ||
+                      in->opcode == EA_OP_I32X4_SHL || in->opcode == EA_OP_I64X2_SHL;
+        bool is_shr_s = in->opcode == EA_OP_I8X16_SHR_S || in->opcode == EA_OP_I16X8_SHR_S ||
+                        in->opcode == EA_OP_I32X4_SHR_S || in->opcode == EA_OP_I64X2_SHR_S;
+        uint32_t es = w == 0 ? 8 : w == 1 ? 16 : w == 2 ? 32 : 64;
+        pop_w(e, R16); // shift count (i32)
+        pop_q(c, V16);
+        // count mod esize (a64_and_imm32 takes a PRE-ENCODED bitmask field,
+        // not a plain immediate — materialize the mask in a register instead)
+        a64_mov32_imm(e, R17, es - 1);
+        a64_and_reg32(e, R16, R16, R17);
+        // sshl/ushl register form: negative count = right shift by |count|
+        // (NOT the esize-shift immediate convention)
+        if (!is_shl) a64_neg32(e, R16, R16);
+        a64_neon_dup(e, 1u << w, V17, R16); // broadcast at the lane width
+        a64_neon_w(e, is_shr_s ? sshl_b : ushl_b, w, V16, V16, V17);
+        push_q(c, V16);
+        return true;
+    }
+    case EA_OP_F32X4_ADD: case EA_OP_F32X4_SUB: case EA_OP_F32X4_MUL:
+    case EA_OP_F32X4_DIV: case EA_OP_F64X2_ADD: case EA_OP_F64X2_SUB:
+    case EA_OP_F64X2_MUL: case EA_OP_F64X2_DIV: {
+        uint32_t sample;
+        switch (in->opcode) {
+        case EA_OP_F32X4_ADD: sample = fadd_s; break;
+        case EA_OP_F32X4_SUB: sample = fsub_s; break;
+        case EA_OP_F32X4_MUL: sample = fmul_s; break;
+        case EA_OP_F32X4_DIV: sample = fdiv_s; break;
+        case EA_OP_F64X2_ADD: sample = fadd_s; break;
+        case EA_OP_F64X2_SUB: sample = fsub_s; break;
+        case EA_OP_F64X2_MUL: sample = fmul_s; break;
+        default: sample = fdiv_s; break;
+        }
+        uint32_t fw = (in->opcode >= EA_OP_F64X2_ADD) ? 1 : 0;
+        pop_q(c, V17); pop_q(c, V16);
+        a64_neon_w(e, sample, fw, V16, V16, V17);
+        push_q(c, V16);
+        return true;
+    }
+    case EA_OP_F32X4_EQ: case EA_OP_F32X4_NE: case EA_OP_F32X4_LT:
+    case EA_OP_F32X4_LE: case EA_OP_F32X4_GT: case EA_OP_F32X4_GE:
+    case EA_OP_F64X2_EQ: case EA_OP_F64X2_NE: case EA_OP_F64X2_LT:
+    case EA_OP_F64X2_LE: case EA_OP_F64X2_GT: case EA_OP_F64X2_GE: {
+        uint32_t sample; bool swap;
+        switch (in->opcode) {
+        case EA_OP_F32X4_EQ: sample = fcmeq_s; swap = false; break;
+        case EA_OP_F32X4_NE: sample = fcmeq_s; swap = false; break;
+        case EA_OP_F32X4_GT: sample = fcmgt_s; swap = false; break;
+        case EA_OP_F32X4_LT: sample = fcmgt_s; swap = true; break;
+        case EA_OP_F32X4_GE: sample = fcmge_s; swap = false; break;
+        case EA_OP_F32X4_LE: sample = fcmge_s; swap = true; break;
+        case EA_OP_F64X2_EQ: sample = fcmeq_s; swap = false; break;
+        case EA_OP_F64X2_NE: sample = fcmeq_s; swap = false; break;
+        case EA_OP_F64X2_GT: sample = fcmgt_s; swap = false; break;
+        case EA_OP_F64X2_LT: sample = fcmgt_s; swap = true; break;
+        case EA_OP_F64X2_GE: sample = fcmge_s; swap = false; break;
+        default: sample = fcmge_s; swap = true; break;
+        }
+        uint32_t fw = (in->opcode >= EA_OP_F64X2_EQ) ? 1 : 0;
+        pop_q(c, V17); pop_q(c, V16);
+        if (swap) a64_neon_w(e, sample, fw, V16, V17, V16);
+        else      a64_neon_w(e, sample, fw, V16, V16, V17);
+        if (in->opcode == EA_OP_F32X4_NE || in->opcode == EA_OP_F64X2_NE)
+            a64_neon(e, mvn_s, V16, V16, 0);
+        push_q(c, V16);
+        return true;
+    }
+    }
     return false;
 }
 
