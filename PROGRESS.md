@@ -855,6 +855,27 @@ CALL*/RETURN_CALL*/THROW*/TRY_TABLE），无需每次调用都做
 5. 附带发现：**leaf-skip 与 EA_CACHE 相互作用破坏 return.wast**
    （36 FAIL）——探针为何 load-bearing 未查明，是下轮切入点。
 
+## 迭代 23：EH 快路径 — throw 命中单 clause 内联分发（2026-09-23，已合入）
+
+`throw $T` 的默认路径 = 分支到冷存根 → `ea_jit_eh_throw` 构造异常对象 →
+`eh_dispatch` 逐条目逐 clause 匹配。当**最内层 enclosing try_table 恰有
+一个 clause 且为 `catch $T`（同 tag）或 `catch_all`** 时，现在直接内联：
+
+    bl ea_jit_eh_pop        // 摘除本 try 的 handler 条目（helper 语义）
+    <emit_br_to 载荷搬运>    // 与 br 完全相同的落点：sp = 标签高度-载荷数
+    b  <clause 落点>         // 与 helper resume 相同的目标
+
+- 落点公式与 eh_dispatch 逐字段对齐：height/arity 取自 clause 标签的
+  ctrl 帧（校验器保证标签 arity == tag 参数量），函数级 clause 落到
+  隐式 end（emit_return 尾）。
+- 其余形态（tag 不命中、多 clause、catch_ref、throw_ref、外层 handler）
+  一律回退原存根路径——运行时 EA_EHDBG 验证：命中场景 0 次 dispatch，
+  不命中场景 1 次（正确 trap）。
+- 教训：`fix_to_pc` 之前必须先发射占位 `em_b_label`（它补丁最近一条 b），
+  漏发 = SIGILL。
+- 验证：exceptions 全家（throw 12/0、try_table 45/0、throw_ref 14/0）、
+  全量双模式 257/258 零回归。
+
 ### 三、排查方法备忘
 
 - 单函数 JIT 代码对比：EA_JIT_DUMP + llvm-mc（--disassemble 输入须为

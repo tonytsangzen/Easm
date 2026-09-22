@@ -1855,6 +1855,46 @@ static bool compile_function(JC *c) {
             break;
         }
         case EA_OP_THROW: {
+            // fast path: the innermost enclosing try_table has a single plain
+            // catch of this exact tag (or a single catch_all) — drop its
+            // handler entry and land directly, exactly like the helper's
+            // match would (sp at the label height minus the payload, payload
+            // carried as a br), skipping the stub and the dispatch walk
+            EaInstr *tin = NULL;
+            uint32_t tf = UINT32_MAX;
+            for (uint32_t k = c->csp; k-- > 0;) {
+                if (c->ctrl[k].is_try) {
+                    tf = k;
+                    tin = &code->v[c->ctrl[k].block_idx];
+                    break;
+                }
+            }
+            if (tin && tin->n_catches == 1 &&
+                (tin->catches[0].kind == 2 ||
+                 (tin->catches[0].kind == 0 &&
+                  tin->catches[0].tag == in->imm.u32))) {
+                uint32_t lbl = tin->catches[0].label;
+                uint32_t theight, tarity, tpc;
+                if (lbl >= tf) { // function-level clause label
+                    theight = 0;
+                    tarity = c->n_res;
+                    tpc = c->n_pc;
+                } else {
+                    uint32_t f = tf - 1 - lbl;
+                    theight = c->ctrl[f].height;
+                    tarity = tin->catches[0].kind == 2 ? 0 : c->ctrl[f].arity;
+                    tpc = c->ctrl[f].is_loop ? c->ctrl[f].block_idx + 1
+                                             : c->ctrl[f].end_idx;
+                }
+                a64_mov_reg64(e, R0, R27);
+                call_helper(c, (const void *)ea_jit_eh_pop); // drop the entry
+                emit_br_to(c, c->depth, theight + tarity, tarity);
+                em_b_label(e, 0);
+                fix_to_pc(c, tpc);
+                c->skip_depth = 0;
+                c->reachable = false;
+                break;
+            }
             // payload stays where it is; the helper reads [sp, sp + n*16)
             a64_movz32(e, R2, in->imm.u32 & 0xFFFF);
             if (in->imm.u32 > 0xFFFF) a64_movk32(e, R2, in->imm.u32 >> 16);
