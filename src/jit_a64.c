@@ -1116,7 +1116,6 @@ static void emit_load(JC *c, EaInstr *in) {
     case EA_OP_V128_LOAD8_SPLAT: case EA_OP_V128_LOAD16_SPLAT:
     case EA_OP_V128_LOAD32_SPLAT: case EA_OP_V128_LOAD64_SPLAT:
     case EA_OP_V128_LOAD32_ZERO: case EA_OP_V128_LOAD64_ZERO:
-        if (!getenv("EA_V128_B4")) { jfail(c, "v128 load variant gated"); return; }
         nat = in->opcode == EA_OP_V128_LOAD8_SPLAT ? 1 :
               in->opcode == EA_OP_V128_LOAD16_SPLAT ? 2 :
               in->opcode == EA_OP_V128_LOAD64_SPLAT ||
@@ -2620,35 +2619,6 @@ static bool v128_load_store_lane(JC *c, EaInstr *in) {
 
 static bool v128_batch1(JC *c, EaInstr *in) {
     Em *e = &c->em;
-    // batch 4 (abs/neg/popcnt/any-all_true/load splat-zero-lane) is gated:
-    // per-function results are correct, but a sequence-dependent wild access
-    // in the wast driver (simd_splat, ASLR-sensitive) is still open
-    static int b4 = -1;
-    if (b4 < 0) b4 = getenv("EA_V128_B4") != NULL;
-    if (!b4) {
-        // batch 4 (abs/neg/popcnt/any-all_true/load splat-zero-lane) is gated:
-        // per-function results are correct, but the wast driver hits a
-        // sequence- and ASLR-dependent wild access (simd_splat) that is still
-        // open — those opcodes ride the interpreter until it is pinned down
-        switch (in->opcode) {
-        case EA_OP_I8X16_ABS: case EA_OP_I16X8_ABS: case EA_OP_I32X4_ABS:
-        case EA_OP_I64X2_ABS: case EA_OP_I8X16_NEG: case EA_OP_I16X8_NEG:
-        case EA_OP_I32X4_NEG: case EA_OP_I64X2_NEG:
-        case EA_OP_F32X4_ABS: case EA_OP_F64X2_ABS: case EA_OP_F32X4_NEG:
-        case EA_OP_F64X2_NEG: case EA_OP_I8X16_POPCNT:
-        case EA_OP_V128_ANY_TRUE: case EA_OP_I8X16_ALL_TRUE:
-        case EA_OP_I16X8_ALL_TRUE: case EA_OP_I32X4_ALL_TRUE:
-        case EA_OP_V128_LOAD8_SPLAT: case EA_OP_V128_LOAD16_SPLAT:
-        case EA_OP_V128_LOAD32_SPLAT: case EA_OP_V128_LOAD64_SPLAT:
-        case EA_OP_V128_LOAD32_ZERO: case EA_OP_V128_LOAD64_ZERO:
-        case EA_OP_V128_LOAD8_LANE: case EA_OP_V128_LOAD16_LANE:
-        case EA_OP_V128_LOAD32_LANE: case EA_OP_V128_LOAD64_LANE:
-        case EA_OP_V128_STORE8_LANE: case EA_OP_V128_STORE16_LANE:
-        case EA_OP_V128_STORE32_LANE: case EA_OP_V128_STORE64_LANE:
-            return false;
-        default: break;
-        }
-    }
     switch (in->opcode) {
     case EA_OP_V128_CONST: {
         uint64_t lo = 0, hi = 0;
@@ -2801,7 +2771,8 @@ static bool v128_batch1(JC *c, EaInstr *in) {
     }
     case EA_OP_V128_ANY_TRUE:
         pop_q(c, V16);
-        a64_neon(e, 0x6E30AA10u, V16, V16, 0); // umaxv b16
+        // reductions carry a fixed 10001 pattern in the Rm field position
+        a64_neon(e, 0x6E30AA10u, V16, V16, 17); // umaxv b16
         a64_neon_umov(e, 1, 0, R16, V16);
         a64_cmp_imm32(e, R16, 0);
         a64_cset32(e, R16, CC_NE);
@@ -2809,8 +2780,8 @@ static bool v128_batch1(JC *c, EaInstr *in) {
         return true;
     case EA_OP_I8X16_ALL_TRUE: case EA_OP_I16X8_ALL_TRUE: case EA_OP_I32X4_ALL_TRUE:
         pop_q(c, V16);
-        a64_neon(e, 0x6E31AA10u, V16, V16, 0); // uminv b16 (byte-min != 0
-        a64_neon_umov(e, 1, 0, R16, V16);      //  <=> every lane != 0)
+        a64_neon(e, 0x6E31AA10u, V16, V16, 17); // uminv b16 (byte-min != 0
+        a64_neon_umov(e, 1, 0, R16, V16);       //  <=> every lane != 0)
         a64_cmp_imm32(e, R16, 0);
         a64_cset32(e, R16, CC_NE);
         push_w(e, R16);
