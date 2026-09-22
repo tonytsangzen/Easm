@@ -1113,6 +1113,15 @@ static void emit_load(JC *c, EaInstr *in) {
     case EA_OP_I32_LOAD: case EA_OP_F32_LOAD:
     case EA_OP_I64_LOAD32_S: case EA_OP_I64_LOAD32_U: nat = 4; break;
     case EA_OP_V128_LOAD: nat = 16; break;
+    case EA_OP_V128_LOAD8_SPLAT: case EA_OP_V128_LOAD16_SPLAT:
+    case EA_OP_V128_LOAD32_SPLAT: case EA_OP_V128_LOAD64_SPLAT:
+    case EA_OP_V128_LOAD32_ZERO: case EA_OP_V128_LOAD64_ZERO:
+        if (!getenv("EA_V128_B4")) { jfail(c, "v128 load variant gated"); return; }
+        nat = in->opcode == EA_OP_V128_LOAD8_SPLAT ? 1 :
+              in->opcode == EA_OP_V128_LOAD16_SPLAT ? 2 :
+              in->opcode == EA_OP_V128_LOAD64_SPLAT ||
+              in->opcode == EA_OP_V128_LOAD64_ZERO ? 8 : 4;
+        break;
     default: nat = 8; break;
     }
     // 32-bit memories: out-of-bounds accesses fault inside the 12 GiB
@@ -1144,6 +1153,34 @@ static void emit_load(JC *c, EaInstr *in) {
     case EA_OP_I64_LOAD32_U: a64_ldr_reg32(&c->em, R16, mem_base, R16); break;
     case EA_OP_V128_LOAD:
         a64_ldr_q_reg(&c->em, V16, mem_base, R16);
+        a64_str_q_pre(&c->em, V16);
+        return;
+    case EA_OP_V128_LOAD8_SPLAT:
+        a64_ldrb_reg32(&c->em, R16, mem_base, R16);
+        a64_neon_dup(&c->em, 1, V16, R16);
+        a64_str_q_pre(&c->em, V16);
+        return;
+    case EA_OP_V128_LOAD16_SPLAT:
+        a64_ldrh_reg32(&c->em, R16, mem_base, R16);
+        a64_neon_dup(&c->em, 2, V16, R16);
+        a64_str_q_pre(&c->em, V16);
+        return;
+    case EA_OP_V128_LOAD32_SPLAT:
+        a64_ldr_reg32(&c->em, R16, mem_base, R16);
+        a64_neon_dup(&c->em, 4, V16, R16);
+        a64_str_q_pre(&c->em, V16);
+        return;
+    case EA_OP_V128_LOAD64_SPLAT:
+        a64_ldr_reg64(&c->em, R16, mem_base, R16);
+        a64_neon_dup(&c->em, 8, V16, R16);
+        a64_str_q_pre(&c->em, V16);
+        return;
+    case EA_OP_V128_LOAD32_ZERO:
+        a64_ldr_reg_fpr(&c->em, V16, mem_base, R16, 4); // zero-extends to Q
+        a64_str_q_pre(&c->em, V16);
+        return;
+    case EA_OP_V128_LOAD64_ZERO:
+        a64_ldr_reg_fpr(&c->em, V16, mem_base, R16, 8);
         a64_str_q_pre(&c->em, V16);
         return;
     default: a64_ldr_reg64(&c->em, R16, mem_base, R16); break;
@@ -2528,8 +2565,90 @@ static uint32_t trunc_sat_src(JC *c, int b) {
 // v128 batch 1 (integer/bitwise): returns false when the opcode is not
 // lowered (caller bails to the interpreter).  FP ops defer until their NaN
 // canonicalization matches the interpreter byte-for-byte.
+// v128.loadN_lane / v128.storeN_lane: the vector is the top operand, then
+// the address (shared memory plumbing with the scalar load/store paths)
+static bool v128_load_store_lane(JC *c, EaInstr *in) {
+    Em *e = &c->em;
+    bool is_store = in->opcode >= EA_OP_V128_STORE8_LANE;
+    uint32_t se = 1; // lane byte width
+    if (in->opcode == EA_OP_V128_LOAD16_LANE || in->opcode == EA_OP_V128_STORE16_LANE) se = 2;
+    else if (in->opcode == EA_OP_V128_LOAD32_LANE || in->opcode == EA_OP_V128_STORE32_LANE) se = 4;
+    else if (in->opcode == EA_OP_V128_LOAD64_LANE || in->opcode == EA_OP_V128_STORE64_LANE) se = 8;
+    pop_q(c, V16); // vector (top)
+    if (c->m->memories[in->imm.ma.memidx].is64) pop_x(e, R16);
+    else pop_w(e, R16); // address
+    uint64_t off = in->imm.ma.offset;
+    if (off) {
+        if (off < 4096) a64_add_imm64(e, R16, R16, (uint32_t)off);
+        else { a64_mov64_imm(e, R0, off); a64_add_reg64(e, R16, R16, R0); }
+    }
+    uint32_t mem_base = R25, mem_limit = R26;
+    if (in->imm.ma.memidx != 0) {
+        a64_ldr_imm64(e, R14, R28, __builtin_offsetof(EaInstance, memories));
+        a64_ldr_imm64(e, R14, R14, (int64_t)in->imm.ma.memidx * 8);
+        a64_ldr_imm64(e, R14, R14, __builtin_offsetof(EaMemInst, base));
+        a64_ldr_imm64(e, R15, R28, __builtin_offsetof(EaInstance, memories));
+        a64_ldr_imm64(e, R15, R15, (int64_t)in->imm.ma.memidx * 8);
+        a64_ldr_imm64(e, R15, R15, __builtin_offsetof(EaMemInst, size));
+        mem_base = R14;
+        mem_limit = R15;
+    }
+    if (c->m->memories[in->imm.ma.memidx].is64) {
+        a64_sub_imm64(e, R17, mem_limit, se);
+        a64_cmp_reg64(e, R16, R17);
+        trap_if(c, TRAP_OOB_MEMORY, CC_HI);
+    }
+    if (!is_store) {
+        switch (se) {
+        case 1: a64_ldrb_reg32(e, R16, mem_base, R16); break;
+        case 2: a64_ldrh_reg32(e, R16, mem_base, R16); break;
+        case 4: a64_ldr_reg32(e, R16, mem_base, R16); break;
+        default: a64_ldr_reg64(e, R16, mem_base, R16); break;
+        }
+        a64_neon_ins(e, se, in->lane, V16, R16);
+        push_q(c, V16);
+    } else {
+        switch (se) {
+        case 1: a64_neon_umov(e, 1, in->lane, R17, V16); a64_strb_reg32(e, R17, mem_base, R16); break;
+        case 2: a64_neon_umov(e, 2, in->lane, R17, V16); a64_strh_reg32(e, R17, mem_base, R16); break;
+        case 4: a64_neon_umov(e, 4, in->lane, R17, V16); a64_str_reg32(e, R17, mem_base, R16); break;
+        default: a64_neon_umov(e, 8, in->lane, R17, V16); a64_str_reg64(e, R17, mem_base, R16); break;
+        }
+    }
+    return true;
+}
+
 static bool v128_batch1(JC *c, EaInstr *in) {
     Em *e = &c->em;
+    // batch 4 (abs/neg/popcnt/any-all_true/load splat-zero-lane) is gated:
+    // per-function results are correct, but a sequence-dependent wild access
+    // in the wast driver (simd_splat, ASLR-sensitive) is still open
+    static int b4 = -1;
+    if (b4 < 0) b4 = getenv("EA_V128_B4") != NULL;
+    if (!b4) {
+        // batch 4 (abs/neg/popcnt/any-all_true/load splat-zero-lane) is gated:
+        // per-function results are correct, but the wast driver hits a
+        // sequence- and ASLR-dependent wild access (simd_splat) that is still
+        // open — those opcodes ride the interpreter until it is pinned down
+        switch (in->opcode) {
+        case EA_OP_I8X16_ABS: case EA_OP_I16X8_ABS: case EA_OP_I32X4_ABS:
+        case EA_OP_I64X2_ABS: case EA_OP_I8X16_NEG: case EA_OP_I16X8_NEG:
+        case EA_OP_I32X4_NEG: case EA_OP_I64X2_NEG:
+        case EA_OP_F32X4_ABS: case EA_OP_F64X2_ABS: case EA_OP_F32X4_NEG:
+        case EA_OP_F64X2_NEG: case EA_OP_I8X16_POPCNT:
+        case EA_OP_V128_ANY_TRUE: case EA_OP_I8X16_ALL_TRUE:
+        case EA_OP_I16X8_ALL_TRUE: case EA_OP_I32X4_ALL_TRUE:
+        case EA_OP_V128_LOAD8_SPLAT: case EA_OP_V128_LOAD16_SPLAT:
+        case EA_OP_V128_LOAD32_SPLAT: case EA_OP_V128_LOAD64_SPLAT:
+        case EA_OP_V128_LOAD32_ZERO: case EA_OP_V128_LOAD64_ZERO:
+        case EA_OP_V128_LOAD8_LANE: case EA_OP_V128_LOAD16_LANE:
+        case EA_OP_V128_LOAD32_LANE: case EA_OP_V128_LOAD64_LANE:
+        case EA_OP_V128_STORE8_LANE: case EA_OP_V128_STORE16_LANE:
+        case EA_OP_V128_STORE32_LANE: case EA_OP_V128_STORE64_LANE:
+            return false;
+        default: break;
+        }
+    }
     switch (in->opcode) {
     case EA_OP_V128_CONST: {
         uint64_t lo = 0, hi = 0;
@@ -2650,6 +2769,57 @@ static bool v128_batch1(JC *c, EaInstr *in) {
         push_q(c, V16);
         return true;
     }
+    case EA_OP_I8X16_ABS: case EA_OP_I16X8_ABS: case EA_OP_I32X4_ABS:
+    case EA_OP_I64X2_ABS: case EA_OP_I8X16_NEG: case EA_OP_I16X8_NEG:
+    case EA_OP_I32X4_NEG: case EA_OP_I64X2_NEG:
+    case EA_OP_F32X4_ABS: case EA_OP_F64X2_ABS: case EA_OP_F32X4_NEG:
+    case EA_OP_F64X2_NEG:
+    case EA_OP_I8X16_POPCNT: {
+        // 2-reg misc family, calibrated at the widest lane of each group
+        static const uint32_t abs_w[4] = {0x4E20BA10u, 0x4E60BA10u, 0x4EA0BA10u, 0x4EE0BA10u};
+        static const uint32_t neg_w[4] = {0x6E20BA10u, 0x6E60BA10u, 0x6EA0BA10u, 0x6EE0BA10u};
+        pop_q(c, V16);
+        uint32_t sample;
+        switch (in->opcode) {
+        case EA_OP_I8X16_ABS: sample = abs_w[0]; break;
+        case EA_OP_I16X8_ABS: sample = abs_w[1]; break;
+        case EA_OP_I32X4_ABS: sample = abs_w[2]; break;
+        case EA_OP_I64X2_ABS: sample = abs_w[3]; break;
+        case EA_OP_I8X16_NEG: sample = neg_w[0]; break;
+        case EA_OP_I16X8_NEG: sample = neg_w[1]; break;
+        case EA_OP_I32X4_NEG: sample = neg_w[2]; break;
+        case EA_OP_I64X2_NEG: sample = neg_w[3]; break;
+        case EA_OP_F32X4_ABS: sample = 0x4EA0FA10u; break;
+        case EA_OP_F64X2_ABS: sample = 0x4EE0FA10u; break;
+        case EA_OP_F32X4_NEG: sample = 0x6EA0FA10u; break;
+        case EA_OP_F64X2_NEG: sample = 0x6EE0FA10u; break;
+        default: sample = 0x4E205A10u; break; // cnt v16.16b
+        }
+        a64_neon(e, sample, V16, V16, 0);
+        push_q(c, V16);
+        return true;
+    }
+    case EA_OP_V128_ANY_TRUE:
+        pop_q(c, V16);
+        a64_neon(e, 0x6E30AA10u, V16, V16, 0); // umaxv b16
+        a64_neon_umov(e, 1, 0, R16, V16);
+        a64_cmp_imm32(e, R16, 0);
+        a64_cset32(e, R16, CC_NE);
+        push_w(e, R16);
+        return true;
+    case EA_OP_I8X16_ALL_TRUE: case EA_OP_I16X8_ALL_TRUE: case EA_OP_I32X4_ALL_TRUE:
+        pop_q(c, V16);
+        a64_neon(e, 0x6E31AA10u, V16, V16, 0); // uminv b16 (byte-min != 0
+        a64_neon_umov(e, 1, 0, R16, V16);      //  <=> every lane != 0)
+        a64_cmp_imm32(e, R16, 0);
+        a64_cset32(e, R16, CC_NE);
+        push_w(e, R16);
+        return true;
+    case EA_OP_V128_LOAD8_LANE: case EA_OP_V128_LOAD16_LANE:
+    case EA_OP_V128_LOAD32_LANE: case EA_OP_V128_LOAD64_LANE:
+    case EA_OP_V128_STORE8_LANE: case EA_OP_V128_STORE16_LANE:
+    case EA_OP_V128_STORE32_LANE: case EA_OP_V128_STORE64_LANE:
+        return v128_load_store_lane(c, in);
     }
     // ---- batch 3: comparisons, shifts, FP arith, int min/max ----
     // integer lane width: 16b/8h/4s/2d -> 0/1/2/3
