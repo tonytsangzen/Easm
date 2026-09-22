@@ -714,6 +714,30 @@ static void push_w(JC *c, uint32_t rt) { a64_str_pre32(&c->em, rt, SP, -16); }
 static void pop_w(JC *c, uint32_t rt) { a64_ldr_post32(&c->em, rt, SP, 16); }
 static void push_q(JC *c, uint32_t rt) { a64_str_q_pre(&c->em, rt); }
 static void pop_q(JC *c, uint32_t rt) { a64_ldr_q_post(&c->em, rt); }
+// Q load/store at a signed FP-relative offset (imm9 form, with far fallback
+// through the R0 scratch for the deep-local frames)
+static void str_q_frame(JC *c, uint32_t rt, int32_t off) {
+    if (off >= -256 && off <= 255) {
+        em_word(&c->em, 0x3C800000u | (((uint32_t)off & 0x1FF) << 12) | (FP << 5) | rt);
+    } else if (off >= 0 && off <= 32760) {
+        em_word(&c->em, 0x3D800000u | (((uint32_t)off / 16) << 10) | (FP << 5) | rt);
+    } else {
+        if (off >= 0 && off <= 4095) a64_add_imm64(&c->em, R0, FP, (uint32_t)off);
+        else { a64_mov64_imm(&c->em, R0, (uint64_t)off); a64_add_reg64(&c->em, R0, FP, R0); }
+        a64_str_q_reg(&c->em, rt, R0, 0);
+    }
+}
+static void ldr_q_frame(JC *c, uint32_t rt, int32_t off) {
+    if (off >= -256 && off <= 255) {
+        em_word(&c->em, 0x3CC00000u | (((uint32_t)off & 0x1FF) << 12) | (FP << 5) | rt);
+    } else if (off >= 0 && off <= 32760) {
+        em_word(&c->em, 0x3DC00000u | (((uint32_t)off / 16) << 10) | (FP << 5) | rt);
+    } else {
+        if (off >= 0 && off <= 4095) a64_add_imm64(&c->em, R0, FP, (uint32_t)off);
+        else { a64_mov64_imm(&c->em, R0, (uint64_t)off); a64_add_reg64(&c->em, R0, FP, R0); }
+        a64_ldr_q_reg(&c->em, rt, R0, 0);
+    }
+}
 // deferred-operand fusion: i32/i64 const or local.get parks its value in x17
 // and the very next instruction consumes it from the register instead of the
 // stack slot.  Safe because we only defer when no branch can target the
@@ -1018,6 +1042,7 @@ static void pop_s(JC *c, uint32_t vt) { a64_ldr_post_fpr(&c->em, vt, SP, 16, 4);
 static void push_d(JC *c, uint32_t vt) { a64_str_pre_fpr(&c->em, vt, SP, -16, 8); }
 static void pop_d(JC *c, uint32_t vt) { a64_ldr_post_fpr(&c->em, vt, SP, 16, 8); }
 static void peek_x(JC *c, uint32_t rt, uint32_t slot) { a64_ldr_imm64(&c->em, rt, SP, (int64_t)slot * 16); }
+static void peek_q(JC *c, uint32_t rt, uint32_t slot) { a64_ldr_imm64(&c->em, rt, SP, (int64_t)slot * 16); } // Q reg, same encoding
 static void poke_x(JC *c, uint32_t rt, uint32_t slot) { a64_str_imm64(&c->em, rt, SP, (int64_t)slot * 16); }
 
 static int32_t local_off(JC *c, uint32_t k) {
@@ -1610,9 +1635,13 @@ static void emit_br_to(JC *c, uint32_t cur, uint32_t target_depth, uint32_t arit
     // carry never changes an operand's type, so a scalar slot's stale upper
     // half is never read by a wider consumer — 16-byte moves would smear it.
     int32_t up = (int32_t)(cur - target_depth); // slots the pointer moves up
+    // full 16-byte ldp/stp pairs: a v128 may ride the carried slots, and the
+    // type-preserving carry never lets a scalar's stale upper half reach a
+    // wider reader (the ascending loop stays overlap-safe for 16-byte moves)
     for (int32_t i = 0; i < (int32_t)arity; i++) {
-        a64_ldr_imm64(&c->em, R16, SP, ((int64_t)arity - 1 - i) * 16);
-        a64_str_imm64(&c->em, R16, SP, ((int64_t)up + (int64_t)arity - 1 - i) * 16);
+        a64_ldp_off64(&c->em, R16, R17, SP, (int32_t)(arity - 1 - i) * 2);
+        a64_stp_off64(&c->em, R16, R17, SP,
+                      (int32_t)((int64_t)up + (int64_t)arity - 1 - i) * 2);
     }
     if (up > 0) a64_add_imm64(&c->em, SP, SP, up * SLOT);
     else if (up < 0) a64_sub_imm64(&c->em, SP, SP, (-up) * SLOT);
@@ -1702,13 +1731,27 @@ static bool compile_function(JC *c) {
     // (arg i is the (i+1)-th slot below entry: [fp + 32 + below + (A-1-i)*16])
     {
         int32_t below = (c->n_res > c->n_params) ? (int32_t)(c->n_res - c->n_params) * SLOT : 0;
+        const EaFuncType *ft = &c->m->types[c->f->type_idx].func;
+        bool vzero_emitted = false;
         for (uint32_t i = 0; i < c->n_params && i < c->n_locals; i++) {
-            a64_ldr_imm64(e, R16, FP, 32 + below + (int32_t)(c->n_params - 1 - i) * 16);
-            a64_str_imm64(e, R16, FP, local_off(c, i));
+            int32_t aoff = 32 + below + (int32_t)(c->n_params - 1 - i) * 16;
+            if (ft->params[i] == VT_V128) {
+                ldr_q_frame(c, V16, aoff); // v128 params move full 16-byte slots
+                str_q_frame(c, V16, local_off(c, i));
+            } else {
+                a64_ldr_imm64(e, R16, FP, aoff);
+                a64_str_imm64(e, R16, FP, local_off(c, i));
+            }
         }
         // wasm zeroes declared locals; the frame is raw stack memory
-        for (uint32_t i = c->n_params; i < c->n_locals; i++)
-            a64_str_imm64(e, 31, FP, local_off(c, i));
+        for (uint32_t i = c->n_params; i < c->n_locals; i++) {
+            if (c->f->locals[i] == VT_V128) {
+                if (!vzero_emitted) { a64_neon_movi0(e, V16); vzero_emitted = true; }
+                str_q_frame(c, V16, local_off(c, i));
+            } else {
+                a64_str_imm64(e, 31, FP, local_off(c, i));
+            }
+        }
     }
 
     // cold exception stubs (throw / throw_ref / resume / propagate) sit before
@@ -2193,6 +2236,12 @@ static bool compile_function(JC *c) {
             push_x(e, R17);
             break;
         case EA_OP_LOCAL_GET:
+            if (in->imm.u32 < c->n_locals && c->f->locals[in->imm.u32] == VT_V128) {
+                flush_deferred(c);
+                ldr_q_frame(c, V16, local_off(c, in->imm.u32));
+                push_q(c, V16);
+                break;
+            }
             if (c->def_count == 1 && c->def_first) {
                 load_local_val(c, R17, in->imm.u32);
                 c->def_kind1 = 1; c->def_count = 2; c->def_first = 0;
@@ -2208,10 +2257,22 @@ static bool compile_function(JC *c) {
             }
             break;
         case EA_OP_LOCAL_SET:
+            if (in->imm.u32 < c->n_locals && c->f->locals[in->imm.u32] == VT_V128) {
+                flush_deferred(c);
+                pop_q(c, V16);
+                str_q_frame(c, V16, local_off(c, in->imm.u32));
+                break;
+            }
             pop_x(e, R16);
             set_local_val(c, in->imm.u32, R16);
             break;
         case EA_OP_LOCAL_TEE:
+            if (in->imm.u32 < c->n_locals && c->f->locals[in->imm.u32] == VT_V128) {
+                flush_deferred(c);
+                peek_q(c, V16, 0);
+                str_q_frame(c, V16, local_off(c, in->imm.u32));
+                break;
+            }
             peek_x(e, R16, 0);
             set_local_val(c, in->imm.u32, R16);
             break;
@@ -2393,9 +2454,18 @@ static void emit_tail_call(JC *c, bool indirect, EaInstr *in) {
     {
         int32_t below = (c->n_res > c->n_params) ? (int32_t)(c->n_res - c->n_params) * SLOT : 0;
         int32_t dst0 = 32 + (int32_t)c->n_params * SLOT + below - (int32_t)a * SLOT;
+        // v128 params carry as full 16-byte slots (the tail call's sp lands
+        // below this frame, so the copies must finish before the pop)
+        const EaFuncType *ct = indirect ? &c->m->types[in->imm.pair.a].func
+                                        : &c->m->types[c->m->funcs[in->imm.u32].type_idx].func;
         for (uint32_t i = 0; i < a; i++) {
-            a64_ldr_imm64(e, R16, SP, (int64_t)i * 16);
-            a64_str_imm64(e, R16, FP, dst0 + (int64_t)i * 16);
+            if (ct->params[i] == VT_V128) {
+                em_word(e, 0x3DC00000u | ((uint32_t)i << 10) | (SP << 5) | V16); // ldr q,[sp,i*16]
+                str_q_frame(c, V16, dst0 + (int32_t)i * 16);
+            } else {
+                a64_ldr_imm64(e, R16, SP, (int64_t)i * 16);
+                a64_str_imm64(e, R16, FP, dst0 + (int64_t)i * 16);
+            }
         }
     }
     // pop this frame: x29/x30 restored, sp = fp + 32
@@ -3135,6 +3205,14 @@ void ea_jit_compile_module(EaModule *m) {
             bool has_v128 = false;
             for (uint32_t q = 0; q < f->n_locals && q < 4096; q++)
                 has_v128 |= f->locals[q] == VT_V128;
+            if (has_v128)
+                for (uint32_t q = 0; q < f->code.n; q++)
+                    if (f->code.v[q].opcode == EA_OP_SELECT ||
+                        f->code.v[q].opcode == EA_OP_SELECT_T) {
+                        // the 8-byte csel select cannot carry a v128 payload
+                        has_v128 = 2;
+                        break;
+                    }
             if (has_v128) { em_free(&c.em); free(c.eh_fx); free(c.eh_descs); continue; }
         }
         uint64_t fsz = 48 + (uint64_t)c.n_locals * 16 + ((uint64_t)f->max_stack + 8) * 16;

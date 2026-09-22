@@ -896,8 +896,13 @@ v128 从「函数级回退解释器」升级为**原生 NEON 执行**（第一�
 - **效果**：simd 文件族从回退解释器变为真执行机器码：simd_const 265/0、
   i32x4_arith 192/0、i64x2_arith 198/0、lane 357/0、bit_shift 235/0、
   splat 180/0；全量双模式 257/258 零回归，WASI 15/15。
-- 批 2 候选：FP 算术（NaN 规范化）、min/max、比较全宽度、移位、
-  load/store lane 变体、v128 局部/参数免 bail。
+- **批 2（已合入）**：v128 局部/参数免 bail——prologue 参数拷贝/零初始化
+  16 字节、local get/set/tee 走 Q 寄存器帧槽（str/ldur q 带大偏移回退）、
+  尾调用参数搬运按 callee 类型 16 字节、br 携带升级 16 字节 ldp/stp
+  （类型保持，标量陈旧高半区不外泄）；SELECT/SELECT_T 仍为 8 字节 csel，
+  含它们的 v128 函数保留 bail（显式扫描门控）。
+- 批 3 候选：FP 算术（NaN 规范化）、min/max、比较全宽度、移位、
+  load/store lane 变体、select 的 16 字节形式。
 
 ### 三、排查方法备忘
 
