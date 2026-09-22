@@ -60,10 +60,17 @@ static void ea_jit_call_interp(EaExec *ex, EaFuncInst *fi, WVal *args) {
 }
 
 uint64_t ea_h_popcnt64(uint64_t x) { return __builtin_popcountll(x); }
-void ea_h_wdump6(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
-    fprintf(stderr, "[R] %llu %llu %llu %llu %llu %llu\n",
+void ea_h_wdump6(uint64_t fp, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+    // fp points at the JIT frame; locals live at [fp-32-16*(nloc-k)] — we
+    // don't know nloc here, so dump the raw fp-relative window too
+    uint64_t *fpw = (uint64_t *)fp;
+    fprintf(stderr, "[R] regs %llu %llu %llu %llu %llu %llu\n",
             (unsigned long long)a, (unsigned long long)b, (unsigned long long)c,
             (unsigned long long)d, (unsigned long long)e, (unsigned long long)f);
+    fprintf(stderr, "[R] frame -1..-7: %llu %llu %llu %llu %llu %llu %llu\n",
+            (unsigned long long)fpw[-1], (unsigned long long)fpw[-2], (unsigned long long)fpw[-3],
+            (unsigned long long)fpw[-4], (unsigned long long)fpw[-5], (unsigned long long)fpw[-6],
+            (unsigned long long)fpw[-7]);
 }
 
 EaFuncInst *ea_jit_callee_lookup(EaExec *ex, EaInstance *inst, uint32_t table_idx,
@@ -1419,7 +1426,8 @@ static bool compile_function(JC *c) {
                     c->cache_dirty = 0;
                     if (getenv("EA_WDBG2")) {
                         for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++)
-                            a64_mov_reg64(e, R0 + i, ea_cache_reg[i]);
+                            a64_mov_reg64(e, R1 + i, ea_cache_reg[i]);
+                        a64_mov_reg64(e, R0, FP);
                         call_helper(c, (const void *)ea_h_wdump6);
                     }
                     EaInstr *lin = &code->v[c->wl_loop_pc];
@@ -1440,7 +1448,8 @@ static bool compile_function(JC *c) {
                 }
                 if (c->wl_pass == 2 && getenv("EA_WDBG2")) {
                     for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++)
-                        a64_mov_reg64(e, R0 + i, ea_cache_reg[i]);
+                        a64_mov_reg64(e, R1 + i, ea_cache_reg[i]);
+                    a64_mov_reg64(e, R0, FP);
                     call_helper(c, (const void *)ea_h_wdump6);
                 }
                 c->wl_pass = 0;
@@ -1490,7 +1499,7 @@ static bool compile_function(JC *c) {
             }
             // emitted before the branch so both paths establish the state the
             // compile-time cache map describes
-            if (getenv("EA_WDBG")) fprintf(stderr, "[X] brif pc=%u tpc=%u head=%u pass=%u\n", pc, tpc, c->wl_head_pc, c->wl_pass);
+            if (getenv("EA_WDBG")) fprintf(stderr, "[X] f%u brif pc=%u tpc=%u head=%u pass=%u csp=%u\n", c->fn_idx, pc, tpc, c->wl_head_pc, c->wl_pass, c->csp);
             if (c->wl_pass && tpc == c->wl_head_pc) warm_backedge(c);
             else flush_cache(c);
             uint32_t cc;
