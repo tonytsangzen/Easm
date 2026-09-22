@@ -14,10 +14,15 @@ baseline JIT** 为主执行引擎，不能降级的指令形态自动回退解�
 - **解释器**：值栈 + 控制帧，`setjmp/longjmp` trap 传播
 - **aarch64 baseline JIT**：1:1 指令级翻译（操作数栈即机器栈），浮点直通 S/D 寄存器、
   延迟操作数融合（单值/双值窗口）、真尾调用（`br` 尾跳，C 栈零增长）、br_table、
-  bulk-memory / table 指令；v128 等罕见形态自动回退解释器
+  bulk-memory / table 指令
+- **原生 SIMD（NEON）**：v128 常量/加载存储、整数 add/sub/mul、全宽度比较、
+  min/max、可变移位、splat/extract/replace lane、位运算与 bitselect 直接降级为
+  NEON 指令；v128 局部/参数按 16 字节槽原生承载，剩余形态自动回退解释器
 - **JIT exception handling**：`try_table`/`throw`/`throw_ref` 原生代码生成——
   handler 栈逐帧 marker 链式传播，catch 载荷按 `br` 语义精确落栈，
-  JIT↔解释器边界双向传播；prologue 原生栈深检查（深递归 trap 而非段错误）
+  JIT↔解释器边界双向传播；`throw` 命中单 clause try_table 时内联分发
+  （省去存根+helper 走栈）；prologue 原生栈深检查（深递归 trap 而非段错误，
+  leaf 函数免检）
 - **GC 运行时**：struct/array 分配、i31 打包引用、`ref.test`/`ref.cast`/
   `br_on_cast` 运行时子类型检查、extern/any 侧互转
 - **exceptions**：`throw`/`throw_ref`/`try_table`（catch / catch_ref / catch_all /
@@ -110,13 +115,13 @@ python3 tools/run_spec.py -j 8 --jit    # JIT 模式（每文件真正跑 JIT �
 python3 tools/run_bench.py all          # JIT / 解释器 / wasmtime / node 对比
 ```
 
-### 当前状态（2026-09-22，详见 [PROGRESS.md](PROGRESS.md)）
+### 当前状态（2026-09-23，详见 [PROGRESS.md](PROGRESS.md)）
 
 **覆盖率**（官方 spec 套件，258 个 wast 文件，双模式）：
 
 - 解释器模式：**257 个文件全过（99.6%）**，累计 61,120+ 条 assert
 - **JIT 模式：257/258 全过，与解释器逐文件一致**——每个文件的 JIT 编译函数
-  实际执行机器码（含 exceptions / multi-memory / SIMD 直通返回），
+  实际执行机器码（含 exceptions / multi-memory / 原生 NEON SIMD），
   61,124 条 assert 全部通过
 - 唯一双模式都未过：annotations.wast（wabt 与 wasm-tools 均不支持注解提案
   文本语法，转换失败，非运行时问题）
