@@ -876,6 +876,29 @@ CALL*/RETURN_CALL*/THROW*/TRY_TABLE），无需每次调用都做
 - 验证：exceptions 全家（throw 12/0、try_table 45/0、throw_ref 14/0）、
   全量双模式 257/258 零回归。
 
+## 迭代 24：v128 NEON lowering 第一批（2026-09-23，已合入）
+
+v128 从「函数级回退解释器」升级为**原生 NEON 执行**（第一批，整数/位运算）：
+
+- **指令面**：v128.const（GPR 半区 + INS）、v128.load/store（Q 寄存器 16 字节
+  移动，沿用 guard-page 陷阱路径）、not/and/andnot/or/xor/bitselect(BSL)、
+  i8x16/i16x8/i32x4/i64x2 add/sub、i8x16/i16x8/i32x4 mul、四宽度 eq/ne
+  （cmeq+mvn）、splat×6、extract_lane×8（符号形式补 sxtb/sxth）、
+  replace_lane×6。**FP 算术暂缓**（NaN 规范化须与解释器逐位对齐，批 2）。
+- **编码方法**：全部对照 llvm-mc 标定；发射器从标定样本字补丁寄存器域。
+- **三个编码陷阱（均已修并留档）**：
+  1. 样本字掩码误清 3-same 固定位 bit10 → ADD 静默变 SMLAL2（掩码应为
+     0xFFE0FC1F）；
+  2. INS/UMOV 的 imm5 = (lane << (log2(esize/8)+1)) | esize/8 —— lane<<se
+     在 se=8 时溢出 5 位字段，d[1] 被写成 d[0]；
+  3. extract/replace 的 opcode 族 interleaves replace 形式，`opcode-base`
+     索引越界 —— 宽度映射必须用显式 switch。
+- **效果**：simd 文件族从回退解释器变为真执行机器码：simd_const 265/0、
+  i32x4_arith 192/0、i64x2_arith 198/0、lane 357/0、bit_shift 235/0、
+  splat 180/0；全量双模式 257/258 零回归，WASI 15/15。
+- 批 2 候选：FP 算术（NaN 规范化）、min/max、比较全宽度、移位、
+  load/store lane 变体、v128 局部/参数免 bail。
+
 ### 三、排查方法备忘
 
 - 单函数 JIT 代码对比：EA_JIT_DUMP + llvm-mc（--disassemble 输入须为
