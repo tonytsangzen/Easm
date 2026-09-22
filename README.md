@@ -15,6 +15,9 @@ baseline JIT** 为主执行引擎，不能降级的指令形态自动回退解�
 - **aarch64 baseline JIT**：1:1 指令级翻译（操作数栈即机器栈），浮点直通 S/D 寄存器、
   延迟操作数融合（单值/双值窗口）、真尾调用（`br` 尾跳，C 栈零增长）、br_table、
   bulk-memory / table 指令；v128 等罕见形态自动回退解释器
+- **JIT exception handling**：`try_table`/`throw`/`throw_ref` 原生代码生成——
+  handler 栈逐帧 marker 链式传播，catch 载荷按 `br` 语义精确落栈，
+  JIT↔解释器边界双向传播；prologue 原生栈深检查（深递归 trap 而非段错误）
 - **GC 运行时**：struct/array 分配、i31 打包引用、`ref.test`/`ref.cast`/
   `br_on_cast` 运行时子类型检查、extern/any 侧互转
 - **exceptions**：`throw`/`throw_ref`/`try_table`（catch / catch_ref / catch_all /
@@ -103,19 +106,22 @@ EA_JIT_TRACE=1   跟踪 JIT 执行
 
 ```bash
 python3 tools/run_spec.py -j 8          # 解释器模式一致性覆盖率
-python3 tools/run_spec.py -j 8 --jit    # JIT 模式（逐文件结果与解释器一致）
+python3 tools/run_spec.py -j 8 --jit    # JIT 模式（每文件真正跑 JIT 机器码）
 python3 tools/run_bench.py all          # JIT / 解释器 / wasmtime / node 对比
 ```
 
 ### 当前状态（2026-09-22，详见 [PROGRESS.md](PROGRESS.md)）
 
-**覆盖率**（官方 spec 套件，258 个 wast 文件）：
+**覆盖率**（官方 spec 套件，258 个 wast 文件，双模式）：
 
-- **257 个文件全过（99.6%）**，累计 61,110 条 assert；JIT 模式与解释器模式逐文件一致
-- 唯一未过：annotations.wast（wabt 与 wasm-tools 均不支持注解提案文本语法，
-  转换失败，非运行时问题）
+- 解释器模式：**257 个文件全过（99.6%）**，累计 61,110+ 条 assert
+- **JIT 模式：248/258 全过**——`--jit` 现已真正接线（此前该开关未生效），
+  每个文件的 JIT 编译函数实际执行机器码；剩余 10 个文件的 JIT 边角
+  （simd select/const 各 3、block/if/loop/br/fac/bulk 各 1-2）在跟进
+- 唯一双模式都未过：annotations.wast（wabt 与 wasm-tools 均不支持注解提案
+  文本语法，转换失败，非运行时问题）
 - 已覆盖：Wasm 2.0 全部 + GC（struct/array/i31/ref.test/cast/br_on_cast/rec/sub）、
-  typed function references、exceptions（throw/throw_ref/try_table）、
+  typed function references、**exceptions（throw/throw_ref/try_table 含 JIT）**、
   multi-memory、table64、SIMD（非 relaxed）
 
 **性能**（同机与 wasmtime 48.0.2 / node 对比，含引擎启动）：
