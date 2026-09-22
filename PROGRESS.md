@@ -637,7 +637,11 @@ memsum 0.003）：这批内核为访存带宽受限，省下的 ALU 指令本就
    串位）；skip 模式下的 END 也必须终结 wl 上下文（循环体经内部 br
    退出时 END 走 skip join 分支，否则 wl_pass 卡死、后续碰巧命中陈旧
    head 的分支会发射错误寄存器搬移）。
-   **EA_WARM 残余缝隙**：EA_WDBG/EA_WDBG2 插桩显示四循环生命周期
+   **EA_WARM 残余缝隙（[R] 升级后精确化）**：余数循环头入口寄存器
+   [i2=1 ✓, l6=3 ✗(应0), l5=0 ✓, s=0 ✓, i1=6 ✗(应3), l4=2 ✗(应1)]、
+   帧 local6=3（应0）——预填充装载到的帧已被体执行污染，循环跑 2 遍
+   （count 初值 2）。缝隙锁定：余数 setup（pcs 88-99）与循环头之间
+   的帧写入。原**EA_WARM 残余缝隙**：EA_WDBG/EA_WDBG2 插桩显示四循环生命周期
    全部正常（pass1→record→pass2→finish），但 bench 内核（sum 余数
    路径、8× 展开 fib、primes）仍产出错值——spec 套件 257/258 未覆盖
    该模式。下轮：以 EA_WARM 差分 dump（warm vs 冷态）逐指令比对
