@@ -360,6 +360,14 @@ static inline void a64_strh_reg32(Em *e, uint32_t rt, uint32_t rn, uint32_t rm) 
 }
 // stp / ldp 64-bit
 // imm7 in BYTES (scaled by 8 internally); must be multiple of 8
+// stp with signed 7-bit scaled offset (unsigned-offset form, no writeback)
+static inline void a64_stp_off64(Em *e, uint32_t rt1, uint32_t rt2, uint32_t rn, int32_t imm7) {
+    em_word(e, 0xA9000000u | ((uint32_t)(imm7 & 0x7F) << 15) | (rn << 5) | (rt1) | (rt2 << 10));
+}
+// ldp with signed 7-bit scaled offset (imm7 in 8-byte units for 64-bit)
+static inline void a64_ldp_off64(Em *e, uint32_t rt1, uint32_t rt2, uint32_t rn, int32_t imm7) {
+    em_word(e, 0xA9400000u | ((uint32_t)(imm7 & 0x7F) << 15) | (rn << 5) | (rt1) | (rt2 << 10));
+}
 static inline void a64_stp_pre64(Em *e, uint32_t rt1, uint32_t rt2, uint32_t rn, int32_t imm7) {
     int32_t v = imm7 / 8;
     em_word(e, 0xA9800000 | ((uint32_t)(v & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt1);

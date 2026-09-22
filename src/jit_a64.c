@@ -10,6 +10,7 @@
 #include "opcodes.h"
 #include "a64_emit.h"
 #include <stdio.h>
+#include <setjmp.h>
 #include <sys/mman.h>
 #include <pthread.h>
 #include <libkern/OSCacheControl.h>
@@ -215,7 +216,12 @@ EaFuncInst *ea_jit_callee_lookup(EaExec *ex, EaInstance *inst, uint32_t table_id
     if (table_idx >= inst->n_tables || elem_idx >= inst->tables[table_idx].size)
         ea_trap(ex, TRAP_UNDEF_ELEM);
     EaFuncInst *fi = (EaFuncInst *)inst->tables[table_idx].elems[elem_idx].ref;
-    if (!fi) ea_trap(ex, TRAP_UNINIT_ELEM);
+    if (!fi) {
+        ex->trap = TRAP_UNINIT_ELEM;
+        snprintf(ex->trap_msg, sizeof(ex->trap_msg), "uninitialized element %u", elem_idx);
+        if (ex->jb) longjmp(*(jmp_buf *)ex->jb, 1);
+        ea_trap(ex, TRAP_UNINIT_ELEM);
+    }
     EaFuncType *want = &inst->module->types[type_idx].func;
     bool sig_ok;
     if (fi->inst && fi->inst->module == inst->module)
@@ -1218,14 +1224,25 @@ static void emit_return(JC *c) {
     // results on operand stack top: value i is the (i+1)-th slot below entry;
     // copy to [entry_sp-R*16, entry_sp) = [fp+32+below+(A-1-i)*16, ...); then
     // leave sp = entry_sp - R*16 (see call-site contract)
-    {
+        // full 16-byte slot copies: v128 results carry 4 lanes (scalars keep
+        // stale upper halves, which their consumers never read)
         int32_t below = (c->n_res > c->n_params) ? (int32_t)(c->n_res - c->n_params) * SLOT : 0;
         for (int32_t i = 0; i < (int32_t)c->n_res; i++) {
             int32_t off = 32 + below + (int32_t)(c->n_params - 1 - i) * 16;
-            a64_ldr_imm64(&c->em, R16, SP, ((int32_t)c->n_res - 1 - i) * 16);
-            a64_str_imm64(&c->em, R16, FP, off);
+            a64_ldp_off64(&c->em, R16, R17, SP, ((int32_t)c->n_res - 1 - i) * 2);
+            // stp imm7 spans only +/-512 bytes; long-argument-list functions
+            // need far slots — compute the address into R0 when out of range
+            if (off / 8 > 63) {
+                if (off <= 4095) a64_add_imm64(&c->em, R0, FP, (uint32_t)off);
+                else {
+                    a64_mov64_imm(&c->em, R0, (uint64_t)off);
+                    a64_add_reg64(&c->em, R0, FP, R0);
+                }
+                a64_stp_off64(&c->em, R16, R17, R0, 0);
+            } else {
+                a64_stp_off64(&c->em, R16, R17, FP, off / 8);
+            }
         }
-    }
     a64_mov_sp_from(&c->em, FP);
     a64_ldp_post64(&c->em, FP, LR, SP, 32);
     // ldp restored sp to fp+32 = entry_sp - A*16 - below; land at entry_sp - R*16
@@ -1329,6 +1346,7 @@ static void eh_emit_stubs(JC *c) {
     }
     if (c->has_throwref) {
         c->throwref_stub_at = e->len;
+        a64_sub_imm64(e, SP, SP, 512);   // helper-frame scratch (see the throw stub)
         a64_mov_reg64(e, R0, R27);
         a64_mov_reg64(e, R1, R28);
         a64_mov_reg64(e, R3, FP);        // x2 = exnref, popped at the site
@@ -1565,16 +1583,20 @@ static void br_label_target(JC *c, uint32_t l, uint32_t *theight, uint32_t *tari
 }
 
 static void emit_br_to(JC *c, uint32_t cur, uint32_t target_depth, uint32_t arity) {
-    // carry the top `arity` slots (absolute [cur-arity+1, cur]) to absolute
-    // [target_depth, target_depth+arity), then land sp at slot target_depth.
-    // [sp + k*16] is absolute slot (cur - k), so:
+    // carry the top `arity` slots so they become the top `arity` slots after
+    // sp lands at absolute slot `target_depth` ([sp + k*16] is absolute slot
+    // (cur - k), so slot s lives at [sp + (cur-s)*16]):
     //   src slot (cur-arity+1+i) -> [sp + (arity-1-i)*16]
-    //   dst slot (target_depth+i) -> [sp + (cur-target_depth-i)*16]
-    for (int32_t i = (int32_t)arity - 1; i >= 0; i--) {
-        a64_ldr_imm64(&c->em, R16, SP, ((int64_t)arity - 1 - i) * 16);
-        a64_str_imm64(&c->em, R16, SP, ((int64_t)cur - (int64_t)target_depth - i) * 16);
-    }
+    //   dst slot (target_depth-arity+1+i) -> [sp + (up+arity-1-i)*16]
+    // ascending i copies high-to-low, which is overlap-safe for the upward
+    // shift (up > 0); up == 0 degenerates to a self-copy.  8-byte moves: the
+    // carry never changes an operand's type, so a scalar slot's stale upper
+    // half is never read by a wider consumer — 16-byte moves would smear it.
     int32_t up = (int32_t)(cur - target_depth); // slots the pointer moves up
+    for (int32_t i = 0; i < (int32_t)arity; i++) {
+        a64_ldr_imm64(&c->em, R16, SP, ((int64_t)arity - 1 - i) * 16);
+        a64_str_imm64(&c->em, R16, SP, ((int64_t)up + (int64_t)arity - 1 - i) * 16);
+    }
     if (up > 0) a64_add_imm64(&c->em, SP, SP, up * SLOT);
     else if (up < 0) a64_sub_imm64(&c->em, SP, SP, (-up) * SLOT);
 }
@@ -2131,15 +2153,32 @@ static bool compile_function(JC *c) {
         case EA_OP_GLOBAL_GET:
             a64_ldr_imm64(e, R16, R28, __builtin_offsetof(EaInstance, jit_globals));
             a64_ldr_imm64(e, R16, R16, (int64_t)in->imm.u32 * 8);
-            a64_ldr_imm64(e, R16, R16, 0);
-            push_x(e, R16);
+            if (in->imm.u32 < c->m->n_globals_def &&
+                c->m->globals_def[in->imm.u32].type == VT_V128) {
+                // v128 globals occupy full 16-byte slots
+                a64_ldp_off64(e, R0, R1, R16, 0);
+                a64_stp_pre64(e, R0, R1, SP, -16);
+            } else {
+                a64_ldr_imm64(e, R16, R16, 0);
+                push_x(e, R16);
+            }
             break;
-        case EA_OP_GLOBAL_SET:
-            pop_x(e, R16);
-            a64_ldr_imm64(e, R17, R28, __builtin_offsetof(EaInstance, jit_globals));
-            a64_ldr_imm64(e, R17, R17, (int64_t)in->imm.u32 * 8);
-            a64_str_imm64(e, R16, R17, 0);
+        case EA_OP_GLOBAL_SET: {
+            bool g128 = in->imm.u32 < c->m->n_globals_def &&
+                        c->m->globals_def[in->imm.u32].type == VT_V128;
+            if (g128) {
+                a64_ldp_post64(e, R16, R17, SP, 16);
+                a64_ldr_imm64(e, R0, R28, __builtin_offsetof(EaInstance, jit_globals));
+                a64_ldr_imm64(e, R0, R0, (int64_t)in->imm.u32 * 8);
+                a64_stp_off64(e, R16, R17, R0, 0);
+            } else {
+                pop_x(e, R16);
+                a64_ldr_imm64(e, R17, R28, __builtin_offsetof(EaInstance, jit_globals));
+                a64_ldr_imm64(e, R17, R17, (int64_t)in->imm.u32 * 8);
+                a64_str_imm64(e, R16, R17, 0);
+            }
             break;
+        }
         case EA_OP_MEMORY_SIZE:
             emit_helper3(c, ea_h_memory_size, in->imm.u32, 0xFFFFFFFFu);
             break;
@@ -2884,6 +2923,15 @@ void ea_jit_compile_module(EaModule *m) {
             uint32_t op = f->code.v[q].opcode;
             if (op == EA_OP_THROW) c.has_throw = 1;
             else if (op == EA_OP_THROW_REF) c.has_throwref = 1;
+        }
+        // v128 params/locals: the 1:1 model moves 8-byte scalars through the
+        // frame (param copy, local get/set) — leave such functions to the
+        // interpreter, which handles full 16-byte slots
+        {
+            bool has_v128 = false;
+            for (uint32_t q = 0; q < f->n_locals && q < 4096; q++)
+                has_v128 |= f->locals[q] == VT_V128;
+            if (has_v128) { em_free(&c.em); free(c.eh_fx); free(c.eh_descs); continue; }
         }
         uint64_t fsz = 48 + (uint64_t)c.n_locals * 16 + ((uint64_t)f->max_stack + 8) * 16;
         if (fsz >= (1 << 20)) {

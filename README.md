@@ -114,10 +114,10 @@ python3 tools/run_bench.py all          # JIT / 解释器 / wasmtime / node 对�
 
 **覆盖率**（官方 spec 套件，258 个 wast 文件，双模式）：
 
-- 解释器模式：**257 个文件全过（99.6%）**，累计 61,110+ 条 assert
-- **JIT 模式：248/258 全过**——`--jit` 现已真正接线（此前该开关未生效），
-  每个文件的 JIT 编译函数实际执行机器码；剩余 10 个文件的 JIT 边角
-  （simd select/const 各 3、block/if/loop/br/fac/bulk 各 1-2）在跟进
+- 解释器模式：**257 个文件全过（99.6%）**，累计 61,120+ 条 assert
+- **JIT 模式：257/258 全过，与解释器逐文件一致**——每个文件的 JIT 编译函数
+  实际执行机器码（含 exceptions / multi-memory / SIMD 直通返回），
+  61,124 条 assert 全部通过
 - 唯一双模式都未过：annotations.wast（wabt 与 wasm-tools 均不支持注解提案
   文本语法，转换失败，非运行时问题）
 - 已覆盖：Wasm 2.0 全部 + GC（struct/array/i31/ref.test/cast/br_on_cast/rec/sub）、

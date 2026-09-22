@@ -11,25 +11,21 @@
 | 运行时（实例化 / 常量表达式 / import 链接 / 12GiB 保留内存） | ✅ |
 | 解释器（值栈 + RCtl 控制帧 + longjmp trap） | ✅ |
 | aarch64 baseline JIT（1:1 降级翻译，不可降级指令自动回退解释器） | ✅ |
-| 一致性覆盖率（官方 spec 测试套） | ✅ 170/258 文件全过（解释器与 JIT 模式完全一致） |
+| 一致性覆盖率（官方 spec 测试套） | ✅ 257/258 文件全过（解释器与 JIT 模式逐文件一致） |
 | Benchmark 对比（wasmtime / node） | ✅ JIT 较解释器 17–31×，fib/primes 快于 node |
 
 可执行文件 `build/easm` 仅 **188 KB**（目标 <200KB ✅）。
 
-## 二、一致性覆盖率（官方 spec 套件）
+## 二、一致性覆盖率（官方 spec 测试套）
 
 运行方式：`python3 tools/run_spec.py -j 8 [--jit]`（内部 wast2json + 并行 + 缓存）
 
-- **258** 个 wast 文件中 **243 个完全通过（94.2%）**，累计通过 **61,000+** 条 assert
-  （迭代 7 结束时 182 → 迭代 9 结束时 225 → 迭代 10 结束时 237 → 迭代 11 结束时 243）。
+- **258** 个 wast 文件中 **257 个完全通过（99.6%）**，解释器模式 61,120+ 条、
+  JIT 模式 61,124 条 assert 全部通过
+  （迭代 7 结束时 182 → 迭代 9 结束时 225 → 迭代 11 结束时 243 → 迭代 12 结束时 257）。
 - `--jit` 与解释器模式**逐文件结果完全一致**：JIT 编译成功的函数真正执行机器码，
-  不能降级的函数（v128 / br_table 等）自动回退解释器，正确性对齐。
-- 转换失败仅剩 1 个文件（wast_convert.py 自定义转换器兜底 GC/rec 新语法后）。
-- 剩余 15 个失败文件的主因：
-  - exception-handling 执行语义（throw/throw_ref/try_table/instance 4 个文件）
-  - GC rec 组跨组 canonical 等价边界（type-subtyping 6、type-equivalence 6、
-    type-rec 2）
-  - 少量校验严格性边角（linking 3、table_init64 25、br_table/names/binary 等各 1）
+  不能降级的函数（v128 局部/参数等）自动回退解释器，正确性对齐。
+- 转换失败仅剩 1 个文件（annotations.wast，wabt/wasm-tools 均不支持注解文本语法）。
 
 ## 三、Benchmark（best-of-2，单位秒，越低越好）
 
@@ -763,7 +759,7 @@ JIT EH 代码生成：
 | 模式 | 全过文件 | 说明 |
 |---|---|---|
 | 解释器 | **257/258**（99.6%，与之前一致，零回归） | 唯一未过 annotations.wast（转换器限制） |
-| JIT | **248/258** | 剩余 10 个文件的 JIT 边角跟进中（simd select/const 各 3、block/if/loop/br/fac/bulk 各 1-2） |
+| JIT | **257/258**（61,124 条 assert 全过） | 与解释器逐文件一致（详见下方迭代 21） |
 
 新增 `assert_exception` 命令支持（此前未捕获异常断言被静默跳过）。
 
@@ -775,6 +771,51 @@ bench（JIT）：fib/primes/sum/memsum 在噪声级 ±5% 内；matmul 0.157→0.
 
 ### 五、下一步
 
-1. JIT 剩余 10 个文件（simd select/const 的 v128 边角、block/if/loop 各 1-2）
-2. matmul 布局回归调查（leaf 函数免栈检查）
-3. EH 快路径：clause 匹配内联（常见单 tag 场景省 helper 调用）
+1. matmul 布局回归调查（leaf 函数免栈检查）
+2. EH 快路径：clause 匹配内联（常见单 tag 场景省 helper 调用）
+
+## 阶段报告（2026-09-22）：迭代 21 — JIT 模式 257/258 追平解释器
+
+### 一、修复的四个 JIT 缺陷（剩余 9 个测试文件全部清零）
+
+1. **多值 br 携带 dst 公式差 (arity-1) 个槽位**：目标公式写成 `(cur-target_depth-i)*16`，
+   正确应为落点后**顶部 arity 槽** `(up+arity-1-i)*16`（up = cur-target_depth）。
+   up>0 时旧公式把值放低 arity-1 槽；up==0 且 arity≥2 时甚至向 sp 上方
+   （slot cur+1…）写入。且递减循环在向上搬移时会读到本迭代刚写的槽
+   （前向重叠拷贝）→ 改为**升序循环**（高地址先拷，对上移重叠安全；
+   up==0 退化为自拷贝 no-op）。受害：block/if/loop/br/fac/stack/local_tee/
+   load/load64/load2/memory_grow 的全部多值用例。
+2. **16 字节 ldp/stp 携带涂抹陈旧高半区**：标量槽只有低 8 字节被写（i32 推送仅
+   str w），16 字节搬运把 +8..+16 的栈垃圾带进目标槽，i64 结果读到
+   0x0000000300000012 这类值。br 携带不改变操作数类型 → 改回 **8 字节搬运**
+   即类型安全（v128 由函数级 bail 覆盖，不经过 br 携带）。
+3. **16 字节 select 的结果槽错位**：pop_w 后把结果写到 [SP+0]（b 槽），
+   而 `add sp,#16` 后最终栈顶落在 a 槽 → cond=0 时读到旧 a 值
+   （select-i32(1,2,0) 得 1）。回退为基线 csel 形式（pop_w/pop_x×2/
+   csel/push_x，select.wast 154/154、float_exprs 48 个 select 用例全过）。
+4. **emit_return 的 stp imm7 静默截断**：`a64_stp_off64` 偏移仅 ±512 字节，
+   100 参数函数的结果槽 off=1600 被截断写到 [FP+576] →
+   return-from-long-argument-list 返回垃圾。off>504 时改经 R0 计算地址
+   （≤4095 用 add imm12，否则 mov64+add reg）再 stp [R0]。
+5. **v128 global.get/set 截断为 8 字节**（simd_const 4 个 as-global.set 用例）：
+   按全局类型分支——VT_V128 用 ldp/stp 全槽拷贝，标量走原 8 字节路径
+   （注意 ldp_post 的目的寄存器不能与 globals 指针暂存共用）。
+
+附带：v128 参数/局部函数跳过 JIT（1:1 模型按 8 字节槽搬参数/局部，无法承载
+16 字节）——此前 simd_select 的失败根因之一。
+
+### 二、覆盖率（双模式）
+
+| 模式 | 全过文件 | assert |
+|---|---|---|
+| 解释器 | **257/258**（零回归） | 61,120+ |
+| JIT | **257/258**（追平解释器） | 61,124 全过 |
+
+WASI 矩阵 15/15；bench 五内核（fib/primes/sum/matmul/memsum）噪声级内无回归。
+annotations.wast 仍为唯一未过（文本语法转换限制，非运行时问题）。
+
+### 三、下一步
+
+1. matmul 布局回归（leaf 函数免栈检查）
+2. EH 快路径：clause 匹配内联
+3. v128 全量 JIT lowering（16 字节槽语义的 push/pop/move 全链路）
