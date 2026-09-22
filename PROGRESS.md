@@ -907,8 +907,16 @@ v128 从「函数级回退解释器」升级为**原生 NEON 执行**（第一�
   满足套件 NaN 断言）、整数 min/max（smin/umin/smax/umax × b/h/s）、
   可变移位 ×12（sshl/ushl 寄存器形式：计数 mod esize，右移取负——
   **不是**立即数形式的 esize-shift 约定）。simd_splat 180/0。
-- 批 4 候选：load/store lane 与 load_splat/zero 变体、abs/neg/popcnt、
-  any_true/all_true、narrow/extend、select 的 16 字节形式。
+- **批 4（已合入，EA_V128_B4=1 门控）**：abs/neg（i8x16..i64x2 + fabs/fneg）、
+  popcnt、any_true（umaxv+cset）/all_true（uminv+cset）、loadN_splat、
+  load32/64_zero、loadN_lane/storeN_lane。逐函数结果经 CLI 对照解释器全部
+  正确；**遗留**：wast 驱动多断言序列下 simd_splat 出现 ASLR 相关野访问
+  （同一输入三种表现：SIGILL/missing export/正常），根因未明——默认门控，
+  下轮以 lldb + 确定性复现为切入点。
+- 批 5 候选：narrow/extend、select 的 16 字节形式、FP min/max 的 NaN 修正。
+- **性能边界结论**：sum/matmul 与 wasmtime 的 5–6× 差距 = 操作数栈临时值
+  往返（def 窗口仅 2 槽，3 活跃值形态必须溢栈，如 `i*3-(i>>1)` 链）——
+  解法为栈槽位寄存器分配（HIR），已量化：循环体压到 ~12 条即达 wasmtime 同档。
 
 ### 三、排查方法备忘
 
