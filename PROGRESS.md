@@ -907,12 +907,17 @@ v128 从「函数级回退解释器」升级为**原生 NEON 执行**（第一�
   满足套件 NaN 断言）、整数 min/max（smin/umin/smax/umax × b/h/s）、
   可变移位 ×12（sshl/ushl 寄存器形式：计数 mod esize，右移取负——
   **不是**立即数形式的 esize-shift 约定）。simd_splat 180/0。
-- **批 4（已合入，EA_V128_B4=1 门控）**：abs/neg（i8x16..i64x2 + fabs/fneg）、
+- **批 4（已合入，默认原生）**：abs/neg（i8x16..i64x2 + fabs/fneg）、
   popcnt、any_true（umaxv+cset）/all_true（uminv+cset）、loadN_splat、
-  load32/64_zero、loadN_lane/storeN_lane。逐函数结果经 CLI 对照解释器全部
-  正确；**遗留**：wast 驱动多断言序列下 simd_splat 出现 ASLR 相关野访问
-  （同一输入三种表现：SIGILL/missing export/正常），根因未明——默认门控，
-  下轮以 lldb + 确定性复现为切入点。
+  load32/64_zero、loadN_lane/storeN_lane。simd_splat 180/0、boolean 271/0、
+  load_splat 120/0、load_zero 31/0。
+- **simd_splat 野访问根因（已修）**：umaxv/uminv 归约指令在 Rm 字段位置
+  携带**固定模式 10001**——样本字发射器把该字段当寄存器清零（rm=0），
+  发出未定义指令：SIGILL，或经 ASLR 偏移砸中模块导出表（"missing export"
+  的假象）。同轮连带修复：sshl/ushl 寄存器形式负计数（-shift，而非
+  立即数形式的 esize-shift）、计数广播的 lane 宽度、i8x16 abs/neg 样本字
+  （误用 .4s 形式）。方法论：确定性复现后 lldb 直接读故障字
+  （EXC_BAD_INSTRUCTION 的 subcode = 出错的指令编码本身）。
 - 批 5 候选：narrow/extend、select 的 16 字节形式、FP min/max 的 NaN 修正。
 - **性能边界结论**：sum/matmul 与 wasmtime 的 5–6× 差距 = 操作数栈临时值
   往返（def 窗口仅 2 槽，3 活跃值形态必须溢栈，如 `i*3-(i>>1)` 链）——
