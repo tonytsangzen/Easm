@@ -670,3 +670,33 @@ static inline void a64_sxth64(Em *e, uint32_t rd, uint32_t rn) { em_word(e, 0x93
 static inline void a64_sxtw64(Em *e, uint32_t rd, uint32_t rn) { em_word(e, 0x93407C00 | (rn << 5) | rd); }
 
 #endif
+
+// ---- Advanced SIMD (NEON) helpers — words calibrated against llvm-mc ----
+// 128-bit slot push/pop (V regs share the GPR load/store encoding space)
+static inline void a64_str_q_pre(Em *e, uint32_t rt)  { em_word(e, 0x3C9F0FE0u | rt); }
+static inline void a64_ldr_q_post(Em *e, uint32_t rt) { em_word(e, 0x3CC107E0u | rt); }
+// q <-> memory, register offset: ldr/str q, [Xn, Xm]
+static inline void a64_ldr_q_reg(Em *e, uint32_t rt, uint32_t rn, uint32_t rm) { em_word(e, 0x3CE06800u | (rm << 16) | (rn << 5) | rt); }
+static inline void a64_str_q_reg(Em *e, uint32_t rt, uint32_t rn, uint32_t rm) { em_word(e, 0x3CA06800u | (rm << 16) | (rn << 5) | rt); }
+// three-same / bitwise op from an llvm-mc-calibrated sample word
+// (register fields rm[20:16] / rn[9:5] / rd[4:0] patched in)
+static inline void a64_neon(Em *e, uint32_t sample, uint32_t rd, uint32_t rn, uint32_t rm) {
+    em_word(e, (sample & 0xFFE0FC1Fu) | (rm << 16) | (rn << 5) | rd);
+}
+// dup (splat) from a GPR: se = lane byte width 1/2/4/8
+static inline void a64_neon_dup(Em *e, uint32_t se, uint32_t rd, uint32_t rn) {
+    em_word(e, (1u << 30) | 0x0E000000u | 0xC00u | (se << 16) | (rn << 5) | rd);
+}
+// ins Vd.lane <-> GPR (se = lane byte width 1/2/4/8; the imm5 field is
+// (lane << (log2(se)+1)) | se, calibrated against llvm-mc per lane width)
+static inline uint32_t a64_neon_imm5(uint32_t se, uint32_t lane) {
+    static const uint32_t sh[9] = {0, 1, 2, 0, 3, 0, 0, 0, 4}; // 1/2/4/8 indexed
+    return ((lane << sh[se]) | se) & 0x1F;
+}
+static inline void a64_neon_ins(Em *e, uint32_t se, uint32_t lane, uint32_t vd, uint32_t rn) {
+    em_word(e, 0x4E001C00u | (a64_neon_imm5(se, lane) << 16) | (rn << 5) | vd);
+}
+static inline void a64_neon_umov(Em *e, uint32_t se, uint32_t lane, uint32_t rd, uint32_t vn) {
+    em_word(e, ((se == 8 ? 1u : 0u) << 30) | 0x0E003C00u | (a64_neon_imm5(se, lane) << 16) | (vn << 5) | rd);
+}
+static inline void a64_neon_movi0(Em *e, uint32_t rd) { em_word(e, 0x4F00E400u | rd); }

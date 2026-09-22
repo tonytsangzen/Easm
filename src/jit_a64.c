@@ -556,6 +556,9 @@ int ea_jit_call(EaExec *ex, EaFuncInst *fi) {
 // float values move directly through S/D registers (no gpr<->fpr round-trip)
 #define V0 0
 #define V1 1
+#define V16 16
+#define V17 17
+#define V18 18
 
 typedef struct {
     Em em;
@@ -709,6 +712,8 @@ static void push_x(JC *c, uint32_t rt) { a64_str_pre64(&c->em, rt, SP, -16); }
 static void pop_x(JC *c, uint32_t rt) { a64_ldr_post64(&c->em, rt, SP, 16); }
 static void push_w(JC *c, uint32_t rt) { a64_str_pre32(&c->em, rt, SP, -16); }
 static void pop_w(JC *c, uint32_t rt) { a64_ldr_post32(&c->em, rt, SP, 16); }
+static void push_q(JC *c, uint32_t rt) { a64_str_q_pre(&c->em, rt); }
+static void pop_q(JC *c, uint32_t rt) { a64_ldr_q_post(&c->em, rt); }
 // deferred-operand fusion: i32/i64 const or local.get parks its value in x17
 // and the very next instruction consumes it from the register instead of the
 // stack slot.  Safe because we only defer when no branch can target the
@@ -792,6 +797,7 @@ static void pop_pair_x(JC *c) {
     if (c->def_count == 1) { c->def_count = 0; c->vpops = 1; pop_x(c, R16); return; }
     pop_x(c, R17); pop_x(c, R16);
 }
+static bool v128_batch1(JC *c, EaInstr *in);
 static int32_t local_off(JC *c, uint32_t k);
 static void push_s(JC *c, uint32_t vt);
 static void push_d(JC *c, uint32_t vt);
@@ -1081,6 +1087,7 @@ static void emit_load(JC *c, EaInstr *in) {
     case EA_OP_I64_LOAD16_S: case EA_OP_I64_LOAD16_U: nat = 2; break;
     case EA_OP_I32_LOAD: case EA_OP_F32_LOAD:
     case EA_OP_I64_LOAD32_S: case EA_OP_I64_LOAD32_U: nat = 4; break;
+    case EA_OP_V128_LOAD: nat = 16; break;
     default: nat = 8; break;
     }
     // 32-bit memories: out-of-bounds accesses fault inside the 12 GiB
@@ -1110,6 +1117,10 @@ static void emit_load(JC *c, EaInstr *in) {
     case EA_OP_I64_LOAD16_U: a64_ldrh_reg32(&c->em, R16, mem_base, R16); break;
     case EA_OP_I64_LOAD32_S: em_word(&c->em, 0xB8A06800 | (R16 << 16) | (mem_base << 5) | R16); break;
     case EA_OP_I64_LOAD32_U: a64_ldr_reg32(&c->em, R16, mem_base, R16); break;
+    case EA_OP_V128_LOAD:
+        a64_ldr_q_reg(&c->em, V16, mem_base, R16);
+        a64_str_q_pre(&c->em, V16);
+        return;
     default: a64_ldr_reg64(&c->em, R16, mem_base, R16); break;
     }
     // i64-result loads must push the full 8-byte slot (push_w would leave the
@@ -1160,7 +1171,8 @@ static void emit_store(JC *c, EaInstr *in) {
         a64_str_reg_fpr(&c->em, vsrc, mem_base, R16, b);
         return;
     }
-    pop_x(&c->em, R17); // value
+    if (in->opcode == EA_OP_V128_STORE) pop_q(c, V16); // 16-byte value
+    else pop_x(&c->em, R17); // value
     if (c->m->memories[in->imm.ma.memidx].is64) pop_x(&c->em, R16); // address
     else pop_w(&c->em, R16); // i32 address: 32-bit slots only have 4 clean bytes
     uint64_t off = in->imm.ma.offset;
@@ -1174,6 +1186,7 @@ static void emit_store(JC *c, EaInstr *in) {
     case EA_OP_I32_STORE8: case EA_OP_I64_STORE8: nat = 1; break;
     case EA_OP_I32_STORE16: case EA_OP_I64_STORE16: nat = 2; break;
     case EA_OP_I32_STORE: case EA_OP_F32_STORE: case EA_OP_I64_STORE32: nat = 4; break;
+    case EA_OP_V128_STORE: nat = 16; break;
     default: nat = 8; break;
     }
     // multi-memory: load this memory's base/limit on demand (x14/x15)
@@ -1197,6 +1210,9 @@ static void emit_store(JC *c, EaInstr *in) {
         a64_mov_reg64(&c->em, R17, R0);
     }
     switch (in->opcode) {
+    case EA_OP_V128_STORE:
+        a64_str_q_reg(&c->em, V16, mem_base, R16);
+        return;
     case EA_OP_I32_STORE: case EA_OP_F32_STORE: case EA_OP_I64_STORE32:
         a64_str_reg32(&c->em, R17, mem_base, R16);
         break;
@@ -2307,6 +2323,7 @@ static bool compile_function(JC *c) {
                 emit_store(c, in);
                 break;
             }
+            if (v128_batch1(c, in)) break;
             if (!compile_scalar_op(c, in)) {
                 char tmp[48];
                 snprintf(tmp, sizeof(tmp), "op 0x%x not lowered in v1", op);
@@ -2436,6 +2453,135 @@ static uint32_t trunc_sat_src(JC *c, int b) {
     pop_x(&c->em, R16);
     fmov_to_fpr(c, 0, R16, b);
     return V0;
+}
+
+// v128 batch 1 (integer/bitwise): returns false when the opcode is not
+// lowered (caller bails to the interpreter).  FP ops defer until their NaN
+// canonicalization matches the interpreter byte-for-byte.
+static bool v128_batch1(JC *c, EaInstr *in) {
+    Em *e = &c->em;
+    switch (in->opcode) {
+    case EA_OP_V128_CONST: {
+        uint64_t lo = 0, hi = 0;
+        for (int i = 0; i < 8; i++) lo |= (uint64_t)in->imm.bytes[i] << (8 * i);
+        for (int i = 0; i < 8; i++) hi |= (uint64_t)in->imm.bytes[8 + i] << (8 * i);
+        if (lo == 0 && hi == 0) {
+            a64_neon_movi0(e, V16);
+        } else {
+            a64_mov64_imm(e, R16, lo);
+            a64_mov64_imm(e, R17, hi);
+            a64_neon_ins(e, 8, 0, V16, R16);
+            a64_neon_ins(e, 8, 1, V16, R17);
+        }
+        push_q(c, V16);
+        return true;
+    }
+    case EA_OP_V128_NOT:
+        pop_q(c, V16);
+        a64_neon(e, 0x6E205A10u, V16, V16, 0); // mvn
+        push_q(c, V16);
+        return true;
+    case EA_OP_V128_BITSELECT:
+        pop_q(c, V18); pop_q(c, V17); pop_q(c, V16); // c, x, y
+        a64_neon(e, 0x6E721E30u, V16, V17, V18);     // bsl: (c&x)|(~c&y)
+        push_q(c, V16);
+        return true;
+    case EA_OP_I8X16_SPLAT: case EA_OP_I16X8_SPLAT: case EA_OP_I32X4_SPLAT:
+    case EA_OP_F32X4_SPLAT: case EA_OP_I64X2_SPLAT: case EA_OP_F64X2_SPLAT: {
+        static const uint32_t se[6] = {1, 2, 4, 8, 4, 8}; // I8,I16,I32,I64,F32,F64
+        uint32_t k = in->opcode - EA_OP_I8X16_SPLAT;
+        if (se[k] == 8) pop_x(e, R16); else pop_w(e, R16);
+        a64_neon_dup(e, se[k], V16, R16);
+        push_q(c, V16);
+        return true;
+    }
+    case EA_OP_I8X16_EXTRACT_LANE_S: case EA_OP_I8X16_EXTRACT_LANE_U:
+    case EA_OP_I16X8_EXTRACT_LANE_S: case EA_OP_I16X8_EXTRACT_LANE_U:
+    case EA_OP_I32X4_EXTRACT_LANE: case EA_OP_I64X2_EXTRACT_LANE:
+    case EA_OP_F32X4_EXTRACT_LANE: case EA_OP_F64X2_EXTRACT_LANE: {
+        // lane byte width (the opcode family interleaves replace-lane forms,
+        // so a base-subtraction index would be non-contiguous)
+        uint32_t se;
+        switch (in->opcode) {
+        case EA_OP_I8X16_EXTRACT_LANE_S: case EA_OP_I8X16_EXTRACT_LANE_U: se = 1; break;
+        case EA_OP_I16X8_EXTRACT_LANE_S: case EA_OP_I16X8_EXTRACT_LANE_U: se = 2; break;
+        case EA_OP_I32X4_EXTRACT_LANE: case EA_OP_F32X4_EXTRACT_LANE: se = 4; break;
+        default: se = 8; break; // I64X2 / F64X2
+        }
+        pop_q(c, V16);
+        a64_neon_umov(e, se, in->lane, R16, V16);
+        if (in->opcode == EA_OP_I8X16_EXTRACT_LANE_S)
+            em_word(e, 0x13001E10u); // sxtb w16, w16
+        else if (in->opcode == EA_OP_I16X8_EXTRACT_LANE_S)
+            em_word(e, 0x13003E10u); // sxth w16, w16
+        if (se == 8) push_x(e, R16); else push_w(e, R16);
+        return true;
+    }
+    case EA_OP_I8X16_REPLACE_LANE: case EA_OP_I16X8_REPLACE_LANE:
+    case EA_OP_I32X4_REPLACE_LANE: case EA_OP_I64X2_REPLACE_LANE:
+    case EA_OP_F32X4_REPLACE_LANE: case EA_OP_F64X2_REPLACE_LANE: {
+        uint32_t se;
+        switch (in->opcode) {
+        case EA_OP_I8X16_REPLACE_LANE: se = 1; break;
+        case EA_OP_I16X8_REPLACE_LANE: se = 2; break;
+        case EA_OP_I32X4_REPLACE_LANE: case EA_OP_F32X4_REPLACE_LANE: se = 4; break;
+        default: se = 8; break; // I64X2 / F64X2
+        }
+        if (se == 8) pop_x(e, R16); else pop_w(e, R16); // scalar (top)
+        pop_q(c, V16);
+        a64_neon_ins(e, se, in->lane, V16, R16);
+        push_q(c, V16);
+        return true;
+    }
+    case EA_OP_V128_AND: case EA_OP_V128_OR: case EA_OP_V128_XOR:
+    case EA_OP_V128_ANDNOT:
+    case EA_OP_I8X16_ADD: case EA_OP_I8X16_SUB:
+    case EA_OP_I16X8_ADD: case EA_OP_I16X8_SUB: case EA_OP_I16X8_MUL:
+    case EA_OP_I32X4_ADD: case EA_OP_I32X4_SUB: case EA_OP_I32X4_MUL:
+    case EA_OP_I64X2_ADD: case EA_OP_I64X2_SUB:
+    case EA_OP_I8X16_EQ: case EA_OP_I16X8_EQ: case EA_OP_I32X4_EQ:
+    case EA_OP_I64X2_EQ: case EA_OP_I8X16_NE: case EA_OP_I16X8_NE:
+    case EA_OP_I32X4_NE: case EA_OP_I64X2_NE: {
+        // pop b then a, op a = a OP b, push
+        static const uint32_t add_w[4]  = {0x4E318610u, 0x4E718610u, 0x4EB18610u, 0x4EF18610u};
+        static const uint32_t sub_w[4]  = {0x6E318610u, 0x6E718610u, 0x6EB18610u, 0x6EF18610u};
+        static const uint32_t mul_w[2]  = {0x4E719E10u, 0x4EB19E10u}; // h, s
+        static const uint32_t eq_w[4]   = {0x4E318E10u, 0x4E718E10u, 0x6EB18E10u, 0x6EF18E10u};
+        uint32_t sample = 0;
+        switch (in->opcode) {
+        case EA_OP_V128_AND:    sample = 0x4E311E10u; break;
+        case EA_OP_V128_OR:     sample = 0x4EB11E10u; break;
+        case EA_OP_V128_XOR:    sample = 0x6E311E10u; break;
+        case EA_OP_V128_ANDNOT: sample = 0x4E711E10u; break; // bic: a & ~b
+        case EA_OP_I8X16_ADD: sample = add_w[0]; break;
+        case EA_OP_I16X8_ADD: sample = add_w[1]; break;
+        case EA_OP_I32X4_ADD: sample = add_w[2]; break;
+        case EA_OP_I64X2_ADD: sample = add_w[3]; break;
+        case EA_OP_I8X16_SUB: sample = sub_w[0]; break;
+        case EA_OP_I16X8_SUB: sample = sub_w[1]; break;
+        case EA_OP_I32X4_SUB: sample = sub_w[2]; break;
+        case EA_OP_I64X2_SUB: sample = sub_w[3]; break;
+        case EA_OP_I16X8_MUL: sample = mul_w[0]; break;
+        case EA_OP_I32X4_MUL: sample = mul_w[1]; break;
+        case EA_OP_I8X16_EQ: sample = eq_w[0]; break;
+        case EA_OP_I16X8_EQ: sample = eq_w[1]; break;
+        case EA_OP_I32X4_EQ: sample = eq_w[2]; break;
+        case EA_OP_I64X2_EQ: sample = eq_w[3]; break;
+        case EA_OP_I8X16_NE: sample = eq_w[0]; break;
+        case EA_OP_I16X8_NE: sample = eq_w[1]; break;
+        case EA_OP_I32X4_NE: sample = eq_w[2]; break;
+        case EA_OP_I64X2_NE: sample = eq_w[3]; break;
+        }
+        pop_q(c, V17); pop_q(c, V16);
+        a64_neon(e, sample, V16, V16, V17);
+        if (in->opcode == EA_OP_I8X16_NE || in->opcode == EA_OP_I16X8_NE ||
+            in->opcode == EA_OP_I32X4_NE || in->opcode == EA_OP_I64X2_NE)
+            a64_neon(e, 0x6E205A10u, V16, V16, 0); // mvn
+        push_q(c, V16);
+        return true;
+    }
+    }
+    return false;
 }
 
 static bool compile_scalar_op(JC *c, EaInstr *in) {
