@@ -704,3 +704,77 @@ python3 tools/run_bench.py all               # JIT/解释器/wasmtime/node 对�
 EA_JIT=1 build/easm run bench/bench.wasm primes 500000   # 单内核运行
 EA_JIT_DUMP=1 EA_JIT=1 build/easm run x.wasm f   # dump JIT 机器码（llvm-mc 反汇编可读）
 ```
+
+---
+
+## 阶段报告（2026-09-22）：JIT exception handling + 真实 JIT 模式覆盖
+
+### 一、JIT exception handling（本阶段主目标）
+
+此前含 `try_table`/`throw`/`throw_ref` 的模块在 JIT 侧整模块放弃
+（`ea_jit_compile_module` 直接 return），全靠解释器。本阶段实现了完整的
+JIT EH 代码生成：
+
+- **handler 栈**（per-EaExec）：`try_table` 安装 `{sp0, fp, inst, desc}`，
+  desc（含各 clause 的 tag/kind/delta_up）驻留在代码区 arena，push 时内联
+  最终地址；`try_table` 正常退出 / `br` 跨越 / `return` / 尾调用精确 pop。
+- **throw/throw_ref**：helper 只匹配**当前帧**（fp 相同）的 handler，
+  匹配则按 `br` 语义落载荷（`sp_f[ncarry-1-q] = vals[q]`，exnref 置顶）并
+  跳转 clause 目标；不匹配则置 `pending_exn` 返回 marker（x0==1），
+  调用方 call site（`cmp x0,#1; b.eq resume`）逐帧续搜——
+  **JIT↔解释器边界双向传播**（解释器帧沿用 ctl 栈 unwind）。
+- **catch 语义对齐**：clause label 相对 try_table **外层**解析；JIT ctrl 栈
+  无合成函数帧，`label == outer_csp` 即函数级标签（落私有 return stub）。
+- **安全网**：invoke 边界清 stale `pending_exn`、trap longjmp 后恢复
+  `eh_top`；prologue 原生栈深检查（递归超限 trap 而非烧穿 C 栈）。
+- **开销隔离**：仅异常/间接调用相关模块生成 checked call sites；
+  bench 模块零额外 call 开销。
+
+### 二、`--jit` 从未生效 → 首轮真实 JIT 全量回归暴露 10+ 个潜伏 bug
+
+排查中发现 `run_spec.py --jit` 虽解析但从未传入子进程，`wast.c` 也从不调用
+`ea_jit_compile_module`——**此前所有"JIT 模式逐文件一致"的验证实际跑的是
+解释器**。接线修复后首轮全量 JIT 回归从 248→162→228→248 逐层修复：
+
+| # | bug | 症状 |
+|---|---|---|
+| 1 | `SELECT_T` 发射非法编码（0x9EA00C00 基码） | typed select 恒返回 false 值 |
+| 2 | EH/异常桩内联在 prologue 后，入口**跌落** | 首指令即返回 marker |
+| 3 | `INT_MIN/-1` trap fixup 用 26 位 B 编码写 bcond | SIGILL（div 系） |
+| 4 | `fix_to_pc` 不初始化 fx.cond/ccode（realloc 垃圾） | 大 br_table 分支腐坏 |
+| 5 | `call_indirect` JIT 路径**不弹参** | callee 读调用者栈垃圾 |
+| 6 | 尾调用解释器桥传 args_end 非 args_base + 复用被桥污染的 x30 | return_call 挂死 |
+| 7 | r>a 结果写入桥自身帧（伪红区） | gc/array 跳 NULL |
+| 8 | `data.drop`/`elem.drop` 3 参 ABI 对 5 参调用点 | bulk-memory 崩溃 |
+| 9 | JIT prologue 无栈深检查（且 `cmp sp` 编码成 xzr） | 深递归段错误/全函数误 trap |
+| 10 | `fcvtzs` f64→32 基码错 + trunc_sat 不处理 parked 浮点 | conversions 49 FAIL |
+| 11 | i64 load 按 4 字节压栈且压错寄存器 | endianness/load/float_memory |
+| 12 | `memory.size`/`table.size` helper 向 sp**上方**写结果 | memory_size 系 17 FAIL |
+| 13 | multi-memory 访存永远用 memories[0]（x14/x15 按需加载修复） | multi-memory 全簇 |
+| 14 | 浮点 binop/fcmp 不 flush int-parked 延迟操作数 | f32/f64 1442 FAIL |
+| 15 | min/max NaN 未静默化、±0 用了 -inf 位模式 | f32/f64 NaN 断言 |
+| 16 | linking.wast 语义：失败实例化的 funcinst 仍可调用；
+     jit_mem0 原在 elem/data/start 之后设置 | linking 崩溃 |
+| 17 | `unreachable` 不发射 trap（只标记死代码） | unreachable 57 FAIL |
+| 18 | defer 窗口跨越分支目标共址位置（producer 被跳过读陈旧寄存器） | EH catch 后 if 走错 |
+
+### 三、覆盖率（双模式）
+
+| 模式 | 全过文件 | 说明 |
+|---|---|---|
+| 解释器 | **257/258**（99.6%，与之前一致，零回归） | 唯一未过 annotations.wast（转换器限制） |
+| JIT | **248/258** | 剩余 10 个文件的 JIT 边角跟进中（simd select/const 各 3、block/if/loop/br/fac/bulk 各 1-2） |
+
+新增 `assert_exception` 命令支持（此前未捕获异常断言被静默跳过）。
+
+### 四、性能影响
+
+bench（JIT）：fib/primes/sum/memsum 在噪声级 ±5% 内；matmul 0.157→0.215
+（~15%，prologue 栈检查 + 代码布局变化，后续可用 leaf 函数跳过栈检查回收）。
+体积：~240KB → ~250KB。
+
+### 五、下一步
+
+1. JIT 剩余 10 个文件（simd select/const 的 v128 边角、block/if/loop 各 1-2）
+2. matmul 布局回归调查（leaf 函数免栈检查）
+3. EH 快路径：clause 匹配内联（常见单 tag 场景省 helper 调用）
