@@ -377,7 +377,18 @@ int ea_store_instantiate(EaStore *s, EaModule *m, EaInstance **out, char **err_m
             else
                 fok = type_matches(fi->type, &m->types[im->idx].func);
             if (!fok) {
-                if (getenv("EA_IDBG")) fprintf(stderr, "FAIL func import %s.%s\n", im->module, im->name);
+                if (getenv("EA_IDBG")) fprintf(stderr, "FAIL func import %s.%s host(np=%u nr=%u p=%d,%d,%d,%d r0=%d) guest(np=%u nr=%u p=%d,%d,%d,%d)\n",
+                    im->module, im->name, fi->type->n_params, fi->type->n_results,
+                    fi->type->n_params > 0 ? fi->type->params[0] : -1,
+                    fi->type->n_params > 1 ? fi->type->params[1] : -1,
+                    fi->type->n_params > 2 ? fi->type->params[2] : -1,
+                    fi->type->n_params > 3 ? fi->type->params[3] : -1,
+                    fi->type->n_results ? fi->type->results[0] : -1,
+                    m->types[im->idx].func.n_params, m->types[im->idx].func.n_results,
+                    m->types[im->idx].func.n_params > 0 ? m->types[im->idx].func.params[0] : -1,
+                    m->types[im->idx].func.n_params > 1 ? m->types[im->idx].func.params[1] : -1,
+                    m->types[im->idx].func.n_params > 2 ? m->types[im->idx].func.params[2] : -1,
+                    m->types[im->idx].func.n_params > 3 ? m->types[im->idx].func.params[3] : -1);
                 fail = "incompatible import type";
                 goto unlinkable;
             }

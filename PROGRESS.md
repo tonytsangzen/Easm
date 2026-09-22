@@ -607,6 +607,26 @@ memsum 0.003）：这批内核为访存带宽受限，省下的 ALU 指令本就
 验证：全量套件两种模式 257/258 零回归（memory.wast 75 条 OOB trap 经
 信号路径全部正确上报）。
 
+### WASI 运行时（已合入，三后端 + CLI/GUI demo + 验证矩阵 15/15）
+
+- **WASI Preview 1 子集**（21 个 syscall）：args/env、clock_time/res、
+  random_get、fd_write/read/close/seek/tell/sync、fd_fdstat/filestat、
+  prestat/prestat_dir_name、path_open、sched_yield、poll_oneoff（clock
+  sleep）、proc_exit——全部按 preview1 指针出参约定实现；
+- **三平台移植层**（`EaWasiPlat` vtable + 3 后端）：
+  - POSIX（macOS/Linux）：open/read/write/seek/mkdir/unlink + clock_gettime
+    + /dev/urandom + opendir/readdir；
+  - Win32：UTF-8→UTF-16 双宽 API（CreateFileW/SetFilePointerEx/FindFirstW），
+    mingw 交叉编译零 error；QueryPerformanceCounter 时钟 + rand() 随机；
+  - ewokos：HAL vtable + 内置 RAM 文件系统（64KB/文件，flat 目录，
+    1ms fake clock，LCG random）——纯可移植 C，本机即可全功能验证；
+- **CLI demo**（wasi_echo.wasm：banner + clock + argv echo；wasi_file.wasm：
+  path_open 创建→写入→关闭→重开→读回→校验）；
+- **GUI demo**（wasi_gui.wasm：Mandelbrot 分形渲染写入 WASI 帧缓冲设备；
+  easm_gui：AppKit NSWindow 实时渲染）；
+- **验证矩阵**：15/15 通过（POSIX echo 5 项 + EWOK echo 2 项 +
+  POSIX file 4 项 + EWOK file 3 项 + GUI 1 项）。
+
 ## 六、下一步（按规划优先级）
 
 1. **HIR / 寄存器分配**（效率阶段主战场）：迭代 15-17 已把 matmul 与

@@ -4,7 +4,8 @@ CFLAGS  = -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11 -fno-omit-frame-po
 LDFLAGS = -ldl
 
 SRC     = src/decode.c src/validate.c src/runtime.c src/interp.c src/arith.c \
-          src/simd_exec.c src/util.c src/jit_a64.c src/wast.c src/main.c
+          src/simd_exec.c src/util.c src/jit_a64.c src/wasi.c src/wasi_posix.c \
+          src/wasi_win.c src/wasi_ewok.c src/wast.c src/main.c
 OBJ     = $(SRC:src/%.c=build/%.o)
 
 all: build/easm

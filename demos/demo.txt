@@ -1,0 +1,1 @@
+easm WASI file demo: hello from inside the sandbox

@@ -44,6 +44,15 @@ static void ea_jit_trap_now(EaExec *ex, uint32_t code) {
 }
 
 static void ea_jit_call_interp(EaExec *ex, EaFuncInst *fi, WVal *args) {
+    if (fi->is_host) { // host function: bridge the arg/result buffers directly
+        WVal la[16], lr[16];
+        uint32_t np = fi->type->n_params < 16 ? fi->type->n_params : 16;
+        for (uint32_t k = 0; k < np; k++) la[k] = args[k];
+        fi->host_fn(fi->host_user, la, lr);
+        uint32_t nr = fi->type->n_results < 16 ? fi->type->n_results : 16;
+        for (uint32_t k = 0; k < nr; k++) args[k] = lr[k];
+        return;
+    }
     uint32_t n = fi->type->n_params;
     uint32_t r = fi->type->n_results;
     // JIT stack layout: wasm arg i lives at args[n-1-i]; push in wasm order
