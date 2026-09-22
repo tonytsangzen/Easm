@@ -610,6 +610,7 @@ typedef struct {
     // references from the body are backward and need no fixups)
     uint8_t eh_calls;          // call sites must check the exception marker
     uint8_t has_throw, has_throwref;
+    uint8_t is_leaf; // no calls/tail calls/EH: prologue stack check skippable
     uint32_t throw_stub_at, throwref_stub_at, eh_resume_at, eh_prop_at, eh_ret_at;
     EaEhDesc **eh_descs;       // descs of this function (patched at publish)
     uint32_t n_eh_descs, cap_eh_descs;
@@ -1647,11 +1648,19 @@ static bool compile_function(JC *c) {
     // [entry_sp-R*16, entry_sp), which would otherwise overlap this frame);
     // then build our frame below it
     {
-        // (cmp cannot read sp in the plain register encoding — go via x17)
-        a64_mov_from_sp(e, R17);
-        a64_ldr_imm64(e, R16, R27, __builtin_offsetof(EaExec, jit_stack_limit));
-        a64_cmp_reg64(e, R17, R16);
-        trap_if(c, TRAP_STACK_EXHAUSTED, CC_LS);
+        // leaf functions cannot recurse and add only their own bounded frame
+        // on top of an already-checked caller (invoke bridge or JIT caller),
+        // so the per-call native-stack probe is pure overhead for them; keep
+        // the check whenever the frame is large against the 256KB margin
+        // (never under EA_CACHE/WARM: there the probe's presence is
+        // load-bearing — return.wast breaks with it skipped; root cause TBD)
+        if (c->cache_on || !c->is_leaf || c->frame_size >= 64 * 1024) {
+            // (cmp cannot read sp in the plain register encoding — go via x17)
+            a64_mov_from_sp(e, R17);
+            a64_ldr_imm64(e, R16, R27, __builtin_offsetof(EaExec, jit_stack_limit));
+            a64_cmp_reg64(e, R17, R16);
+            trap_if(c, TRAP_STACK_EXHAUSTED, CC_LS);
+        }
     }
     {
         int32_t skip = (int32_t)c->n_params * SLOT;
@@ -2919,10 +2928,19 @@ void ea_jit_compile_module(EaModule *m) {
         c.n_params = c.ft->n_params;
         c.n_res = c.ft->n_results;
         c.eh_calls = eh_calls;
+        c.is_leaf = 1;
         for (uint32_t q = 0; q < f->code.n; q++) {
             uint32_t op = f->code.v[q].opcode;
             if (op == EA_OP_THROW) c.has_throw = 1;
             else if (op == EA_OP_THROW_REF) c.has_throwref = 1;
+            switch (op) {
+            case EA_OP_CALL: case EA_OP_CALL_INDIRECT: case EA_OP_CALL_REF:
+            case EA_OP_RETURN_CALL: case EA_OP_RETURN_CALL_INDIRECT:
+            case EA_OP_RETURN_CALL_REF:
+            case EA_OP_THROW: case EA_OP_THROW_REF: case EA_OP_TRY_TABLE:
+                c.is_leaf = 0; // frame may grow without this function's check
+                break;
+            }
         }
         // v128 params/locals: the 1:1 model moves 8-byte scalars through the
         // frame (param copy, local get/set) — leave such functions to the

@@ -819,3 +819,48 @@ annotations.wast 仍为唯一未过（文本语法转换限制，非运行时问
 1. matmul 布局回归（leaf 函数免栈检查）
 2. EH 快路径：clause 匹配内联
 3. v128 全量 JIT lowering（16 字节槽语义的 push/pop/move 全链路）
+
+## 迭代 22：leaf 函数免栈检查 + EA_CACHE/WARM 通道调查（2026-09-23）
+
+### 一、leaf 函数跳过 prologue 原生栈探针（默认路径，已合入）
+
+不能递归、只在自己的已受检调用者之上增加一个有界帧的 leaf 函数（无
+CALL*/RETURN_CALL*/THROW*/TRY_TABLE），无需每次调用都做
+`sp vs jit_stack_limit` 探针——matmul/sum 类内核每次调用省 5 条指令，
+调用密集的真实负载收益更大。帧 ≥64KB 仍保留探针（256KB 余量约束）。
+**限定 `!cache_on`**：实验缓存通道下探针的存在是 load-bearing 的
+（EA_CACHE 下跳过它 return.wast 36 FAIL，根因未查明——见下）。
+验证：默认路径 257/258 保持、WASI 15/15、bench 噪声级。
+
+### 二、EA_CACHE/WARM 通道调查（实验性，保持门控，代码维持 cc2de97 原状）
+
+以单函数 sum 形状（`s += i*3 - (i>>1)` 计数循环）做了完整闭环：
+
+1. **发现 pass-2 重绕缺口**：循环体以 `br` 结尾（计数循环常态）时编译器
+   处于 skip 模式，循环的 END 走 skip 分支——该分支只重置 wl_pass，
+   **不执行 pass-2 重绕**（重绕只在正常 END 路径）→ warm 从未真正运行，
+   EA_CACHE 单开时反而更慢（59→63 条：加了 mov x19/x20 拷贝却照旧
+   ldur/stur 内存）。skip 分支补上重绕后 pass-2 可达。
+2. **证明目标形态可达**：pass-2 循环体 22 条、体部零局部内存访问
+   （s/i 全程驻留 x19/x20，头部 `mov` 取值、回边仅跳转），
+   运行时寄存器轨迹逐迭代正确（s: 3→8→16, i: 2→3→4）。
+3. **出口写回是硬约束**：出环分支目标落在 `insn_at[end_idx]` 之后，
+   循环 END 处的 finalize flush 是死代码（循环只会经 br_if/回边离开）；
+   且编译期 dirty 位无法反映运行时状态（体部每迭代置脏）→ 出口必须
+   **无条件写回全部 want 局部**（spill_warm），尾部才能读到现值。
+   该方案在 sum 形状上完全正确（sum(10)=140）。
+4. **未解**：全量套件 warm 模式仍有缝隙（内部 join 的多前驱映射一致性、
+   >6 活跃局部溢出）——通道需要先设计 join 一致性规则再解锁，
+   本轮所有 cache 改动已回退，调查结论留档。
+5. 附带发现：**leaf-skip 与 EA_CACHE 相互作用破坏 return.wast**
+   （36 FAIL）——探针为何 load-bearing 未查明，是下轮切入点。
+
+### 三、排查方法备忘
+
+- 单函数 JIT 代码对比：EA_JIT_DUMP + llvm-mc（--disassemble 输入须为
+  逗号分隔小端字节流）；循环体指令分类计数。
+- 运行时寄存器轨迹：EA_WDBG2 的 ea_h_wdump6 挂在回边（每迭代打印
+  x19-x24）。
+- 测试脚本自身的两个教训：wast 手写累加漏 `(local.get $s)` 会把
+  `s += e` 写成 `s = e`；zsh 不做单词拆分，`$args` 传双参变单参
+  （第二参缺省为 0）——引擎无恙。
