@@ -25,6 +25,11 @@ baseline JIT** 为主执行引擎，不能降级的指令形态自动回退解�
 - **信号式 OOB**：32 位线性内存的 JIT 访存零边界检查指令——越界落入
   PROT_NONE 保留区，由 SIGSEGV/SIGBUS handler 转换为 wasm trap
   （wasmtime 同款机制）；64 位内存保留显式检查
+- **WASI Preview 1**：21 syscall（args/env/clock/random/fd_write/read/
+  seek/close/fdstat/filestat/prestat/path_open/sync/sched_yield/
+  poll_oneoff/proc_exit），三平台移植层（POSIX + Win32 + ewokos HAL）；
+  含 CLI demo（argv echo + 文件读写）和 GUI demo（Mandelbrot 帧缓冲
+  + AppKit NSWindow）
 
 ## 目录结构
 
@@ -122,6 +127,25 @@ V8/node 的 1/20；磁盘足迹 ~240KB vs wasmtime 48.5MB。
    改为解码期缓存 canonical id
 2. 浮点参数直接 S/D 寄存器往返；v128 的 JIT lowering（当前回退解释器）
 3. annotations 提案文本语法支持（自制转换路径，解锁最后一个测试文件）
+
+## WASI 运行时
+
+```bash
+# CLI demo（POSIX 后端）
+build/easm wasi demos/wasi_echo.wasm hello easm-world
+
+# 文件读写（指定 preopen 目录）
+build/easm wasi --dir d=demos demos/wasi_file.wasm
+
+# ewokos 嵌入式后端（RAM 文件系统）
+EA_BACKEND=ewok build/easm wasi demos/wasi_echo.wasm ewok-hello
+
+# GUI demo（AppKit Mandelbrot 窗口）
+build/easm_gui demos/wasi_gui.wasm
+
+# 验证矩阵（15 项：3 后端 × echo/file + GUI）
+bash tools/test_wasi.sh
+```
 
 ## License
 
