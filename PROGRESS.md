@@ -924,8 +924,16 @@ v128 从「函数级回退解释器」升级为**原生 NEON 执行**（第一�
 - **批 6（已合入）**：i8x16.swizzle（tbl 单表，OOB 索引出 0 与 wasm
   语义一致）、i8x16.shuffle（双表 {a,b} + 立即数索引向量）、
   load8x8/16x4/32x2_s/u（窄加载 + sshll/ushll #0）。simd_lane 357/0 原生。
-- 批 7 候选：select 的 16 字节形式（需编译期类型栈）、FP min/max 的
-  NaN 修正序列、i32x4.dot_i16x8_s、 relaxed-simd 收尾。
+- **批 7（已合入，默认原生）**：v128 select（SELECT_T 自带类型立即数，
+  广播 + cmtst 成掩码 + BSL——无需编译期类型栈）、f32x4/f64x2 min/max
+  （解释器逐位对齐序列：NaN→规范 NaN、±0 符号规则 min=or/max=and，
+  ~18 条 BSL 选择链）、pmin/pmax（fcmgt + BSL 比较选择）、
+  i32x4.dot_i16x8_s（smull+smull2+addp）。
+- **a64_neon 掩码根因（已修，影响全部批次）**：样本字掩码保留了标定
+  rd，`| rd` 产生按位并集（16|2=18）——凡调用寄存器 ≠ 标定寄存器的
+  发射全部错乱。掩码改为 0xFFE0FC00（清 rd/rn/rm、保位型/固定位）。
+  此前的 4 个"独立"编码 bug 皆是此根因的不同症状。
+- 剩余：relaxed-simd 收尾、warm 通道 join 一致性、HIR。
 - **性能边界结论**：sum/matmul 与 wasmtime 的 5–6× 差距 = 操作数栈临时值
   往返（def 窗口仅 2 槽，3 活跃值形态必须溢栈，如 `i*3-(i>>1)` 链）——
   解法为栈槽位寄存器分配（HIR），已量化：循环体压到 ~12 条即达 wasmtime 同档。
