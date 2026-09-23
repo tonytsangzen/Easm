@@ -2791,6 +2791,52 @@ static bool v128_batch1(JC *c, EaInstr *in) {
     case EA_OP_V128_STORE8_LANE: case EA_OP_V128_STORE16_LANE:
     case EA_OP_V128_STORE32_LANE: case EA_OP_V128_STORE64_LANE:
         return v128_load_store_lane(c, in);
+    case EA_OP_I16X8_EXTEND_LOW_I8X16_S: case EA_OP_I16X8_EXTEND_HIGH_I8X16_S:
+    case EA_OP_I16X8_EXTEND_LOW_I8X16_U: case EA_OP_I16X8_EXTEND_HIGH_I8X16_U:
+    case EA_OP_I32X4_EXTEND_LOW_I16X8_S: case EA_OP_I32X4_EXTEND_HIGH_I16X8_S:
+    case EA_OP_I32X4_EXTEND_LOW_I16X8_U: case EA_OP_I32X4_EXTEND_HIGH_I16X8_U:
+    case EA_OP_I64X2_EXTEND_LOW_I32X4_S: case EA_OP_I64X2_EXTEND_HIGH_I32X4_S:
+    case EA_OP_I64X2_EXTEND_LOW_I32X4_U: case EA_OP_I64X2_EXTEND_HIGH_I32X4_U: {
+        // shll/ushll (2) with #0, calibrated per (dest width, signedness, half)
+        static const uint32_t ext[12] = {
+            0x0F08A610u, 0x4F08A610u, 0x2F08A610u, 0x6F08A610u, // i16x8 <- i8x16 s.lo s.hi u.lo u.hi
+            0x0F10A610u, 0x4F10A610u, 0x2F10A610u, 0x6F10A610u, // i32x4 <- i16x8
+            0x0F20A610u, 0x4F20A610u, 0x2F20A610u, 0x6F20A610u, // i64x2 <- i32x4
+        };
+        uint32_t k;
+        switch (in->opcode) {
+        case EA_OP_I16X8_EXTEND_LOW_I8X16_S: k = 0; break;
+        case EA_OP_I16X8_EXTEND_HIGH_I8X16_S: k = 1; break;
+        case EA_OP_I16X8_EXTEND_LOW_I8X16_U: k = 2; break;
+        case EA_OP_I16X8_EXTEND_HIGH_I8X16_U: k = 3; break;
+        case EA_OP_I32X4_EXTEND_LOW_I16X8_S: k = 4; break;
+        case EA_OP_I32X4_EXTEND_HIGH_I16X8_S: k = 5; break;
+        case EA_OP_I32X4_EXTEND_LOW_I16X8_U: k = 6; break;
+        case EA_OP_I32X4_EXTEND_HIGH_I16X8_U: k = 7; break;
+        case EA_OP_I64X2_EXTEND_LOW_I32X4_S: k = 8; break;
+        case EA_OP_I64X2_EXTEND_HIGH_I32X4_S: k = 9; break;
+        case EA_OP_I64X2_EXTEND_LOW_I32X4_U: k = 10; break;
+        default: k = 11; break;
+        }
+        pop_q(c, V16);
+        a64_neon(e, ext[k], V16, V16, 0);
+        push_q(c, V16);
+        return true;
+    }
+    case EA_OP_I8X16_NARROW_I16X8_S: case EA_OP_I8X16_NARROW_I16X8_U:
+    case EA_OP_I16X8_NARROW_I32X4_S: case EA_OP_I16X8_NARROW_I32X4_U: {
+        // narrow a into the dest low half, b into the high half:
+        // sqxtn/uqxtn per operand, then move b's result into d[1]
+        uint32_t narrow_lo = in->opcode == EA_OP_I8X16_NARROW_I16X8_S ? 0x0E214A10u :
+                             in->opcode == EA_OP_I8X16_NARROW_I16X8_U ? 0x2E214A10u :
+                             in->opcode == EA_OP_I16X8_NARROW_I32X4_S ? 0x0E614A10u : 0x2E614A10u;
+        pop_q(c, V17); pop_q(c, V16); // b, a
+        a64_neon(e, narrow_lo, V16, V16, 0);      // sat(a) -> dest lanes 0..n-1
+        a64_neon(e, narrow_lo, V17, V17, 0);      // sat(b) -> scratch low half
+        a64_neon(e, 0x6E180400u, V16, V17, 0);    // ins v16.d[1], v17.d[0]
+        push_q(c, V16);
+        return true;
+    }
     }
     // ---- batch 3: comparisons, shifts, FP arith, int min/max ----
     // integer lane width: 16b/8h/4s/2d -> 0/1/2/3
