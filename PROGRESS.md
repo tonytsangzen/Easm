@@ -921,8 +921,11 @@ v128 从「函数级回退解释器」升级为**原生 NEON 执行**（第一�
 - **批 5（已合入）**：extend_low/high ×12（sshll/ushll (2) #0）、
   narrow ×4（sqxtn/uqxtn ×2 + ins d[1]，双步序列绕开 sqxtn2 的固定
   10001 位型陷阱）。simd_int_to_int_extend 252/0 原生。
-- 批 6 候选：select 的 16 字节形式（需编译期类型栈）、FP min/max 的
-  NaN 修正序列、load8x8/16x4/32x2 变体、swizzle/shuffle。
+- **批 6（已合入）**：i8x16.swizzle（tbl 单表，OOB 索引出 0 与 wasm
+  语义一致）、i8x16.shuffle（双表 {a,b} + 立即数索引向量）、
+  load8x8/16x4/32x2_s/u（窄加载 + sshll/ushll #0）。simd_lane 357/0 原生。
+- 批 7 候选：select 的 16 字节形式（需编译期类型栈）、FP min/max 的
+  NaN 修正序列、i32x4.dot_i16x8_s、 relaxed-simd 收尾。
 - **性能边界结论**：sum/matmul 与 wasmtime 的 5–6× 差距 = 操作数栈临时值
   往返（def 窗口仅 2 槽，3 活跃值形态必须溢栈，如 `i*3-(i>>1)` 链）——
   解法为栈槽位寄存器分配（HIR），已量化：循环体压到 ~12 条即达 wasmtime 同档。
