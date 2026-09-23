@@ -608,8 +608,10 @@ typedef struct {
     int16_t cache_map[6];   // local cached in x19-x24 per slot (-1 = none)
     uint8_t cache_dirty;    // bit per slot: register fresher than frame
     uint8_t cache_clock;    // eviction hand
-    uint8_t cache_on;       // EA_CACHE/EA_WARM opt-in (stale-value hole under
-                            // eviction being chased down)
+    uint8_t cache_on;       // EA_CACHE/EA_WARM opt-in; spec-clean since the
+                            // fused-set/tee cache-bypass and pass-2 want
+                            // write-back fixes, still gated (no measured
+                            // workload win yet; def2 parks x19)
     // warm-loop two-pass state: pass 1 records the cache state at the loop
     // back-edge; the body is then recompiled with those locals pre-loaded at
     // the head, so loop-carried values never touch memory
@@ -888,9 +890,20 @@ static const uint32_t ea_cache_reg[EA_CACHE_SLOTS] = {19, 20, 21, 22, 23, 24};
 
 static void flush_cache(JC *c) {
     for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) {
-        if (c->cache_map[i] >= 0 && (c->cache_dirty & (1u << i)))
-            a64_str_imm64(&c->em, ea_cache_reg[i], FP, local_off(c, (uint32_t)c->cache_map[i]));
-        c->cache_map[i] = -1;
+        if (c->cache_map[i] >= 0) {
+            // warm pass 2: the compile-time dirty bit cannot reflect the
+            // runtime state (the back-edge feeds the pinned set through the
+            // body every iteration, and interior joins see modified values
+            // the linear compile saw as clean), so want slots are written
+            // back unconditionally
+            bool warm_want = false;
+            if (c->wl_pass == 2)
+                for (uint32_t j = 0; j < c->wl_n_want; j++)
+                    warm_want |= c->wl_want[j] == c->cache_map[i];
+            if ((c->cache_dirty & (1u << i)) || warm_want)
+                a64_str_imm64(&c->em, ea_cache_reg[i], FP, local_off(c, (uint32_t)c->cache_map[i]));
+            c->cache_map[i] = -1;
+        }
     }
     c->cache_dirty = 0;
 }
@@ -1037,7 +1050,7 @@ static void push_result_w(JC *c) {
             return;
         }
         if (nop == EA_OP_LOCAL_TEE) {
-            a64_str_imm64(&c->em, R16, FP, local_off(c, c->f->code.v[nx].imm.u32));
+            set_local_val(c, c->f->code.v[nx].imm.u32, R16); // cache-aware
             push_x(&c->em, R16);
             c->skip_next = 1; // the tee itself is fully fused
             return;
@@ -1073,7 +1086,7 @@ static void push_result_x(JC *c) {
             return;
         }
         if (nop == EA_OP_LOCAL_TEE) {
-            a64_str_imm64(&c->em, R16, FP, local_off(c, c->f->code.v[nx].imm.u32));
+            set_local_val(c, c->f->code.v[nx].imm.u32, R16); // cache-aware
             push_x(&c->em, R16);
             c->skip_next = 1; // the tee itself is fully fused
             return;
@@ -1101,10 +1114,12 @@ static void push_result_f(JC *c, int b) {
     if (nx < (uint32_t)c->f->code.n && !c->is_target[nx]) {
         uint32_t nop = c->f->code.v[nx].opcode;
         if (nop == EA_OP_LOCAL_SET) {
-            // frame slots sit at negative offsets: round-trip the value
-            // through a gpr for the FP-relative store
             fmov_to_gpr(c, R16, V0, b);
-            a64_str_imm64(&c->em, R16, FP, local_off(c, c->f->code.v[nx].imm.u32));
+            // set_local_val, not a raw frame store: the local may live in a
+            // dirty cache register, and a bypassing store would leave the
+            // register stale (the next flush would then resurrect the old
+            // value over the fresh one)
+            set_local_val(c, c->f->code.v[nx].imm.u32, R16);
             c->skip_next = 1;
             return;
         }

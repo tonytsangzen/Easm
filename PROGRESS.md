@@ -986,3 +986,46 @@ v128 从「函数级回退解释器」升级为**原生 NEON 执行**（第一�
   三次重复测量 + park 计数证伪为残留后台负载噪声。
   收益面 = 手写 int 链（`a*b+c*d` 形态）；infra（keep 门四形状 +
   冲刷位置不变量）为 HIR 的直接前置。剩余差距仍需 HIR。
+
+## 迭代 26：warm 通道 join 一致性 — 缓存双 bug 根因与修复（2026-09-23，已合入）
+
+EA_CACHE/EA_WARM 从「套件有缝」修到 **257/258（与默认路径完全一致）**，
+WASI 15/15、解释器 257/258 零回归。门禁保留（无实测工作负载收益前不默认开启）。
+
+### 一、缓存一致性双 bug（均以最小复现 + JIT 反汇编定位）
+
+1. **融合 SET/TEE 绕过 set_local_val**（EA_CACHE 单开即错，float_exprs
+   kahan_sum 首调用错值）：push_result_f 的 LOCAL_SET 融合与
+   push_result_w/x 的 LOCAL_TEE 融合直接 `stur` 帧——若该局部已在脏缓存
+   寄存器中，帧写入使寄存器变陈旧，下一次 flush 反而用旧值覆盖新值
+   （kahan 反汇编：`stur x16,[x29,#-48]` 直写 + 回边 `stur x19` 复活旧值）。
+   修复 = 三处融合路径全部改走 set_local_val（非缓存路径同为 str，零默认
+   路径影响）。**迭代 22 的「leaf-skip × EA_CACHE 破坏 return.wast」即此
+   根因的暴露**（探针跳过只是放大器），非独立问题。
+2. **pass-2 编译期 dirty 位不反映运行时状态**（checkRange 死循环）：
+   回边把钉住的 want 寄存器喂进循环体，体内 interior join（IF 的
+   到达即冲刷）在线性编译时看到的是 clean——冲刷漏写回，join 后代码读帧
+   得到陈旧值，`from` 永不推进。修复 = wl_pass==2 时 flush_cache 对 want
+   槽位**无条件写回**（顺带落实迭代 22「出口无条件写回」结论）。
+   直线热循环无 interior 冲刷点，收益不受影响。
+
+### 二、验证与性能
+
+- EA_WARM 全量 257/258（此前 2 错 + 7 超时全消）、EA_CACHE 257/258、
+  默认 257/258 双模式、WASI 15/15。
+- bench（清理孤儿进程后的真实基线：此前基线被旧会话遗留的
+  `easm run /tmp/f42.wasm` 死循环进程拖高 ~8%）：EA_WARM 与默认五内核
+  完全持平（fib 0.025 / primes 0.007 / sum 0.106 / matmul 0.196 /
+  memsum 0.003）——clang 展开内核的局部集 ≤6 且 tee/set 融合后内存
+  流量本就低。
+- **手写循环形状实测收益**：t1 k4 计数循环 JIT 代码 93→64 词（-31%），
+  体部局部全程驻留 x19-x21。
+
+### 三、通道状态
+
+- 门禁保留：`EA_CACHE=1`（单开，分支处冲刷+寄存器分配）、`EA_WARM=1`
+  （两遍编译，回边钉住 want 集）。二者套件级正确，默认关闭——解禁
+  前置：与 def2 的 x19 冲突（def2 在 cache_on 下禁用）+ 真实工作负载
+  的实测收益证据。
+- 排查方法新增：孤儿进程会使 bench 全体虚高（`ps aux | grep easm` 先清场）；
+  lldb attach 工作线程 + EA_JIT_DUMP 反汇编是 JIT 死循环的标准定位路径。
