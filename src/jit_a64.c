@@ -1182,6 +1182,36 @@ static void emit_load(JC *c, EaInstr *in) {
         a64_ldr_reg_fpr(&c->em, V16, mem_base, R16, 8);
         a64_str_q_pre(&c->em, V16);
         return;
+    case EA_OP_V128_LOAD8X8_S:
+        a64_ldr_reg_fpr(&c->em, V16, mem_base, R16, 8);
+        a64_neon(&c->em, 0x0F08A610u, V16, V16, 0); // sshll v16.8h, v16.8b, #0
+        a64_str_q_pre(&c->em, V16);
+        return;
+    case EA_OP_V128_LOAD8X8_U:
+        a64_ldr_reg_fpr(&c->em, V16, mem_base, R16, 8);
+        a64_neon(&c->em, 0x2F08A610u, V16, V16, 0); // ushll
+        a64_str_q_pre(&c->em, V16);
+        return;
+    case EA_OP_V128_LOAD16X4_S:
+        a64_ldr_reg_fpr(&c->em, V16, mem_base, R16, 8);
+        a64_neon(&c->em, 0x0F10A610u, V16, V16, 0); // sshll v16.4s, v16.4h, #0
+        a64_str_q_pre(&c->em, V16);
+        return;
+    case EA_OP_V128_LOAD16X4_U:
+        a64_ldr_reg_fpr(&c->em, V16, mem_base, R16, 8);
+        a64_neon(&c->em, 0x2F10A610u, V16, V16, 0); // ushll
+        a64_str_q_pre(&c->em, V16);
+        return;
+    case EA_OP_V128_LOAD32X2_S:
+        a64_ldr_reg_fpr(&c->em, V16, mem_base, R16, 8);
+        a64_neon(&c->em, 0x0F20A610u, V16, V16, 0); // sshll v16.2d, v16.2s, #0
+        a64_str_q_pre(&c->em, V16);
+        return;
+    case EA_OP_V128_LOAD32X2_U:
+        a64_ldr_reg_fpr(&c->em, V16, mem_base, R16, 8);
+        a64_neon(&c->em, 0x2F20A610u, V16, V16, 0); // ushll
+        a64_str_q_pre(&c->em, V16);
+        return;
     default: a64_ldr_reg64(&c->em, R16, mem_base, R16); break;
     }
     // i64-result loads must push the full 8-byte slot (push_w would leave the
@@ -2834,6 +2864,27 @@ static bool v128_batch1(JC *c, EaInstr *in) {
         a64_neon(e, narrow_lo, V16, V16, 0);      // sat(a) -> dest lanes 0..n-1
         a64_neon(e, narrow_lo, V17, V17, 0);      // sat(b) -> scratch low half
         a64_neon(e, 0x6E180400u, V16, V17, 0);    // ins v16.d[1], v17.d[0]
+        push_q(c, V16);
+        return true;
+    }
+    case EA_OP_I8X16_SWIZZLE:
+        // NEON tbl with a single table: out-of-range indices yield 0,
+        // exactly the wasm swizzle semantics
+        pop_q(c, V17); pop_q(c, V16);
+        a64_neon(e, 0x4E110210u, V16, V16, V17); // tbl v16, {v16}, v17
+        push_q(c, V16);
+        return true;
+    case EA_OP_I8X16_SHUFFLE: {
+        // two-entry table {a, b}: materialize the 16 lane indices, then tbl
+        uint64_t lo = 0, hi = 0;
+        for (int i = 0; i < 8; i++) lo |= (uint64_t)in->imm.bytes[i] << (8 * i);
+        for (int i = 0; i < 8; i++) hi |= (uint64_t)in->imm.bytes[8 + i] << (8 * i);
+        pop_q(c, V17); pop_q(c, V16); // b, a
+        a64_mov64_imm(e, R16, lo);
+        a64_mov64_imm(e, R17, hi);
+        a64_neon_ins(e, 8, 0, V18, R16);
+        a64_neon_ins(e, 8, 1, V18, R17);
+        a64_neon(e, 0x4E122210u, V16, V16, V18); // tbl v16, {v16, v17}, v18
         push_q(c, V16);
         return true;
     }
