@@ -127,24 +127,29 @@ python3 tools/run_bench.py all          # JIT / 解释器 / wasmtime / node 对�
   文本语法，转换失败，非运行时问题）
 - 已覆盖：Wasm 2.0 全部 + GC（struct/array/i31/ref.test/cast/br_on_cast/rec/sub）、
   typed function references、**exceptions（throw/throw_ref/try_table 含 JIT）**、
-  multi-memory、table64、SIMD（非 relaxed）
+  multi-memory、table64、**SIMD + relaxed-simd（全家族原生 NEON，含
+  fmla/sdot/tbl 融合）**
 
 **性能**（同机与 wasmtime 48.0.2 / node 对比，含引擎启动）：
 
 | kernel | easm-jit | easm-int | wasmtime | node |
 |---|---|---|---|---|
-| fib（10M 迭代） | 0.023 | 0.453 | 0.009 | 0.030 |
-| primes（500K 筛） | **0.006** | 0.314 | 0.006 | 0.029 |
-| sum（100M i64） | 0.108 | 9.226 | 0.021 | 0.079 |
-| matmul（30×128³） | 0.157 | 17.426 | 0.030 | 0.091 |
-| memsum（2M load） | **0.003** | 0.007 | 0.005 | 0.025 |
+| fib（10M 迭代） | 0.027 | 0.498 | 0.011 | 0.037 |
+| primes（500K 筛） | 0.009 | 0.345 | 0.009 | 0.034 |
+| sum（100M i64） | 0.072 | 10.579 | 0.028 | 0.091 |
+| matmul（30×128³） | 0.225 | 19.796 | 0.037 | 0.132 |
+| memsum（2M load） | **0.003** | 0.008 | 0.009 | 0.034 |
 
-- primes **追平 wasmtime**，memsum 快于 wasmtime；fib/primes 快于 node
-- JIT 相对解释器加速 **17–48×**；计算密集内核剩余差距来自逐访存边界检查
-  与跨语句值生命周期（→ HIR/寄存器分配阶段的收益空间；信号式 OOB 已就位）
+- primes **追平 wasmtime**，memsum 快于 wasmtime；fib/primes/sum 快于 node
+- JIT 相对解释器加速 **15–50×**；sum 内核经 HIR 第一步（计算就位融合 +
+  缓存引用操作数栈）较迭代 24 的 0.108 缩短 **33%**，与 wasmtime 差距
+  收敛到 ~2.6×；matmul 剩余差距来自 FP 值生命周期（→ HIR-3 描述符栈）
+- 实验通道：EA_CACHE/EA_WARM（局部寄存器缓存 + warm 两遍编译）套件级
+  正确（257/258），sum 再快 ~8%，默认关闭待解禁
 
 **内存**（峰值 RSS）：easm 基线 1.7MB、负载峰值 2.2MB，约为 wasmtime 的 1/3.6、
-V8/node 的 1/20；磁盘足迹 ~240KB vs wasmtime 48.5MB。
+V8/node 的 1/20；磁盘足迹 320KB vs wasmtime 48.5MB；冷启动（解码+编译+执行
+fib(30)）4ms vs wasmtime 57ms。
 
 ## 路线图
 

@@ -1071,3 +1071,64 @@ WASI 15/15、解释器 257/258 零回归。门禁保留（无实测工作负载�
 local.get 零代码入栈（引用缓存寄存器），pop 直读；窗口/物理栈条目
 统一为描述符（kind: PHYS/WIN/CACHE）。这是窗口机制的完全泛化，
 收益预估 sum 循环 33→~13 条（剩余 = 依赖链下限）。
+
+## 迭代 28：HIR-2 — 缓存引用操作数层（2026-09-24，已合入）
+
+操作数描述符栈的第一层落地：**缓存命中的 local.get 零代码入栈**（引用
+缓存寄存器，不拷贝），pop 直读寄存器。三模式 257/258、解释器 257/258、
+WASI 15/15。
+
+### 一、机制
+
+- **cref 层**：`cref_local[4]` 记录待用局部（值在缓存寄存器）；LOCAL_GET
+  命中缓存且谓词失败时零代码入栈。pop_pair 的 a/b 操作数直读寄存器
+  （emit_a/emit_b），单数 pop 原语 cref 感知。
+- **层序不变量**：物理 push 落在 cref 之上会破坏 LIFO——push_w/x/q/s/d
+  原语前置 `spill_crefs`（数组正序溢出，最深先落栈）。
+- **写后读守卫**：融合 set/tee 前检查同局部 cref 冲突或分配型写入
+  （会逐出被引用槽），冲突即先溢出；binop_dst 拒绝把 dst 落在
+  「栈顶两值之下仍存活的 cref」寄存器上。
+- **移位回归 park 路径**：迭代 26 的 def2 守卫已并入 push_result，
+  移位结果恢复停位（省 push+pop 对）；迭代 25 误判的 matmul 回归
+  实为孤儿进程噪声，本次实测无回归。
+
+### 二、根因战：radix LIFO 反转（spec 逮住的真 bug）
+
+float_exprs compute_radix 在 EA_WARM 下 4 FAIL——`spill_crefs` 以数组
+**逆序**溢出（栈顶 cref 先落但落在低地址），`[$0,$1]` 溢栈后互换，
+fadd 读错操作数。最小复现 + 反汇编逐指令对账定位；修复 = 数组正序。
+教训：cref 层的溢出顺序必须与逻辑栈序严格一致，任何「先溢栈顶」直觉
+在 pre-decrement 栈语义下都是反的。
+
+### 三、实测（三维度对比 wasmtime 48.0.2，同机）
+
+**① 性能**（bench，秒，越低越好）：
+
+| kernel | easm-jit | wasmtime | node | easm/wasmtime |
+|---|---|---|---|---|
+| fib | 0.027 | 0.011 | 0.037 | 2.5× |
+| primes | 0.009 | 0.009 | 0.034 | **1.0×（追平）** |
+| sum | 0.072 | 0.028 | 0.091 | 2.6× |
+| matmul | 0.225 | 0.037 | 0.132 | 6.1× |
+| memsum | 0.003 | 0.009 | 0.034 | **0.3×（反超）** |
+
+sum 内核演进：迭代 24 = 0.108 → HIR-1 = 0.106 → cref 层 = 0.086 →
+移位 park = **0.069–0.072（-33%）**；内层 4× 展开环 57→**27 条**；
+ip 微基准循环体 **11 条 = wasmtime 同档**。
+
+**② 一致性**：spec 257/258 双模式（61,124 asserts；唯一未过 =
+annotations.wast 转换器限制）；SIMD + relaxed-simd 全家族原生；
+exceptions/multi-memory/table64/GC 覆盖；WASI 矩阵 15/15。
+wasmtime 为上游参照（100%）。
+
+**③ 交付**：单二进制 320KB vs wasmtime 48.5MB（1/150）；冷启动
+（解码+编译+执行 fib(30)）4ms vs 57ms（1/14）；峰值 RSS ~2.2MB vs
+~8MB（1/3.6）。
+
+### 四、HIR-3 边界
+
+sum 链 `s+i-(j>>1)+k` 仍有一次 cref 溢出往返（push 落在 cref 之上触发
+spill，27 条中 ~9 条为溢出/重载对）。彻底解法 = 完整描述符栈
+（PHYS/WIN/CACHE 统一、push 不再驱逐 cref、线性扫描定寄存器），
+预估 sum 循环 → ~15 条、与 wasmtime 差距 < 2×。matmul 的 FP 值
+生命周期同批收益。
