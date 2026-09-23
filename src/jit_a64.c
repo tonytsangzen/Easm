@@ -603,6 +603,8 @@ typedef struct {
                             // branch on them (-1 = none)
     uint8_t vpops;          // operands the last pop_pair took from registers
     uint8_t skip_next;      // the next pc (a LOCAL_SET) was fused: skip it
+    bool def2_live;         // deepest pending value parked in x19 (int only)
+    uint8_t def2_kind;      // spill width for x19: 0 = i32, 1 = 8-byte
     int16_t cache_map[6];   // local cached in x19-x24 per slot (-1 = none)
     uint8_t cache_dirty;    // bit per slot: register fresher than frame
     uint8_t cache_clock;    // eviction hand
@@ -800,7 +802,34 @@ static bool defer2_possible(JC *c, uint32_t pc, uint32_t n) {
            is_def_producer(c->f->code.v[pc + 1].opcode) &&
            def_consumes(c->f->code.v[pc + 2].opcode);
 }
+// def2 (x19) parking: [binop][producer][producer][int binop] — three values
+// live across the middle producers.  The binop result parks in x19 (deepest),
+// the two producers form the register pair above it.  Only pop_pair (int
+// binops) knows how to consume x19, so the consumer is restricted to them;
+// loads/stores/floats keep their existing flush-based paths.
+static bool defer3_possible(JC *c, uint32_t pc, uint32_t n) {
+    if (c->is_target[pc] || (pc > 0 && c->is_target[pc - 1])) return false;
+    return pc + 3 < n && !c->is_target[pc + 1] && !c->is_target[pc + 2] &&
+           !c->is_target[pc + 3] &&
+           is_def_producer(c->f->code.v[pc + 1].opcode) &&
+           is_def_producer(c->f->code.v[pc + 2].opcode) &&
+           int_consumes(c->f->code.v[pc + 3].opcode);
+}
+// producers allowed to complete a def2 triple: int consts and int local.gets
+// (an FP local would park into the int pair and the float consumer paths
+// would flush the pair-first register away)
+static bool def2_producer_ok(JC *c, EaInstr *in) {
+    if (in->opcode == EA_OP_I32_CONST || in->opcode == EA_OP_I64_CONST) return true;
+    if (in->opcode != EA_OP_LOCAL_GET || in->imm.u32 >= c->n_locals) return false;
+    uint8_t t = c->f->locals[in->imm.u32];
+    return t == VT_I32 || t == VT_I64;
+}
 static void flush_deferred(JC *c) {
+    if (c->def2_live) { // deepest value first, matching logical stack order
+        if (c->def2_kind == 0) a64_str_pre32(&c->em, R19, SP, -16);
+        else a64_str_pre64(&c->em, R19, SP, -16);
+        c->def2_live = false;
+    }
     if (!c->def_count) return;
     if (c->def_count == 2) { // deeper value first; deferred slots are the ones sp points at
         if (c->def_kind0 == 0) a64_str_pre32(&c->em, R16, SP, -16);
@@ -819,12 +848,29 @@ static void flush_deferred(JC *c) {
 // in x16 (first operand) / x17 (second), so nothing is emitted
 static void pop_pair_w(JC *c) {
     c->vpops = 0;
+    if (c->def2_live && c->def_count < 2) {
+        // deepest operand parked in x19: a = x19, b = parked x17 or the stack
+        c->def2_live = false;
+        a64_mov_reg64(&c->em, R16, R19);
+        if (c->def_count == 1) { c->def_count = 0; c->vpops = 2; return; }
+        pop_w(c, R17);
+        c->vpops = 2;
+        return;
+    }
     if (c->def_count == 2) { c->def_count = 0; c->vpops = 2; return; }               // a in x16, b in x17
     if (c->def_count == 1) { c->def_count = 0; c->vpops = 1; pop_w(c, R16); return; } // b in x17; pop a
     pop_w(c, R17); pop_w(c, R16);
 }
 static void pop_pair_x(JC *c) {
     c->vpops = 0;
+    if (c->def2_live && c->def_count < 2) {
+        c->def2_live = false;
+        a64_mov_reg64(&c->em, R16, R19);
+        if (c->def_count == 1) { c->def_count = 0; c->vpops = 2; return; }
+        pop_x(c, R17);
+        c->vpops = 2;
+        return;
+    }
     if (c->def_count == 2) { c->def_count = 0; c->vpops = 2; return; }
     if (c->def_count == 1) { c->def_count = 0; c->vpops = 1; pop_x(c, R16); return; }
     pop_x(c, R17); pop_x(c, R16);
@@ -970,6 +1016,7 @@ static void cmp_result_w(JC *c, uint32_t cc) {
         return;
     }
     a64_cset32(&c->em, R16, cc);
+    if (c->def2_live) flush_deferred(c); // the bool would push above x19
     push_w(&c->em, R16);
 }
 // binop result in R16: fuse with an adjacent consumer instead of a stack
@@ -979,6 +1026,11 @@ static void push_result_w(JC *c) {
     uint32_t nx = c->cur_pc + 1;
     if (nx < (uint32_t)c->f->code.n && !c->is_target[nx]) {
         uint32_t nop = c->f->code.v[nx].opcode;
+        if (nop == EA_OP_LOCAL_SET || nop == EA_OP_LOCAL_TEE) {
+            // the fused set/tee leaves no pushed result: x19 must reach the
+            // stack or it would be the unparked logical top afterwards
+            if (c->def2_live) flush_deferred(c);
+        }
         if (nop == EA_OP_LOCAL_SET) {
             set_local_val(c, c->f->code.v[nx].imm.u32, R16);
             c->skip_next = 1;
@@ -995,13 +1047,26 @@ static void push_result_w(JC *c) {
             c->def_kind1 = 1; c->def_count = 1; c->def_first = 0;
             return;
         }
+        if (c->def_count == 0 && !c->def2_live && !c->cache_on && !c->wl_pass &&
+            defer3_possible(c, c->cur_pc, (uint32_t)c->f->code.n)) {
+            // three live values: this result parks in x19 (deepest) while the
+            // next two producers form the register pair above it
+            a64_mov_reg64(&c->em, R19, R16);
+            c->def2_kind = 1;
+            c->def2_live = true;
+            return;
+        }
     }
+    if (c->def2_live) flush_deferred(c); // the result would push above x19
     push_w(&c->em, R16);
 }
 static void push_result_x(JC *c) {
     uint32_t nx = c->cur_pc + 1;
     if (nx < (uint32_t)c->f->code.n && !c->is_target[nx]) {
         uint32_t nop = c->f->code.v[nx].opcode;
+        if (nop == EA_OP_LOCAL_SET || nop == EA_OP_LOCAL_TEE) {
+            if (c->def2_live) flush_deferred(c);
+        }
         if (nop == EA_OP_LOCAL_SET) {
             set_local_val(c, c->f->code.v[nx].imm.u32, R16);
             c->skip_next = 1;
@@ -1018,7 +1083,15 @@ static void push_result_x(JC *c) {
             c->def_kind1 = 1; c->def_count = 1; c->def_first = 0;
             return;
         }
+        if (c->def_count == 0 && !c->def2_live && !c->cache_on && !c->wl_pass &&
+            defer3_possible(c, c->cur_pc, (uint32_t)c->f->code.n)) {
+            a64_mov_reg64(&c->em, R19, R16);
+            c->def2_kind = 1;
+            c->def2_live = true;
+            return;
+        }
     }
+    if (c->def2_live) flush_deferred(c); // the result would push above x19
     push_x(&c->em, R16);
 }
 // f32/f64 binop result in v0: park in v1 for a following float op, or store
@@ -1738,6 +1811,7 @@ static bool compile_function(JC *c) {
     c->skip_depth = -1;
     c->def_count = 0;
     c->def_first = 0;
+    c->def2_live = false;
     c->fused_cc = -1;
     c->skip_next = 0;
     for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) c->cache_map[i] = -1;
@@ -1867,11 +1941,26 @@ static bool compile_function(JC *c) {
         c->cur_pc = pc;
         EaInstr *in = &code->v[pc];
         uint32_t op = in->opcode;
-        if (c->def_count) {
+        if (c->def_count || c->def2_live) {
             bool keep = c->skip_depth < 0 && c->reachable &&
                         (def_consumes(op) ||
                          (c->def_count == 1 && c->def_first &&
-                          is_def_producer(op) && defer1_possible(c, pc, n)));
+                          is_def_producer(op) && defer1_possible(c, pc, n)) ||
+                         (c->def2_live && c->def_count == 0 &&
+                          def2_producer_ok(c, in) && defer2_possible(c, pc, n)));
+            if (keep && c->def2_live) {
+                // x19 may only stay parked inside the four triple shapes —
+                // anything else pushes or pops below it while its stack slot
+                // is absent.  The parked region is the logical top in every
+                // kept shape, so the flush (deepest first) stays position-
+                // correct whenever we do flush.
+                if (!((c->def_count == 0 && def2_producer_ok(c, in) &&
+                       defer2_possible(c, pc, n)) ||
+                      (c->def_count == 1 && c->def_first) ||
+                      (c->def_count == 1 && !c->def_first && int_consumes(op)) ||
+                      (c->def_count == 2 && int_consumes(op))))
+                    keep = false;
+            }
             if (!keep) flush_deferred(c);
         }
         if (c->skip_depth >= 0) {
@@ -2319,6 +2408,10 @@ static bool compile_function(JC *c) {
             if (c->def_count == 1 && c->def_first) {
                 load_local_val(c, R17, in->imm.u32);
                 c->def_kind1 = 1; c->def_count = 2; c->def_first = 0;
+            } else if (c->def_count == 0 && c->def2_live && def2_producer_ok(c, in) &&
+                       defer2_possible(c, pc, n)) {
+                load_local_val(c, R16, in->imm.u32); // middle of a def2 triple
+                c->def_kind0 = 1; c->def_count = 1; c->def_first = 1;
             } else if (c->def_count == 0 && defer1_possible(c, pc, n)) {
                 load_local_val(c, R17, in->imm.u32);
                 c->def_kind1 = 1; c->def_count = 1;
@@ -3291,9 +3384,9 @@ static bool compile_scalar_op(JC *c, EaInstr *in) {
     case EA_OP_I32_AND: pop_pair_w(c); a64_and_reg32(e, R16, R16, R17); push_result_w(c); return true;
     case EA_OP_I32_OR: pop_pair_w(c); a64_orr_reg32(e, R16, R16, R17); push_result_w(c); return true;
     case EA_OP_I32_XOR: pop_pair_w(c); a64_eor_reg32(e, R16, R16, R17); push_result_w(c); return true;
-    case EA_OP_I32_SHL: pop_pair_w(c); a64_lslv32(e, R16, R16, R17); push_w(e, R16); return true;
-    case EA_OP_I32_SHR_S: pop_pair_w(c); a64_asrv32(e, R16, R16, R17); push_w(e, R16); return true;
-    case EA_OP_I32_SHR_U: pop_pair_w(c); a64_lsrv32(e, R16, R16, R17); push_w(e, R16); return true;
+    case EA_OP_I32_SHL: pop_pair_w(c); a64_lslv32(e, R16, R16, R17); if (c->def2_live) flush_deferred(c); push_w(e, R16); return true;
+    case EA_OP_I32_SHR_S: pop_pair_w(c); a64_asrv32(e, R16, R16, R17); if (c->def2_live) flush_deferred(c); push_w(e, R16); return true;
+    case EA_OP_I32_SHR_U: pop_pair_w(c); a64_lsrv32(e, R16, R16, R17); if (c->def2_live) flush_deferred(c); push_w(e, R16); return true;
     case EA_OP_I32_ROTR: pop_w(e, R17); pop_w(e, R16); a64_rorv32(e, R16, R16, R17); push_w(e, R16); return true;
     case EA_OP_I32_ROTL: {
         pop_w(e, R17); pop_w(e, R16);
@@ -3318,9 +3411,9 @@ static bool compile_scalar_op(JC *c, EaInstr *in) {
     case EA_OP_I64_AND: pop_pair_x(c); a64_and_reg64(e, R16, R16, R17); push_result_x(c); return true;
     case EA_OP_I64_OR: pop_pair_x(c); a64_orr_reg64(e, R16, R16, R17); push_result_x(c); return true;
     case EA_OP_I64_XOR: pop_pair_x(c); a64_eor_reg64(e, R16, R16, R17); push_result_x(c); return true;
-    case EA_OP_I64_SHL: pop_pair_x(c); a64_lslv64(e, R16, R16, R17); push_x(e, R16); return true;
-    case EA_OP_I64_SHR_S: pop_pair_x(c); a64_asrv64(e, R16, R16, R17); push_x(e, R16); return true;
-    case EA_OP_I64_SHR_U: pop_pair_x(c); a64_lsrv64(e, R16, R16, R17); push_x(e, R16); return true;
+    case EA_OP_I64_SHL: pop_pair_x(c); a64_lslv64(e, R16, R16, R17); if (c->def2_live) flush_deferred(c); push_x(e, R16); return true;
+    case EA_OP_I64_SHR_S: pop_pair_x(c); a64_asrv64(e, R16, R16, R17); if (c->def2_live) flush_deferred(c); push_x(e, R16); return true;
+    case EA_OP_I64_SHR_U: pop_pair_x(c); a64_lsrv64(e, R16, R16, R17); if (c->def2_live) flush_deferred(c); push_x(e, R16); return true;
     case EA_OP_I64_ROTR: pop_x(e, R17); pop_x(e, R16); a64_rorv64(e, R16, R16, R17); push_x(e, R16); return true;
     case EA_OP_I64_ROTL: {
         pop_x(e, R17); pop_x(e, R16);
@@ -3347,6 +3440,9 @@ static bool compile_scalar_op2(JC *c, EaInstr *in) {
         if (c->def_count == 1 && c->def_first) {
             a64_mov32_imm(e, R17, in->imm.u32);
             c->def_kind1 = 0; c->def_count = 2; c->def_first = 0;
+        } else if (c->def_count == 0 && c->def2_live && defer2_possible(c, c->cur_pc, c->f->code.n)) {
+            a64_mov32_imm(e, R16, in->imm.u32); // middle of a def2 triple
+            c->def_kind0 = 0; c->def_count = 1; c->def_first = 1;
         } else if (c->def_count == 0 && defer1_possible(c, c->cur_pc, c->f->code.n)) {
             a64_mov32_imm(e, R17, in->imm.u32);
             c->def_kind1 = 0; c->def_count = 1;
@@ -3362,6 +3458,9 @@ static bool compile_scalar_op2(JC *c, EaInstr *in) {
         if (c->def_count == 1 && c->def_first) {
             a64_mov64_imm(e, R17, in->imm.u64);
             c->def_kind1 = 1; c->def_count = 2; c->def_first = 0;
+        } else if (c->def_count == 0 && c->def2_live && defer2_possible(c, c->cur_pc, c->f->code.n)) {
+            a64_mov64_imm(e, R16, in->imm.u64); // middle of a def2 triple
+            c->def_kind0 = 1; c->def_count = 1; c->def_first = 1;
         } else if (c->def_count == 0 && defer1_possible(c, c->cur_pc, c->f->code.n)) {
             a64_mov64_imm(e, R17, in->imm.u64);
             c->def_kind1 = 1; c->def_count = 1;

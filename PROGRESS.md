@@ -953,3 +953,36 @@ v128 从「函数级回退解释器」升级为**原生 NEON 执行**（第一�
 - 测试脚本自身的两个教训：wast 手写累加漏 `(local.get $s)` 会把
   `s += e` 写成 `s = e`；zsh 不做单词拆分，`$args` 传双参变单参
   （第二参缺省为 0）——引擎无恙。
+
+## 迭代 25：def 窗口第三槽 — x19 溢出寄存器（def2）（2026-09-23，已合入）
+
+把「3 活跃值必须溢栈」的量化瓶颈先以最小机制收掉一部分：int binop 结果
+可停入 **x19**（def2 = 最深待用值），其上两个 producer 组成既有 x16/x17
+对——`[binop][producer][producer][int binop]` 四指令形状全程驻留寄存器。
+
+- **机制**：`defer3_possible`（pc..pc+3 静态 target 检查 + 双 producer +
+  int binop 消费者）；park 于 push_result_w/x（`mov x19, x16`）；消费于
+  pop_pair_w/x（a=x19，b=停位 x17 或栈顶，vpops=2）；任意冲刷点先溢
+  x19（最深者优先，与逻辑栈序一致）。
+- **核心不变量（三轮 bug 的共同根因）**：**x19 停泊值之上一旦发生 push，
+  冲刷位置即错**（停泊区必须是逻辑栈顶，冲刷才能保持最深者优先的栈序）。
+  实证：endianness `load8; shl` 链——shl 直推 `push_w` 绕过守卫，其后
+  sub 的 pop_pair 误把 x19 当 a 操作数 → 双模式 62 FAIL、操作数交换。
+  修复 = 六个移位 case 与 cmp_result_w 的 else 路径在直推前加
+  `if (def2_live) flush_deferred(c)` 守卫；push_result 的 SET/TEE 融合
+  与默认 push 路径同样加守卫。
+- **keep 门四形状白名单**：中间 producer（pair-first 停泊）、补对
+  producer、`def_count==2 && int_consumes`（对消费者）、
+  `def_count==1 && !def_first && int_consumes`（def2 消费者）——四形状
+  的 pc 均有静态 target 检查覆盖，故无需运行时 is_target 预冲刷。
+  def2_producer_ok 限定 int const/int local.get（FP local 会落进整数对，
+  FP 消费路径冲刷 pair-first 寄存器 = 丢值）。
+- **验证**：微测试 5 形状（典型链/栈顶消费/call 冲刷/循环回边 + 内部分支/
+  i64）双模式 5/5；全量 **257/258 双模式**、WASI 15/15。
+- **bench 结论（诚实记录）**：五内核与基线持平（fib 0.025 / primes
+  0.007 / sum 0.113 / matmul 0.208 / memsum 0.003）——clang 展开的
+  bench 循环用 local.tee/set 融合 + load 地址链，**不出现四指令形状**，
+  def2 零触发（EA_D2 计数 0）。中途两次 matmul「回归」0.250/0.240 经
+  三次重复测量 + park 计数证伪为残留后台负载噪声。
+  收益面 = 手写 int 链（`a*b+c*d` 形态）；infra（keep 门四形状 +
+  冲刷位置不变量）为 HIR 的直接前置。剩余差距仍需 HIR。
