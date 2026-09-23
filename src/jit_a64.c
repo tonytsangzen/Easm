@@ -559,6 +559,14 @@ int ea_jit_call(EaExec *ex, EaFuncInst *fi) {
 #define V16 16
 #define V17 17
 #define V18 18
+#define V2 2
+#define V3 3
+#define V4 4
+#define V5 5
+#define V6 6
+#define V7 7
+#define V8 8
+#define V9 9
 
 typedef struct {
     Em em;
@@ -2888,6 +2896,84 @@ static bool v128_batch1(JC *c, EaInstr *in) {
         push_q(c, V16);
         return true;
     }
+    case EA_OP_SELECT_T:
+        // the vector select always carries an explicit type immediate
+        if (in->imm.u32 == VT_V128) {
+            pop_w(e, R16);                                 // cond
+            a64_neon_dup(&c->em, 4, V18, R16);             // dup v18.4s, w16
+            a64_neon(&c->em, 0x4EB28E52u, V18, V18, V18);  // cmtst: mask = cond != 0
+            pop_q(c, V17); pop_q(c, V16);                  // b, a
+            a64_neon(&c->em, 0x6E711E12u, V18, V16, V17);  // bsl v18 = (m&a)|(~m&b)
+            push_q(c, V18);
+            return true;
+        }
+        return false; // scalar select_t: the scalar path
+    case EA_OP_F32X4_MIN: case EA_OP_F32X4_MAX:
+    case EA_OP_F64X2_MIN: case EA_OP_F64X2_MAX:
+        // interpreter-parity sequence: NaN -> canonical, +0/-0 by sign rule,
+        // else the IEEE min/max.  (NEON fmin/fmax alone = IEEE minNum, which
+        // returns the non-NaN operand and leaves +/-0 unordered)
+        {
+            bool is64 = in->opcode == EA_OP_F64X2_MIN || in->opcode == EA_OP_F64X2_MAX;
+            bool is_max = in->opcode == EA_OP_F32X4_MAX || in->opcode == EA_OP_F64X2_MAX;
+            pop_q(c, V17); pop_q(c, V16); // b, a
+            // NaN lanes: fcmeq(x, x) is false exactly where x is NaN
+            a64_neon(e, is64 ? 0x4E70E610u : 0x4E30E610u, V2, V16, V16);
+            a64_neon(e, 0x6E205A10u, V2, V2, 0);           // mvn: NaN lanes of a
+            a64_neon(e, is64 ? 0x4E70E610u : 0x4E30E610u, V3, V17, V17);
+            a64_neon(e, 0x6E205A10u, V3, V3, 0);           // NaN lanes of b
+            a64_neon(e, 0x4EB11E10u, V2, V2, V3);          // orr: either-NaN
+            // IEEE min/max (NaN lanes produce garbage, overridden below)
+            a64_neon(e, is64 ? (is_max ? 0x4E71F610u : 0x4EF1F610u)
+                             : (is_max ? 0x4E31F610u : 0x4EB1F610u), V4, V16, V17);
+            // +/-0 fixup: where m == 0, result = (sign(a) OP sign(b)) << 63/31
+            a64_neon(e, is64 ? 0x6F00E400u : 0x4F000400u, V5, 0, 0); // movi 0
+            a64_neon(e, is64 ? 0x4E70E610u : 0x4E30E610u, V5, V4, V5); // m == 0
+            a64_neon(e, is64 ? 0x6F410610u : 0x6F210610u, V6, V16, 0); // a >> 63/31
+            a64_neon(e, is64 ? 0x6F410610u : 0x6F210610u, V7, V17, 0); // b >> 63/31
+            if (is_max) a64_neon(e, 0x4E311E10u, V6, V6, V7); // and: max(+0,-0)=+0
+            else        a64_neon(e, 0x4EB11E10u, V6, V6, V7); // orr: min(+0,-0)=-0
+            a64_neon(e, is64 ? 0x4F7F5610u : 0x4F3F5610u, V6, V6, 0); // shl 63/31
+            a64_neon(e, 0x6E721E30u, V5, V6, V4);          // bsl v5 = (z&s)|(~z&m)
+            // canonical NaN override
+            if (is64) {
+                a64_mov64_imm(e, R16, 0x7FF8000000000000ull);
+                a64_neon_ins(e, 8, 0, V8, R16);
+                a64_neon_ins(e, 8, 1, V8, R16);
+            } else {
+                a64_neon(e, 0x4F0367E0u, V8, 0, 0);        // movi 0x7f<<24
+                a64_neon(e, 0x4F064400u, V9, 0, 0);        // movi 0xc0<<16
+                a64_neon(e, 0x4EB11E10u, V8, V8, V9);      // 0x7fc00000
+            }
+            a64_neon(e, 0x6E721E30u, V2, V8, V5);          // bsl v2 = (n&c)|(~n&m)
+            push_q(c, V2);
+            return true;
+        }
+    case EA_OP_F32X4_PMIN: case EA_OP_F32X4_PMAX:
+    case EA_OP_F64X2_PMIN: case EA_OP_F64X2_PMAX: {
+        // wasm pmin/pmax = the compare-select form (NaN -> a, +0-biased):
+        //   pmin(a,b) = (b < a) ? b : a   pmax(a,b) = (a < b) ? b : a
+        // via fcmgt + bsl (the FP compares are calibrated per width — the
+        // FP size encoding differs from the integer families)
+        bool is64 = in->opcode == EA_OP_F64X2_PMIN || in->opcode == EA_OP_F64X2_PMAX;
+        bool is_max = in->opcode == EA_OP_F32X4_PMAX || in->opcode == EA_OP_F64X2_PMAX;
+        uint32_t fcmgt = is64 ? 0x6EF1E610u : 0x6EB1E610u;
+        pop_q(c, V17); pop_q(c, V16); // b, a
+        if (is_max) a64_neon(e, fcmgt, V2, V16, V17); // mask = a > b
+        else        a64_neon(e, fcmgt, V2, V17, V16); // mask = b > a
+        a64_neon(e, 0x6E721E30u, V2, V17, V16);       // bsl v2 = (m&b)|(~m&a)
+        push_q(c, V2);
+        return true;
+    }
+    case EA_OP_I32X4_DOT_I16X8_S:
+        // smull/smull2 the even-lane products, addp the adjacent pairs:
+        // lane[i] = a[2i]*b[2i] + a[2i+1]*b[2i+1]
+        pop_q(c, V17); pop_q(c, V16);
+        a64_neon(e, 0x0E71C210u, V2, V16, V17);        // smull v2.4s, a.4h, b.4h
+        a64_neon(e, 0x4E71C210u, V3, V16, V17);        // smull2 v3.4s, a.8h, b.8h
+        a64_neon(e, 0x4EB1BE10u, V16, V2, V3);         // addp v16.4s, v2.4s, v3.4s
+        push_q(c, V16);
+        return true;
     }
     // ---- batch 3: comparisons, shifts, FP arith, int min/max ----
     // integer lane width: 16b/8h/4s/2d -> 0/1/2/3
