@@ -1132,3 +1132,33 @@ spill，27 条中 ~9 条为溢出/重载对）。彻底解法 = 完整描述符�
 （PHYS/WIN/CACHE 统一、push 不再驱逐 cref、线性扫描定寄存器），
 预估 sum 循环 → ~15 条、与 wasmtime 差距 < 2×。matmul 的 FP 值
 生命周期同批收益。
+
+## 迭代 29：HIR-3a 否定结果 — 层序计数模型不健全（2026-09-24，留档未合入模型）
+
+尝试消除 cref 层的「push 驱逐」（sum 链 27 条中 ~9 条为溢出/重载对）：
+以 n_pushed 计数 cref 之上的物理 push，pop 按「push → cref → 栈」LIFO
+消费，push 不再触发溢出。**微测试全过，全量 if.wast/call.wast 等
+12 文件崩**。两个根因，均已归档：
+
+1. **深位虚拟值无法物化**：cref 逻辑上位于已物化 push 之下时，溢出须
+   落在更高地址——该区域已被 push 占用。预留 (n_pushed+n_cref)×16 并
+   保 push 地址不变后，cref 块落在 push 之下、窗口 pre-decr 又落在
+   cref 之下——三层相对序无法同时满足，除非**重定位已有 push**
+   （ldp/stp 搬运）。这是 add64_u_with_carry（多值返回 + 同局部双取）
+   崩溃的根因。
+2. **flush_cache 的 cref 溢出是承重逻辑**：pre-switch 在 keep 判断之前
+   无条件清层——join 点上 pending cref 遇 consumer（def_consumes →
+   keep）时会跨分支悬挂。移除它 = if/call 等 12 文件崩；恢复即全绿。
+   教训：**「看似冗余」的无条件清层是 join 一致性的执行者**，删除前
+   必须证明 cref 与 push 的相对序不变量。
+
+回退至迭代 28 语义（sum 0.069、57→27 条收益保留）。三模式 257/258、
+解释器 257/258、WASI 15/15 复验通过。
+
+### HIR-3 正解（下一步）
+
+完整描述符栈 + **物化时重定位**：flush 对 [crefs | pushes | window] 统一
+预留重排（pushes 经 ldp/stp 搬至新偏移），或反向——pops 带位置感知、
+永不通物化（每描述符记录绝对槽偏移）。两者均为 ~300 行级改造，
+收益预估 sum 内环 27→~15 条、与 wasmtime < 2×；matmul FP 生命周期
+同批。风险与迭代 25/28 的经验一致：不变量必须先纸面证明再动手。

@@ -732,8 +732,9 @@ static void load_mem_regs(Em *e) {
 
 static void spill_crefs(JC *c);
 static uint32_t cref_reg(JC *c, uint32_t i);
-// a physical push must land ABOVE any pending cache refs or the LIFO layer
-// ordering breaks — spill them (deepest first) first
+// a physical push materializes pending refs first: a deeper virtual value
+// can only land ABOVE entries that already exist on the stack, so it must
+// be written before the push takes the lowest slot
 static void push_x(JC *c, uint32_t rt) { if (c->n_cref) spill_crefs(c); a64_str_pre64(&c->em, rt, SP, -16); }
 static void pop_x(JC *c, uint32_t rt) {
     if (c->n_cref) { a64_mov_reg64(&c->em, rt, cref_reg(c, --c->n_cref)); return; }
@@ -879,10 +880,10 @@ static int16_t local_cached_slot(JC *c, uint32_t idx) {
 static uint32_t cref_reg(JC *c, uint32_t i) {
     return ea_cache_reg[local_cached_slot(c, c->cref_local[i])];
 }
-static void spill_crefs(JC *c) { // deepest first (array order); 64-bit
-    for (uint32_t i = 0; i < c->n_cref; i++) {  // stores (i32 cache values
-        a64_str_pre64(&c->em, cref_reg(c, i), SP, -16);  // are zero-extended)
-    }
+static void spill_crefs(JC *c) { // deepest first (array order = highest
+    for (uint32_t i = 0; i < c->n_cref; i++) {  // address first); 64-bit
+        a64_str_pre64(&c->em, cref_reg(c, i), SP, -16);  // stores (i32 cache
+    }                          // values are zero-extended by invariant)
     c->n_cref = 0;
 }
 static bool cref_conflict_any(JC *c, uint32_t idx) {
@@ -951,7 +952,10 @@ static void pop_pair_x(JC *c) {
 }
 
 static void flush_deferred(JC *c) {
-    spill_crefs(c); // deepest layer first
+    // crefs first: their insert reserves room for the pushes above them, so
+    // the window's pre-decrement spills land below the block (the logical
+    // top = the lowest addresses)
+    spill_crefs(c);
     if (c->def2_live) { // deepest value first, matching logical stack order
         if (c->def2_kind == 0) a64_str_pre32(&c->em, R19, SP, -16);
         else a64_str_pre64(&c->em, R19, SP, -16);
@@ -978,6 +982,8 @@ static void flush_deferred(JC *c) {
 // in x16 (first operand) / x17 (second), so nothing is emitted
 
 static void flush_cache(JC *c) {
+    // the cref spill here is load-bearing: the pre-switch runs before the
+    // keep gate, so join points materialize pending refs unconditionally
     spill_crefs(c);
     for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) {
         if (c->cache_map[i] >= 0) {
