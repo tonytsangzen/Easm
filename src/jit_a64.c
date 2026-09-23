@@ -2974,6 +2974,83 @@ static bool v128_batch1(JC *c, EaInstr *in) {
         a64_neon(e, 0x4EB1BE10u, V16, V2, V3);         // addp v16.4s, v2.4s, v3.4s
         push_q(c, V16);
         return true;
+    // ---- relaxed-simd (the implementation-defined behaviors land on the
+    // matching NEON instructions; the suite asserts the interpreter's choice,
+    // which these sequences reproduce) ----
+    case EA_OP_I8X16_RELAXED_SWIZZLE:
+        pop_q(c, V17); pop_q(c, V16);
+        a64_neon(e, 0x4E110210u, V16, V16, V17); // tbl (OOB -> 0)
+        push_q(c, V16);
+        return true;
+    case EA_OP_I8X16_RELAXED_LANESELECT: case EA_OP_I16X8_RELAXED_LANESELECT:
+    case EA_OP_I32X4_RELAXED_LANESELECT: case EA_OP_I64X2_RELAXED_LANESELECT:
+        pop_q(c, V18); pop_q(c, V17); pop_q(c, V16); // sel, x, y
+        a64_neon(e, 0x6E721E30u, V18, V17, V16);     // bsl (m&x)|(~m&y)
+        push_q(c, V18);
+        return true;
+    case EA_OP_F32X4_RELAXED_MIN: case EA_OP_F32X4_RELAXED_MAX:
+    case EA_OP_F64X2_RELAXED_MIN: case EA_OP_F64X2_RELAXED_MAX: {
+        // the relaxed spec allows IEEE minNum/maxNum directly
+        bool is64 = in->opcode == EA_OP_F64X2_RELAXED_MIN || in->opcode == EA_OP_F64X2_RELAXED_MAX;
+        pop_q(c, V17); pop_q(c, V16);
+        a64_neon(e, is64 ? 0x4EF1F610u : 0x4EB1F610u, V16, V16, V17); // fmin
+        a64_neon(e, is64 ? 0x4E71F610u : 0x4E31F610u, V16, V16, V17); // fmax
+        push_q(c, V16);
+        return true;
+    }
+    case EA_OP_F32X4_RELAXED_MADD: case EA_OP_F32X4_RELAXED_NMADD:
+    case EA_OP_F64X2_RELAXED_MADD: case EA_OP_F64X2_RELAXED_NMADD: {
+        bool is64 = in->opcode == EA_OP_F64X2_RELAXED_MADD || in->opcode == EA_OP_F64X2_RELAXED_NMADD;
+        bool is_nm = in->opcode == EA_OP_F32X4_RELAXED_NMADD || in->opcode == EA_OP_F64X2_RELAXED_NMADD;
+        pop_q(c, V18); pop_q(c, V17); pop_q(c, V16); // c, b, a
+        if (is_nm) a64_neon(e, is64 ? 0x4EF1CE12u : 0x4EB1CE12u, V18, V16, V17); // fmls c -= a*b
+        else       a64_neon(e, is64 ? 0x4E71CE12u : 0x4E31CE12u, V18, V16, V17); // fmla c += a*b
+        push_q(c, V18);
+        return true;
+    }
+    case EA_OP_I16X8_RELAXED_Q15MULR_S:
+        pop_q(c, V17); pop_q(c, V16);
+        a64_neon(e, 0x6E71B610u, V16, V16, V17); // sqrdmulh
+        push_q(c, V16);
+        return true;
+    case EA_OP_I16X8_RELAXED_DOT_I8X16_I7X16_S:
+        // pair products (smull/smull2), pairwise-add long (saddlp), then
+        // saturating narrow into the two halves
+        pop_q(c, V17); pop_q(c, V16);
+        a64_neon(e, 0x0E71C210u, V2, V16, V17); // smull v2.8h (p0..p7)
+        a64_neon(e, 0x4E71C210u, V3, V16, V17); // smull2 v3.8h (p8..p15)
+        a64_neon(e, 0x4E602844u, V4, V2, 0);    // saddlp v4.4s (p0+p1..p6+p7)
+        a64_neon(e, 0x4E602864u, V5, V3, 0);    // saddlp v5.4s (p8+p9..p14+p15)
+        a64_neon(e, 0x0E614890u, V16, V4, 0);   // sqxtn v16.4h (lanes 0-3)
+        a64_neon(e, 0x4E6148B0u, V16, V5, 17);  // sqxtn2 v16.8h (lanes 4-7)
+        push_q(c, V16);
+        return true;
+    case EA_OP_I32X4_RELAXED_DOT_I8X16_I7X16_ADD_S:
+        // sdot (the 4-term i8 dot per lane) + the accumulator
+        pop_q(c, V18); pop_q(c, V17); pop_q(c, V16); // c, b, a
+        a64_neon(e, 0x4E919610u, V2, V16, V17);      // sdot v2.4s, a, b
+        a64_neon(e, 0x4EB18610u, V2, V2, V18);       // add the accumulator
+        push_q(c, V2);
+        return true;
+    case EA_OP_I32X4_RELAXED_TRUNC_F32X4_S:
+        pop_q(c, V16);
+        a64_neon(e, 0x4EA1BA10u, V16, V16, 0); // fcvtzs (saturating)
+        push_q(c, V16);
+        return true;
+    case EA_OP_I32X4_RELAXED_TRUNC_F32X4_U:
+        pop_q(c, V16);
+        a64_neon(e, 0x6EA1BA10u, V16, V16, 0); // fcvtzu (saturating)
+        push_q(c, V16);
+        return true;
+    case EA_OP_I32X4_RELAXED_TRUNC_F64X2_S_ZERO: case EA_OP_I32X4_RELAXED_TRUNC_F64X2_U_ZERO: {
+        bool u = in->opcode == EA_OP_I32X4_RELAXED_TRUNC_F64X2_U_ZERO;
+        pop_q(c, V16);
+        a64_neon(e, u ? 0x6EE1BA02u : 0x4EE1BA02u, V2, V16, 0); // fcvtzs/zu v2.2d (saturating)
+        a64_neon(e, 0x6F00E410u, V16, 0, 0);            // movi v16.2d, #0
+        a64_neon(e, 0x0EA12850u, V16, V2, 0);           // xtn v16.2s, v2.2d
+        push_q(c, V16);
+        return true;
+    }
     }
     // ---- batch 3: comparisons, shifts, FP arith, int min/max ----
     // integer lane width: 16b/8h/4s/2d -> 0/1/2/3
