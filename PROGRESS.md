@@ -933,7 +933,13 @@ v128 从「函数级回退解释器」升级为**原生 NEON 执行**（第一�
   rd，`| rd` 产生按位并集（16|2=18）——凡调用寄存器 ≠ 标定寄存器的
   发射全部错乱。掩码改为 0xFFE0FC00（清 rd/rn/rm、保位型/固定位）。
   此前的 4 个"独立"编码 bug 皆是此根因的不同症状。
-- 剩余：relaxed-simd 收尾、warm 通道 join 一致性、HIR。
+- **批 8（已合入）**：relaxed-simd 全家族原生——relaxed_swizzle（tbl）、
+  laneselect ×4（bsl）、relaxed_min/max ×4（fmin/fmax 直接满足 relaxed
+  语义）、madd/nmadd ×4（fmla/fmls 融合乘加——relaxed 提案的存在理由）、
+  q15mulr（sqrdmulh）、dot ×2（sdot / smull+saddlp+sqxtn 饱和链）、
+  trunc ×4（fcvtzs/zu 饱和；f64x2 走 fcvtzs .2d + xtn 零槽）。
+  relaxed-simd 7 文件全部原生执行。
+- 剩余：warm 通道 join 一致性、HIR（栈槽位寄存器分配）。
 - **性能边界结论**：sum/matmul 与 wasmtime 的 5–6× 差距 = 操作数栈临时值
   往返（def 窗口仅 2 槽，3 活跃值形态必须溢栈，如 `i*3-(i>>1)` 链）——
   解法为栈槽位寄存器分配（HIR），已量化：循环体压到 ~12 条即达 wasmtime 同档。
