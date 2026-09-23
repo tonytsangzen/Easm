@@ -1029,3 +1029,45 @@ WASI 15/15、解释器 257/258 零回归。门禁保留（无实测工作负载�
   的实测收益证据。
 - 排查方法新增：孤儿进程会使 bench 全体虚高（`ps aux | grep easm` 先清场）；
   lldb attach 工作线程 + EA_JIT_DUMP 反汇编是 JIT 死循环的标准定位路径。
+
+## 迭代 27：HIR 第一步 — 计算就位融合 + warm want 重构（2026-09-24，已合入）
+
+朝「栈槽位寄存器分配」落地的第一块：**binop 直接在被写入局部的缓存
+寄存器里计算**。三模式 257/258、解释器 257/258、WASI 15/15 保持。
+
+### 一、机制（全部 cache_on 门控，默认路径字节级不变）
+
+1. **binop_dst 前瞻**：int binop 下一条为 LOCAL_SET/TEE 且该局部在缓存
+   → 就位寄存器 dst；pop_pair 经 emit_a/emit_b 交出操作数寄存器（配对
+   首值驻留缓存寄存器时=寄存器本身，否则 x16/x17）——
+   `local.set $k (i64.add ... $k ...)` 从 4 条（mov/运算/mov）变
+   `add xK, xA, xB`。通用安全：另一操作数必在 x16/x17（窗口值），
+   永不与 dst 冲突；dst 可与 a/b 重合（ARM 允许）。
+2. **park_pair_first/second**：配对值若已在缓存寄存器则**零拷贝驻留**
+   （local.get 命中 = 0 条指令）；flush 的溢出寄存器随之取真实驻留处。
+3. **push_result/移位/cmp 全 case 改走 emit_a/emit_b**（cmp 无 dst 只换
+   操作数寄存器）；FP 的 fused-set 直达 fmov 缓存寄存器。
+4. **warm 头部 park 放宽**：缓存驻留 park 零窗口载荷，回边恢复的恰是
+   它读取的缓存状态——wl_pass==2 时允许分支目标 pc 本身 park
+   （defer2_possible_head；keep 门补对应放宽分支）。
+5. **warm want 重构（bench sum 7 局部 thrash 根因）**：want 改为**循环体
+   局部使用集扫描**（首次使用序、v128 除外），不再取回边缓存残存——
+   pass-1 自身 thrash 会把幸存者冻结进 pass-2；被逐出局部由头部 setup
+   从帧重载。bench sum 循环 57→33 条。
+
+### 二、实测
+
+- ip 微基准（s+=i 累加 + 三归纳步进）warm 循环体：**11 条 =
+  wasmtime 同档**（`s += i` 即 1 条 `add x19, x19, x22`）；
+  整函数 105→72 词（-31%）。
+- bench sum 内层 4× 展开环 57→33 条（-42%）；墙钟持平（依赖链
+  4 周期/迭代为瓶颈，非指令数）。
+- bench 五内核默认与 EA_WARM 均在噪声带内持平。
+
+### 三、HIR-2 边界（下一步）
+
+`s + i - (j>>1) + k` 链仍走栈往返（17 条）：三个前导 producer 超出
+「def2+配对=3 值」容量。解法 = **操作数描述符栈**：缓存命中的
+local.get 零代码入栈（引用缓存寄存器），pop 直读；窗口/物理栈条目
+统一为描述符（kind: PHYS/WIN/CACHE）。这是窗口机制的完全泛化，
+收益预估 sum 循环 33→~13 条（剩余 = 依赖链下限）。

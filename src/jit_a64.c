@@ -605,6 +605,13 @@ typedef struct {
     uint8_t skip_next;      // the next pc (a LOCAL_SET) was fused: skip it
     bool def2_live;         // deepest pending value parked in x19 (int only)
     uint8_t def2_kind;      // spill width for x19: 0 = i32, 1 = 8-byte
+    uint8_t def_first_reg;  // pair-first value lives here (0 = x16); cache
+                            // hit parking skips the x16 copy entirely
+    uint8_t def_second_reg; // pair-second value lives here (0 = x17)
+    uint32_t emit_a, emit_b; // operand registers chosen by pop_pair (16/17
+                            // unless the pair-first stayed in its cache reg)
+    bool in_place;          // binop computed straight into a cache register
+    int8_t in_place_slot;   // that register's cache slot
     int16_t cache_map[6];   // local cached in x19-x24 per slot (-1 = none)
     uint8_t cache_dirty;    // bit per slot: register fresher than frame
     uint8_t cache_clock;    // eviction hand
@@ -817,6 +824,16 @@ static bool defer3_possible(JC *c, uint32_t pc, uint32_t n) {
            is_def_producer(c->f->code.v[pc + 2].opcode) &&
            int_consumes(c->f->code.v[pc + 3].opcode);
 }
+// warm pass 2 only: a cache-resident park carries no window-register
+// payload, so the producing pc may itself be a branch target — the back-edge
+// restores exactly the cache state the park reads.  The park must hit the
+// cache (checked by the caller via local_cached_slot).
+static bool defer2_possible_head(JC *c, uint32_t pc, uint32_t n) {
+    if (c->wl_pass != 2) return false;
+    return pc + 2 < n && !c->is_target[pc + 1] && !c->is_target[pc + 2] &&
+           is_def_producer(c->f->code.v[pc + 1].opcode) &&
+           def_consumes(c->f->code.v[pc + 2].opcode);
+}
 // producers allowed to complete a def2 triple: int consts and int local.gets
 // (an FP local would park into the int pair and the float consumer paths
 // would flush the pair-first register away)
@@ -832,13 +849,16 @@ static void flush_deferred(JC *c) {
         else a64_str_pre64(&c->em, R19, SP, -16);
         c->def2_live = false;
     }
+    uint32_t r0 = c->def_first_reg ? c->def_first_reg : R16;
+    uint32_t r1 = c->def_second_reg ? c->def_second_reg : R17;
+    c->def_first_reg = 0; c->def_second_reg = 0;
     if (!c->def_count) return;
     if (c->def_count == 2) { // deeper value first; deferred slots are the ones sp points at
-        if (c->def_kind0 == 0) a64_str_pre32(&c->em, R16, SP, -16);
-        else a64_str_pre64(&c->em, R16, SP, -16);
+        if (c->def_kind0 == 0) a64_str_pre32(&c->em, r0, SP, -16);
+        else a64_str_pre64(&c->em, r0, SP, -16);
     }
-    if (c->def_kind1 == 0) a64_str_pre32(&c->em, R17, SP, -16);
-    else if (c->def_kind1 == 1) a64_str_pre64(&c->em, R17, SP, -16);
+    if (c->def_kind1 == 0) a64_str_pre32(&c->em, r1, SP, -16);
+    else if (c->def_kind1 == 1) a64_str_pre64(&c->em, r1, SP, -16);
     else if (c->def_kind1 == 2) a64_str_pre_fpr(&c->em, V1, SP, -16, 4);
     else a64_str_pre_fpr(&c->em, V1, SP, -16, 8);
     c->def_count = 0;
@@ -850,6 +870,7 @@ static void flush_deferred(JC *c) {
 // in x16 (first operand) / x17 (second), so nothing is emitted
 static void pop_pair_w(JC *c) {
     c->vpops = 0;
+    c->emit_a = R16; c->emit_b = R17;
     if (c->def2_live && c->def_count < 2) {
         // deepest operand parked in x19: a = x19, b = parked x17 or the stack
         c->def2_live = false;
@@ -859,12 +880,19 @@ static void pop_pair_w(JC *c) {
         c->vpops = 2;
         return;
     }
-    if (c->def_count == 2) { c->def_count = 0; c->vpops = 2; return; }               // a in x16, b in x17
+    if (c->def_count == 2) { // a and b in their park registers when cached
+        c->def_count = 0; c->vpops = 2;
+        c->emit_a = c->def_first_reg ? c->def_first_reg : R16;
+        c->emit_b = c->def_second_reg ? c->def_second_reg : R17;
+        c->def_first_reg = 0; c->def_second_reg = 0;
+        return;
+    }
     if (c->def_count == 1) { c->def_count = 0; c->vpops = 1; pop_w(c, R16); return; } // b in x17; pop a
     pop_w(c, R17); pop_w(c, R16);
 }
 static void pop_pair_x(JC *c) {
     c->vpops = 0;
+    c->emit_a = R16; c->emit_b = R17;
     if (c->def2_live && c->def_count < 2) {
         c->def2_live = false;
         a64_mov_reg64(&c->em, R16, R19);
@@ -873,7 +901,13 @@ static void pop_pair_x(JC *c) {
         c->vpops = 2;
         return;
     }
-    if (c->def_count == 2) { c->def_count = 0; c->vpops = 2; return; }
+    if (c->def_count == 2) {
+        c->def_count = 0; c->vpops = 2;
+        c->emit_a = c->def_first_reg ? c->def_first_reg : R16;
+        c->emit_b = c->def_second_reg ? c->def_second_reg : R17;
+        c->def_first_reg = 0; c->def_second_reg = 0;
+        return;
+    }
     if (c->def_count == 1) { c->def_count = 0; c->vpops = 1; pop_x(c, R16); return; }
     pop_x(c, R17); pop_x(c, R16);
 }
@@ -944,6 +978,70 @@ static void set_local_val(JC *c, uint32_t idx, uint32_t reg) {
     c->cache_map[s] = (int16_t)idx;
     c->cache_dirty |= (uint8_t)(1u << s);
 }
+// a binop about to be stored straight back to a cached local computes in
+// place: `local.set $k (i64.add ... $k ...)` becomes `add xK, xK, xB` with
+// no copy in either direction.  Safe generically because the other operand
+// never lives in a cache register (window values use x16/x17).
+static uint32_t binop_dst(JC *c, EaInstr *in) {
+    c->in_place = false;
+    c->in_place_slot = -1;
+    if (!c->cache_on) return R16;
+    uint32_t nx = c->cur_pc + 1;
+    if (nx >= (uint32_t)c->f->code.n || c->is_target[nx]) return R16;
+    uint32_t op = c->f->code.v[nx].opcode;
+    if (op != EA_OP_LOCAL_SET && op != EA_OP_LOCAL_TEE) return R16;
+    uint32_t k = c->f->code.v[nx].imm.u32;
+    for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) {
+        if (c->cache_map[i] == (int16_t)k) {
+            c->in_place = true;
+            c->in_place_slot = (int8_t)i;
+            return ea_cache_reg[i];
+        }
+    }
+    return R16;
+}
+static void in_place_finish(JC *c) {
+    if (c->in_place_slot >= 0) c->cache_dirty |= (uint8_t)(1u << c->in_place_slot);
+    c->skip_next = 1;
+    c->in_place = false;
+    c->in_place_slot = -1;
+}
+static int16_t local_cached_slot(JC *c, uint32_t idx) {
+    for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++)
+        if (c->cache_map[i] == (int16_t)idx) return (int16_t)i;
+    return -1;
+}
+// the pair's deep value: when the local already sits in a cache register,
+// park it THERE (no copy) — pop_pair hands the register to the consuming op
+static void park_pair_first(JC *c, uint32_t idx) {
+    if (c->cache_on) {
+        for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) {
+            if (c->cache_map[i] == (int16_t)idx) {
+                c->def_first_reg = (uint8_t)ea_cache_reg[i];
+                c->def_kind0 = 1; c->def_count = 1; c->def_first = 1;
+                return;
+            }
+        }
+    }
+    load_local_val(c, R16, idx);
+    c->def_first_reg = 0;
+    c->def_kind0 = 1; c->def_count = 1; c->def_first = 1;
+}
+// the pair's second (top) value: same cache-resident treatment
+static void park_pair_second(JC *c, uint32_t idx) {
+    if (c->cache_on) {
+        for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) {
+            if (c->cache_map[i] == (int16_t)idx) {
+                c->def_second_reg = (uint8_t)ea_cache_reg[i];
+                c->def_kind1 = 1; c->def_count = 2; c->def_first = 0;
+                return;
+            }
+        }
+    }
+    load_local_val(c, R17, idx);
+    c->def_second_reg = 0;
+    c->def_kind1 = 1; c->def_count = 2; c->def_first = 0;
+}
 // a branch back to the loop head: pass 1 records the cached set; pass 2
 // restores EXACTLY that set, with want[j] pinned to slot j (the head was
 // compiled with that register assignment)
@@ -955,13 +1053,20 @@ static void warm_backedge(JC *c) {
         fprintf(stderr, "\n");
     }
     if (c->wl_pass == 1) {
+        // want = the body's own local set (first-use order, v128 excluded),
+        // NOT the back-edge cache residue: pass 1 thrashes when a pre-loop
+        // set or >6 candidates contend for the slots, and recording the
+        // survivors would freeze the thrash into pass 2.  Evicted locals
+        // live in the frame; the head setup reloads them from there.
         c->wl_n_want = 0;
-        for (uint32_t i = 0; i < EA_CACHE_SLOTS && c->wl_n_want < EA_CACHE_SLOTS; i++) {
-            if (c->cache_map[i] < 0) continue;
-            int16_t v = c->cache_map[i];
+        for (uint32_t p = c->wl_head_pc; p < c->wl_end_idx && c->wl_n_want < EA_CACHE_SLOTS; p++) {
+            uint32_t o = c->f->code.v[p].opcode;
+            if (o != EA_OP_LOCAL_GET && o != EA_OP_LOCAL_SET && o != EA_OP_LOCAL_TEE) continue;
+            uint32_t idx = c->f->code.v[p].imm.u32;
+            if (idx < c->n_locals && c->f->locals[idx] == VT_V128) continue;
             bool have = false;
-            for (uint32_t j = 0; j < c->wl_n_want; j++) have |= c->wl_want[j] == v;
-            if (!have) c->wl_want[c->wl_n_want++] = v;
+            for (uint32_t j = 0; j < c->wl_n_want; j++) have |= c->wl_want[j] == (int16_t)idx;
+            if (!have) c->wl_want[c->wl_n_want++] = (int16_t)idx;
         }
         flush_cache(c);
         return;
@@ -1045,11 +1150,18 @@ static void push_result_w(JC *c) {
             if (c->def2_live) flush_deferred(c);
         }
         if (nop == EA_OP_LOCAL_SET) {
+            if (c->in_place) { in_place_finish(c); return; }
             set_local_val(c, c->f->code.v[nx].imm.u32, R16);
             c->skip_next = 1;
             return;
         }
         if (nop == EA_OP_LOCAL_TEE) {
+            if (c->in_place) {
+                uint32_t r = ea_cache_reg[c->in_place_slot];
+                in_place_finish(c);
+                push_x(&c->em, r); // tee keeps the value on the stack too
+                return;
+            }
             set_local_val(c, c->f->code.v[nx].imm.u32, R16); // cache-aware
             push_x(&c->em, R16);
             c->skip_next = 1; // the tee itself is fully fused
@@ -1081,11 +1193,18 @@ static void push_result_x(JC *c) {
             if (c->def2_live) flush_deferred(c);
         }
         if (nop == EA_OP_LOCAL_SET) {
+            if (c->in_place) { in_place_finish(c); return; }
             set_local_val(c, c->f->code.v[nx].imm.u32, R16);
             c->skip_next = 1;
             return;
         }
         if (nop == EA_OP_LOCAL_TEE) {
+            if (c->in_place) {
+                uint32_t r = ea_cache_reg[c->in_place_slot];
+                in_place_finish(c);
+                push_x(&c->em, r); // tee keeps the value on the stack too
+                return;
+            }
             set_local_val(c, c->f->code.v[nx].imm.u32, R16); // cache-aware
             push_x(&c->em, R16);
             c->skip_next = 1; // the tee itself is fully fused
@@ -1114,11 +1233,21 @@ static void push_result_f(JC *c, int b) {
     if (nx < (uint32_t)c->f->code.n && !c->is_target[nx]) {
         uint32_t nop = c->f->code.v[nx].opcode;
         if (nop == EA_OP_LOCAL_SET) {
+            // in place when the local is cache-resident: fmov straight into
+            // its register (also keeps the register fresh — never bypass
+            // set_local_val with a raw frame store)
+            if (c->cache_on) {
+                uint32_t k = c->f->code.v[nx].imm.u32;
+                for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) {
+                    if (c->cache_map[i] == (int16_t)k) {
+                        fmov_to_gpr(c, ea_cache_reg[i], V0, b);
+                        c->cache_dirty |= (uint8_t)(1u << i);
+                        c->skip_next = 1;
+                        return;
+                    }
+                }
+            }
             fmov_to_gpr(c, R16, V0, b);
-            // set_local_val, not a raw frame store: the local may live in a
-            // dirty cache register, and a bypassing store would leave the
-            // register stale (the next flush would then resurrect the old
-            // value over the fresh one)
             set_local_val(c, c->f->code.v[nx].imm.u32, R16);
             c->skip_next = 1;
             return;
@@ -1827,6 +1956,10 @@ static bool compile_function(JC *c) {
     c->def_count = 0;
     c->def_first = 0;
     c->def2_live = false;
+    c->def_first_reg = 0;
+    c->emit_a = R16; c->emit_b = R17;
+    c->in_place = false;
+    c->in_place_slot = -1;
     c->fused_cc = -1;
     c->skip_next = 0;
     for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) c->cache_map[i] = -1;
@@ -1960,7 +2093,11 @@ static bool compile_function(JC *c) {
             bool keep = c->skip_depth < 0 && c->reachable &&
                         (def_consumes(op) ||
                          (c->def_count == 1 && c->def_first &&
-                          is_def_producer(op) && defer1_possible(c, pc, n)) ||
+                          is_def_producer(op) &&
+                          (defer1_possible(c, pc, n) ||
+                           (c->wl_pass == 2 && !c->is_target[pc] &&
+                            !c->is_target[pc + 1] && pc + 1 < n &&
+                            def_consumes(c->f->code.v[pc + 1].opcode)))) ||
                          (c->def2_live && c->def_count == 0 &&
                           def2_producer_ok(c, in) && defer2_possible(c, pc, n)));
             if (keep && c->def2_live) {
@@ -2421,18 +2558,18 @@ static bool compile_function(JC *c) {
                 break;
             }
             if (c->def_count == 1 && c->def_first) {
-                load_local_val(c, R17, in->imm.u32);
-                c->def_kind1 = 1; c->def_count = 2; c->def_first = 0;
+                park_pair_second(c, in->imm.u32);
             } else if (c->def_count == 0 && c->def2_live && def2_producer_ok(c, in) &&
                        defer2_possible(c, pc, n)) {
-                load_local_val(c, R16, in->imm.u32); // middle of a def2 triple
-                c->def_kind0 = 1; c->def_count = 1; c->def_first = 1;
+                park_pair_first(c, in->imm.u32); // middle of a def2 triple
             } else if (c->def_count == 0 && defer1_possible(c, pc, n)) {
                 load_local_val(c, R17, in->imm.u32);
                 c->def_kind1 = 1; c->def_count = 1;
             } else if (c->def_count == 0 && defer2_possible(c, pc, n)) {
-                load_local_val(c, R16, in->imm.u32);
-                c->def_kind0 = 1; c->def_count = 1; c->def_first = 1;
+                park_pair_first(c, in->imm.u32);
+            } else if (c->def_count == 0 && local_cached_slot(c, in->imm.u32) >= 0 &&
+                       defer2_possible_head(c, pc, n)) {
+                park_pair_first(c, in->imm.u32); // cache-resident: target-safe
             } else {
                 load_local_val(c, R16, in->imm.u32);
                 push_x(e, R16);
@@ -3356,29 +3493,29 @@ static bool compile_scalar_op(JC *c, EaInstr *in) {
     // br_if when possible instead of materializing the bool
     case EA_OP_I32_EQZ:
         pop_w(e, R16); a64_cmp_imm32(e, R16, 0); cmp_result_w(c, CC_EQ); return true;
-    case EA_OP_I32_EQ: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_EQ); return true;
-    case EA_OP_I32_NE: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_NE); return true;
-    case EA_OP_I32_LT_S: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_LT); return true;
-    case EA_OP_I32_LT_U: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_LO); return true;
-    case EA_OP_I32_GT_S: pop_pair_w(c); a64_cmp_reg32(e, R17, R16); cmp_result_w(c, CC_LT); return true;
-    case EA_OP_I32_GT_U: pop_pair_w(c); a64_cmp_reg32(e, R17, R16); cmp_result_w(c, CC_LO); return true;
-    case EA_OP_I32_LE_S: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_LE); return true;
-    case EA_OP_I32_LE_U: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_LS); return true;
-    case EA_OP_I32_GE_S: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_GE); return true;
-    case EA_OP_I32_GE_U: pop_pair_w(c); a64_cmp_reg32(e, R16, R17); cmp_result_w(c, CC_HS); return true;
+    case EA_OP_I32_EQ: pop_pair_w(c); a64_cmp_reg32(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_EQ); return true;
+    case EA_OP_I32_NE: pop_pair_w(c); a64_cmp_reg32(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_NE); return true;
+    case EA_OP_I32_LT_S: pop_pair_w(c); a64_cmp_reg32(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_LT); return true;
+    case EA_OP_I32_LT_U: pop_pair_w(c); a64_cmp_reg32(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_LO); return true;
+    case EA_OP_I32_GT_S: pop_pair_w(c); a64_cmp_reg32(e, c->emit_b, c->emit_a); cmp_result_w(c, CC_LT); return true;
+    case EA_OP_I32_GT_U: pop_pair_w(c); a64_cmp_reg32(e, c->emit_b, c->emit_a); cmp_result_w(c, CC_LO); return true;
+    case EA_OP_I32_LE_S: pop_pair_w(c); a64_cmp_reg32(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_LE); return true;
+    case EA_OP_I32_LE_U: pop_pair_w(c); a64_cmp_reg32(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_LS); return true;
+    case EA_OP_I32_GE_S: pop_pair_w(c); a64_cmp_reg32(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_GE); return true;
+    case EA_OP_I32_GE_U: pop_pair_w(c); a64_cmp_reg32(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_HS); return true;
     // ---- i64 comparisons (result i32)
     case EA_OP_I64_EQZ:
         pop_x(e, R16); a64_cmp_reg64(e, R16, 31); cmp_result_w(c, CC_EQ); return true;
-    case EA_OP_I64_EQ: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_EQ); return true;
-    case EA_OP_I64_NE: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_NE); return true;
-    case EA_OP_I64_LT_S: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_LT); return true;
-    case EA_OP_I64_LT_U: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_LO); return true;
-    case EA_OP_I64_GT_S: pop_pair_x(c); a64_cmp_reg64(e, R17, R16); cmp_result_w(c, CC_LT); return true;
-    case EA_OP_I64_GT_U: pop_pair_x(c); a64_cmp_reg64(e, R17, R16); cmp_result_w(c, CC_LO); return true;
-    case EA_OP_I64_LE_S: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_LE); return true;
-    case EA_OP_I64_LE_U: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_LS); return true;
-    case EA_OP_I64_GE_S: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_GE); return true;
-    case EA_OP_I64_GE_U: pop_pair_x(c); a64_cmp_reg64(e, R16, R17); cmp_result_w(c, CC_HS); return true;
+    case EA_OP_I64_EQ: pop_pair_x(c); a64_cmp_reg64(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_EQ); return true;
+    case EA_OP_I64_NE: pop_pair_x(c); a64_cmp_reg64(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_NE); return true;
+    case EA_OP_I64_LT_S: pop_pair_x(c); a64_cmp_reg64(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_LT); return true;
+    case EA_OP_I64_LT_U: pop_pair_x(c); a64_cmp_reg64(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_LO); return true;
+    case EA_OP_I64_GT_S: pop_pair_x(c); a64_cmp_reg64(e, c->emit_b, c->emit_a); cmp_result_w(c, CC_LT); return true;
+    case EA_OP_I64_GT_U: pop_pair_x(c); a64_cmp_reg64(e, c->emit_b, c->emit_a); cmp_result_w(c, CC_LO); return true;
+    case EA_OP_I64_LE_S: pop_pair_x(c); a64_cmp_reg64(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_LE); return true;
+    case EA_OP_I64_LE_U: pop_pair_x(c); a64_cmp_reg64(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_LS); return true;
+    case EA_OP_I64_GE_S: pop_pair_x(c); a64_cmp_reg64(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_GE); return true;
+    case EA_OP_I64_GE_U: pop_pair_x(c); a64_cmp_reg64(e, c->emit_a, c->emit_b); cmp_result_w(c, CC_HS); return true;
     // ---- f32/f64 comparisons
     case EA_OP_F32_EQ: emit_fcmp32(c, CC_EQ, false); return true;
     case EA_OP_F32_NE: emit_fcmp32(c, CC_NE, true); return true;
@@ -3393,15 +3530,15 @@ static bool compile_scalar_op(JC *c, EaInstr *in) {
     case EA_OP_F64_LE: emit_fcmp64(c, CC_LE); return true;
     case EA_OP_F64_GE: emit_fcmp64(c, CC_GE); return true;
     // ---- i32 arithmetic
-    case EA_OP_I32_ADD: pop_pair_w(c); a64_add_reg32(e, R16, R16, R17); push_result_w(c); return true;
-    case EA_OP_I32_SUB: pop_pair_w(c); a64_sub_reg32(e, R16, R16, R17); push_result_w(c); return true;
-    case EA_OP_I32_MUL: pop_pair_w(c); a64_madd32(e, R16, R16, R17, 31); push_result_w(c); return true;
-    case EA_OP_I32_AND: pop_pair_w(c); a64_and_reg32(e, R16, R16, R17); push_result_w(c); return true;
-    case EA_OP_I32_OR: pop_pair_w(c); a64_orr_reg32(e, R16, R16, R17); push_result_w(c); return true;
-    case EA_OP_I32_XOR: pop_pair_w(c); a64_eor_reg32(e, R16, R16, R17); push_result_w(c); return true;
-    case EA_OP_I32_SHL: pop_pair_w(c); a64_lslv32(e, R16, R16, R17); if (c->def2_live) flush_deferred(c); push_w(e, R16); return true;
-    case EA_OP_I32_SHR_S: pop_pair_w(c); a64_asrv32(e, R16, R16, R17); if (c->def2_live) flush_deferred(c); push_w(e, R16); return true;
-    case EA_OP_I32_SHR_U: pop_pair_w(c); a64_lsrv32(e, R16, R16, R17); if (c->def2_live) flush_deferred(c); push_w(e, R16); return true;
+    case EA_OP_I32_ADD: { uint32_t d = binop_dst(c, in); pop_pair_w(c); a64_add_reg32(e, d, c->emit_a, c->emit_b); push_result_w(c); return true; }
+    case EA_OP_I32_SUB: { uint32_t d = binop_dst(c, in); pop_pair_w(c); a64_sub_reg32(e, d, c->emit_a, c->emit_b); push_result_w(c); return true; }
+    case EA_OP_I32_MUL: { uint32_t d = binop_dst(c, in); pop_pair_w(c); a64_madd32(e, d, c->emit_a, c->emit_b, 31); push_result_w(c); return true; }
+    case EA_OP_I32_AND: { uint32_t d = binop_dst(c, in); pop_pair_w(c); a64_and_reg32(e, d, c->emit_a, c->emit_b); push_result_w(c); return true; }
+    case EA_OP_I32_OR: { uint32_t d = binop_dst(c, in); pop_pair_w(c); a64_orr_reg32(e, d, c->emit_a, c->emit_b); push_result_w(c); return true; }
+    case EA_OP_I32_XOR: { uint32_t d = binop_dst(c, in); pop_pair_w(c); a64_eor_reg32(e, d, c->emit_a, c->emit_b); push_result_w(c); return true; }
+    case EA_OP_I32_SHL: { uint32_t d = binop_dst(c, in); pop_pair_w(c); a64_lslv32(e, d, c->emit_a, c->emit_b); if (c->in_place) in_place_finish(c); else { if (c->def2_live) flush_deferred(c); push_w(e, R16); } return true; }
+    case EA_OP_I32_SHR_S: { uint32_t d = binop_dst(c, in); pop_pair_w(c); a64_asrv32(e, d, c->emit_a, c->emit_b); if (c->in_place) in_place_finish(c); else { if (c->def2_live) flush_deferred(c); push_w(e, R16); } return true; }
+    case EA_OP_I32_SHR_U: { uint32_t d = binop_dst(c, in); pop_pair_w(c); a64_lsrv32(e, d, c->emit_a, c->emit_b); if (c->in_place) in_place_finish(c); else { if (c->def2_live) flush_deferred(c); push_w(e, R16); } return true; }
     case EA_OP_I32_ROTR: pop_w(e, R17); pop_w(e, R16); a64_rorv32(e, R16, R16, R17); push_w(e, R16); return true;
     case EA_OP_I32_ROTL: {
         pop_w(e, R17); pop_w(e, R16);
@@ -3420,15 +3557,15 @@ static bool compile_scalar_op(JC *c, EaInstr *in) {
         a64_mov_reg32(e, R16, R0);
     } push_w(e, R16); return true;
     // ---- i64 arithmetic
-    case EA_OP_I64_ADD: pop_pair_x(c); a64_add_reg64(e, R16, R16, R17); push_result_x(c); return true;
-    case EA_OP_I64_SUB: pop_pair_x(c); a64_sub_reg64(e, R16, R16, R17); push_result_x(c); return true;
-    case EA_OP_I64_MUL: pop_pair_x(c); a64_madd64(e, R16, R16, R17, 31); push_result_x(c); return true;
-    case EA_OP_I64_AND: pop_pair_x(c); a64_and_reg64(e, R16, R16, R17); push_result_x(c); return true;
-    case EA_OP_I64_OR: pop_pair_x(c); a64_orr_reg64(e, R16, R16, R17); push_result_x(c); return true;
-    case EA_OP_I64_XOR: pop_pair_x(c); a64_eor_reg64(e, R16, R16, R17); push_result_x(c); return true;
-    case EA_OP_I64_SHL: pop_pair_x(c); a64_lslv64(e, R16, R16, R17); if (c->def2_live) flush_deferred(c); push_x(e, R16); return true;
-    case EA_OP_I64_SHR_S: pop_pair_x(c); a64_asrv64(e, R16, R16, R17); if (c->def2_live) flush_deferred(c); push_x(e, R16); return true;
-    case EA_OP_I64_SHR_U: pop_pair_x(c); a64_lsrv64(e, R16, R16, R17); if (c->def2_live) flush_deferred(c); push_x(e, R16); return true;
+    case EA_OP_I64_ADD: { uint32_t d = binop_dst(c, in); pop_pair_x(c); a64_add_reg64(e, d, c->emit_a, c->emit_b); push_result_x(c); return true; }
+    case EA_OP_I64_SUB: { uint32_t d = binop_dst(c, in); pop_pair_x(c); a64_sub_reg64(e, d, c->emit_a, c->emit_b); push_result_x(c); return true; }
+    case EA_OP_I64_MUL: { uint32_t d = binop_dst(c, in); pop_pair_x(c); a64_madd64(e, d, c->emit_a, c->emit_b, 31); push_result_x(c); return true; }
+    case EA_OP_I64_AND: { uint32_t d = binop_dst(c, in); pop_pair_x(c); a64_and_reg64(e, d, c->emit_a, c->emit_b); push_result_x(c); return true; }
+    case EA_OP_I64_OR: { uint32_t d = binop_dst(c, in); pop_pair_x(c); a64_orr_reg64(e, d, c->emit_a, c->emit_b); push_result_x(c); return true; }
+    case EA_OP_I64_XOR: { uint32_t d = binop_dst(c, in); pop_pair_x(c); a64_eor_reg64(e, d, c->emit_a, c->emit_b); push_result_x(c); return true; }
+    case EA_OP_I64_SHL: { uint32_t d = binop_dst(c, in); pop_pair_x(c); a64_lslv64(e, d, c->emit_a, c->emit_b); if (c->in_place) in_place_finish(c); else { if (c->def2_live) flush_deferred(c); push_x(e, R16); } return true; }
+    case EA_OP_I64_SHR_S: { uint32_t d = binop_dst(c, in); pop_pair_x(c); a64_asrv64(e, d, c->emit_a, c->emit_b); if (c->in_place) in_place_finish(c); else { if (c->def2_live) flush_deferred(c); push_x(e, R16); } return true; }
+    case EA_OP_I64_SHR_U: { uint32_t d = binop_dst(c, in); pop_pair_x(c); a64_lsrv64(e, d, c->emit_a, c->emit_b); if (c->in_place) in_place_finish(c); else { if (c->def2_live) flush_deferred(c); push_x(e, R16); } return true; }
     case EA_OP_I64_ROTR: pop_x(e, R17); pop_x(e, R16); a64_rorv64(e, R16, R16, R17); push_x(e, R16); return true;
     case EA_OP_I64_ROTL: {
         pop_x(e, R17); pop_x(e, R16);
@@ -3454,6 +3591,7 @@ static bool compile_scalar_op2(JC *c, EaInstr *in) {
     case EA_OP_I32_CONST:
         if (c->def_count == 1 && c->def_first) {
             a64_mov32_imm(e, R17, in->imm.u32);
+            c->def_second_reg = 0;
             c->def_kind1 = 0; c->def_count = 2; c->def_first = 0;
         } else if (c->def_count == 0 && c->def2_live && defer2_possible(c, c->cur_pc, c->f->code.n)) {
             a64_mov32_imm(e, R16, in->imm.u32); // middle of a def2 triple
@@ -3472,6 +3610,7 @@ static bool compile_scalar_op2(JC *c, EaInstr *in) {
     case EA_OP_I64_CONST:
         if (c->def_count == 1 && c->def_first) {
             a64_mov64_imm(e, R17, in->imm.u64);
+            c->def_second_reg = 0;
             c->def_kind1 = 1; c->def_count = 2; c->def_first = 0;
         } else if (c->def_count == 0 && c->def2_live && defer2_possible(c, c->cur_pc, c->f->code.n)) {
             a64_mov64_imm(e, R16, in->imm.u64); // middle of a def2 triple
