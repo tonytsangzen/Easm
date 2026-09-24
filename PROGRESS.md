@@ -1339,3 +1339,42 @@ dump（ea_h_spdump）。实现中捕获 ARM64 编码陷阱：**mov_reg64 对 31 
 以稳定触发方式（编译期 env 缓存 + 无条件发射 + flag 判断）重做。
 
 三模式 257/258 复验（工具对语义无影响）。
+
+## 迭代 38：else 体从未被 JIT 发射——系统性 bail 暗面修复（2026-09-25，已合入）
+
+spdump 触发排查的意外收获:sat 最小模块 `[SP]` 不出现 + EA_JIT_STATS
+揭示 **func 1 JIT bail**。根因不是轨迹工具,而是两个从 init 就存在的
+JIT 编译器缺陷——语义测试全绿是解释器兜底造成的暗面:
+
+1. **else 体跳过**(影响所有含非空 else 的 if):主发射路径 ELSE case
+   `pc = end_idx; continue` 直接跳过 else 体发射,而 IF 的假分支
+   fixup 目标恰为 else_idx+1(else 体首条)→ insn_at 恒 UINT32_MAX →
+   fixup 解析失败 → 整函数 bail 回解释器。if.wast 38/53 函数 bail。
+   修复 = 删除跳转,`depth = height + arity_in` 后正常发射 else 体
+   (else 体栈基 = 块基 + 输入元数,then 体结果不在栈上;死代码路径
+   2311 行早已是正确语义,主路径对齐之)。
+
+2. **函数级 br fixup off-by-one**:BR/BR_IF/br_label_target 的函数级
+   `tpc = c->n_pc`,但隐式 end 记录位是 `insn_at[n]`(n = n_pc-1)→
+   裸 br 到函数 label 必 fixup miss。修复 = tpc 改 `c->n_pc - 1`;
+   同时函数尾部 return 序列改为**无条件发射**(原 `if (reachable)` 在
+   体以 br 结尾时不记录 insn_at[n],fixup 仍 miss)。
+
+量化影响(修复前 → 后):if 15/38 → **53/0**;func 99/18 → **117/0**;
+br_if 63/0;br_table 78/0;block/loop/select/call/return/br/unreachable
+全部 0 bail。此前 JIT 覆盖率统计(含性能归因)在控制流密集代码上失真;
+bench 五内核无数值变化(内核无 else/函数级 br,符合预期)。
+
+附带:ea_wdbg2_on() 编译期 env 缓存推广至 pre-call 钩子;[SP] dump
+首次实测成功,确认 CALL 边界槽序公式——**第 k 参数在
+[sp+(a-1-k)*16],第 k 结果同**(sp=参数区末/结果区首,逆序)。
+
+验证:解释器/JIT 双模式 257/258(br_on_cast_fail 仍为转换失败,
+非运行失败)+ WASI 15/15。
+
+### HIR-3 前提修正
+
+迭代 32-37 对 add64_u_saturated 的调查建立在一个未验证假设上——
+调用方被 JIT 执行。实际该调用链含 else,**此前从未进入 JIT**。
+HIR-2 下 sat 模块现已全 JIT 且语义正确,HIR-3 的 CALL 边界重定位
+对比可在真实 JIT 执行上重做;槽序公式(见上)已实测入库。

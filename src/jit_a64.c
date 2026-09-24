@@ -751,6 +751,11 @@ static int ea_ctrace_on(void) { // compile-time decision trace (EA_CTRACE)
     if (on < 0) on = getenv("EA_CTRACE") != NULL;
     return on;
 }
+static int ea_wdbg2_on(void) { // runtime layout dumps (EA_WDBG2)
+    static int on = -1;
+    if (on < 0) on = getenv("EA_WDBG2") != NULL;
+    return on;
+}
 #define CTRACE(c, ...) do { if (ea_ctrace_on()) fprintf(stderr, "[CT] f%u pc=%u " __VA_ARGS__); } while (0)
 // a physical push materializes pending refs first: a deeper virtual value
 // can only land ABOVE entries that already exist on the stack, so it must
@@ -1865,6 +1870,9 @@ static void eh_emit_stubs(JC *c) {
 }
 
 static void emit_call_static(JC *c, EaInstr *in) {
+    if (ea_ctrace_on())
+        fprintf(stderr, "[CT] call_static f%u pc=%u pass=%u callee=%u wdbg=%d\n",
+                c->fn_idx, c->cur_pc, c->wl_pass, in->imm.u32, ea_wdbg2_on());
     uint32_t callee = in->imm.u32;
     uint32_t a = 0, r = 0;
     if (callee < c->m->n_funcs) {
@@ -1875,9 +1883,9 @@ static void emit_call_static(JC *c, EaInstr *in) {
         jfail(c, "bad callee");
         return;
     }
-    if (getenv("EA_WDBG2")) { // pre-call: the args' materialized layout
+    if (ea_wdbg2_on()) { // pre-call: the args' materialized layout
         a64_movz32(&c->em, R0, 1);
-        a64_mov_reg64(&c->em, R1, SP);
+        a64_add_imm64(&c->em, R1, SP, 0); // NOT mov_reg64: 31 encodes XZR there
         call_helper(c, (const void *)ea_h_spdump);
     }
     uint32_t foff = __builtin_offsetof(EaInstance, funcs);
@@ -1932,7 +1940,7 @@ static void emit_call_static(JC *c, EaInstr *in) {
         if (a > r) a64_add_imm64(&c->em, SP, SP, (a - r) * SLOT);
         uint32_t join2 = c->em.len;
         c->em.buf[skip_at] = 0x14000000 | ((join2 - skip_at) & 0x3FFFFFF);
-        if (getenv("EA_WDBG2")) { // post-call: the results' layout
+        if (ea_wdbg2_on()) { // post-call: the results' layout
             a64_movz32(&c->em, R0, 2);
             a64_add_imm64(&c->em, R1, SP, 0);
             call_helper(c, (const void *)ea_h_spdump);
@@ -2049,7 +2057,7 @@ static void emit_helper3(JC *c, const void *helper, uint32_t imm0, uint32_t imm1
 static void br_label_target(JC *c, uint32_t l, uint32_t *theight, uint32_t *tarity,
                             bool *tloop, uint32_t *tpc) {
     if (l >= c->csp) { // function-level label: return with the function's results
-        *theight = 0; *tarity = c->n_res; *tloop = false; *tpc = c->n_pc;
+        *theight = 0; *tarity = c->n_res; *tloop = false; *tpc = c->n_pc - 1;
         return;
     }
     *theight = c->ctrl[c->csp - 1 - l].height;
@@ -2477,14 +2485,18 @@ static bool compile_function(JC *c) {
             break;
         }
         case EA_OP_ELSE:
-            // taken-branch fallthrough: jump to end
+            // taken-branch fallthrough: jump to end.  The false branch
+            // (fix_cond_to_pc targeted else_idx + 1) lands on the else body,
+            // which the loop now emits — the else body's logical stack starts
+            // from the block base + its input arity (the then body's results
+            // are NOT on the stack here).
             c->depth = c->ctrl[c->csp - 1].height + c->ctrl[c->csp - 1].rarity;
             {
                 em_b_label(e, 0);
                 fix_to_pc(c, c->ctrl[c->csp - 1].end_idx);
             }
-            pc = c->ctrl[c->csp - 1].end_idx; // emit join label there
-            continue;                          // skip pc++ (label recorded next iteration)
+            c->depth = c->ctrl[c->csp - 1].height + c->ctrl[c->csp - 1].arity_in;
+            break;
         case EA_OP_END:
             if (c->csp > 0) {
                 // normal exit of a try_table: drop its handler.  Branch
@@ -2551,7 +2563,7 @@ static bool compile_function(JC *c) {
                 theight = 0;
                 tarity = c->n_res;
                 tloop = false;
-                tpc = c->n_pc; // implicit end (emit_return tail)
+                tpc = c->n_pc - 1; // implicit end (emit_return tail)
             } else {
                 theight = c->ctrl[c->csp - 1 - l].height;
                 tarity = c->ctrl[c->csp - 1 - l].arity;
@@ -2577,7 +2589,7 @@ static bool compile_function(JC *c) {
                 theight = 0;
                 tarity = c->n_res;
                 tloop = false;
-                tpc = c->n_pc;
+                tpc = c->n_pc - 1;
             } else {
                 theight = c->ctrl[c->csp - 1 - l].height;
                 tarity = c->ctrl[c->csp - 1 - l].arity;
@@ -2871,10 +2883,10 @@ static bool compile_function(JC *c) {
         }
         pc++;
     }
-    if (c->reachable) {
-        c->insn_at[n] = e->len;
-        emit_return(c);
-    }
+    // unconditional: function-level br/br_if/br_table fixups target insn_at[n]
+    // even when the fallthrough tail is unreachable (body ended in a br)
+    c->insn_at[n] = e->len;
+    emit_return(c);
     // private return sequence for catch clauses that target the function-level
     // label (they land here with the payload as the results)
     if (c->n_eh_fx > 0) {
@@ -4131,7 +4143,12 @@ static bool compile_one_function(JC *c) {
     for (uint32_t i = 0; i < c->nfx; i++) {
         uint32_t at = c->fx[i].at;
         uint32_t target = c->insn_at[c->fx[i].target_pc];
-        if (target == UINT32_MAX) return false;
+        if (target == UINT32_MAX) {
+            if (getenv("EA_JIT_STATS"))
+                fprintf(stderr, "JIT fixup miss f%u fix#%u at=%u -> pc=%u\n",
+                        c->fn_idx, i, at, c->fx[i].target_pc);
+            return false;
+        }
         int64_t off = (int64_t)target - (int64_t)at;
         if (c->fx[i].cond)
             c->em.buf[at] |= ((uint32_t)(off & 0x7FFFF) << 5) | (c->fx[i].ccode & 0xF);
