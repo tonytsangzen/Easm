@@ -1304,3 +1304,27 @@ warm 回边免物化、emit_return 拷贝、头部 park 放宽、ref 序。
 未定位：add64_u_saturated 调用链的 2 assert（需 f50 反汇编 + CTRACE
 对账，或 EA_WDBG2 挂 CALL 边界）。两者均为实现级调试，设计本身
 （描述符栈 + 槽位感知）未被否定——22 条 sum 内环形态保持可达。
+
+## 迭代 36：add64_u_saturated 调用链定位（2026-09-24，留档）
+
+HIR-3 重放 + f50 反汇编逐指令核对：调用序列 = args 入栈（42-47，cref
+层下仅 const 物理入栈）→ callee 检查（48-54）→ 直接/桥接双路径
+（55-63 / 64-73）→ 结果读（78-88）。add #48 清理、结果覆盖 args 顶槽、
+pops 时序在 HIR-2（push 即溢出）与 HIR-3（push 计数 + 重定位物化）下
+形式一致——纸面推演再次均判正确，失败需 CALL 边界的运行时轨迹。
+
+**回退至 73730c3 + 轨迹工具语义**（三模式 257/258 + 全部微测试复验）。
+
+### 下会话唯一调试点
+
+CALL 边界运行时轨迹：EA_WDBG2 增加 CALL 前后挂点（wa dump 扩展为
+sp/args/results 三点），对比 HIR-2 与 HIR-3 的 add64_u_saturated
+运行时栈布局差异。失败形态已锁定：got = carry 派生值（1），即
+多值结果 (k, carry) 的读取错位——FLUSH 重定位后 CALL 参数区与结果区
+的槽位映射需描述符化（迭代 32 清单第 2 条的具体化）。
+
+### 已验证部件清单（HIR-3 落地时直接复用）
+
+重定位序列（含 ref 序修正）、LIFO pop 规则、push 计数、warm 回边免
+物化、emit_return 拷贝、头部 park 放宽、imm12 融合、直发 park、
+EA_CTRACE/EA_WDBG2 轨迹工具。
