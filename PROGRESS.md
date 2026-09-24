@@ -1285,3 +1285,22 @@ EA_CTRACE 间歇性（~25% 运行，ASLR 相关）打印垃圾 fn_idx/cur_pc
 HIR-3 状态重申：第三次尝试的 if.wast 失败 = 槽位索引问题（迭代 32
 根因），与垃圾打印无关（无 CTRACE 时同样失败）。正解 = 完整描述符栈
 + 槽位感知（迭代 32 清单），为下一次大改版。
+
+## 迭代 35：HIR-3 第四次尝试 — emit_return 核实与收尾（2026-09-24）
+
+重放重定位模型（ref 序已修正）：radix 转绿 ✓；if.wast 仅剩
+add64_u_saturated 调用链 2 assert。逐指令核对 emit_return 的多值
+拷贝：`ldp [sp + (n_res-1-i)*16]` 在重定位布局下**正确**（低 8 位 =
+值、高 8 位 = 消费者不读的陈旧半区——源码注释明示）——失败点在
+add64_u_saturated 调用链的其他环节（候选：CALL 的参数弹出与 cref
+物化交错、调用方自身 cref/window 状态、多层调用结果区）。
+
+**回退至 73730c3 + 轨迹工具语义**（三模式 257/258 + 全部微测试复验）。
+
+### HIR-3 状态盘点（四次尝试后）
+
+已验证正确的部件：重定位序列（sub/ldr/str + ref 序）、LIFO pop 规则、
+warm 回边免物化、emit_return 拷贝、头部 park 放宽、ref 序。
+未定位：add64_u_saturated 调用链的 2 assert（需 f50 反汇编 + CTRACE
+对账，或 EA_WDBG2 挂 CALL 边界）。两者均为实现级调试，设计本身
+（描述符栈 + 槽位感知）未被否定——22 条 sum 内环形态保持可达。
