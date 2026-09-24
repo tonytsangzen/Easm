@@ -1251,3 +1251,25 @@ cref 层序交互），需要运行时寄存器轨迹（EA_WDBG2 挂点改造）
 3. 物化（flush）= 重定位（本轮已验证的 sub/ldr/str 序列 + 正确 ref 序）；
 4. warm 回边免物化（cref 按局部索引解析，pin 透明——已验证）；
 5. 预估：sum 内环 27→~15 条、与 wasmtime < 2×；matmul FP 同批。
+
+## 迭代 33：HIR-3 第三次尝试 — 复现、轨迹线索与收尾（2026-09-24）
+
+重放重定位溢出模型（含修正后的 ref 序）：radix 之外的微测试全过，
+radix 2 assert 复现 ✓（可稳定复现 = 可调试）。EA_CTRACE 首次对账
+if.wast 编译期决策流，捕获异常线索：**push_result_x 在 f0/f2 的
+cur_pc/fn_idx 打印为垃圾值（0x3FFF0000 系）**——疑似 JC 字段偏移、
+编译上下文残留或 warm 重绕路径的 cur_pc 未设置——尚未确证，但这是
+radix/if.wast 交叉问题的第一条运行前线索。
+
+环境修复：机器重启清 /tmp 致 wast_convert.py 的 wasm-tools 丢失
+（25 文件假象性转换失败）→ brew 持久安装 + PATH 回退链（重启免疫）。
+
+**回退至 73730c3 + 轨迹工具语义**（三模式 257/258 + 全部微测试复验）。
+
+### 下会话开工序列（HIR-3 第四次）
+
+1. 先查垃圾 cur_pc 线索：CTRACE 的 f0/f2 异常打印 → 定位 push_result_x
+   的非常规调用点（怀疑 warm 重绕或 JC 复用路径 cur_pc 未刷新）；
+2. 修复后重放 HIR-3（本轮编辑序列可直接复用，ref 序已修正）；
+3. if.wast add64 形态 = 验证靶（多值返回 + 同局部双取 + RETURN flush）；
+4. 收益锚点：sum 内环 27→22 已证，表达式链 7 条 = wasmtime 同档。
