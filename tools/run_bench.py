@@ -42,8 +42,8 @@ def main():
     easm = str(ROOT / "build" / "easm")
     env_int = {"PATH": "/usr/bin:/bin:/usr/sbin", "HOME": __import__("os").environ.get("HOME", "")}
     env_jit = dict(env_int, EA_JIT="1")
-    # EA_CACHE/EA_WARM experiments: run_bench.py jit-cache / jit-warm
-    extra = {k: "1" for k in sys.argv[2:] if k in ("EA_CACHE", "EA_WARM")}
+    # experiment channels: run_bench.py jit EA_NOCACHE / EA_NOWARM / ...
+    extra = {k: "1" for k in sys.argv[2:] if k.startswith("EA_")}
     env_jit.update(extra)
 
     print(f"{'kernel':10} {'easm-jit':>10} {'easm-int':>10} {'wasmtime':>10} {'node':>10}   (seconds, lower is better)")

@@ -102,9 +102,13 @@ build/easm wast path/to/case.json [-v]
 
 # 环境变量
 EA_JIT=1         启用 JIT（默认解释器）
+EA_NOCACHE=1     关闭局部寄存器缓存（x19–x24，默认开启）
+EA_NOWARM=1      关闭 warm 两遍循环编译（默认开启）
 EA_JIT_STATS=1   编译/调用统计（bail 原因、尾调用追踪）
 EA_JIT_DUMP=1    dump JIT 机器码（可用 llvm-mc --disassemble 反汇编阅读）
 EA_JIT_TRACE=1   跟踪 JIT 执行
+EA_CTRACE=1      编译期决策轨迹（spill/park/调用点）
+EA_CODE_DUMP=1   逐函数机器码导出到 /tmp/jitf/f<N>.bin
 ```
 
 ## 测试与基准
@@ -115,7 +119,7 @@ python3 tools/run_spec.py -j 8 --jit    # JIT 模式（每文件真正跑 JIT �
 python3 tools/run_bench.py all          # JIT / 解释器 / wasmtime / node 对比
 ```
 
-### 当前状态（2026-09-23，详见 [PROGRESS.md](PROGRESS.md)）
+### 当前状态（2026-09-25，详见 [PROGRESS.md](PROGRESS.md)）
 
 **覆盖率**（官方 spec 套件，258 个 wast 文件，双模式）：
 
