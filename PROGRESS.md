@@ -1328,3 +1328,14 @@ sp/args/results 三点），对比 HIR-2 与 HIR-3 的 add64_u_saturated
 重定位序列（含 ref 序修正）、LIFO pop 规则、push 计数、warm 回边免
 物化、emit_return 拷贝、头部 park 放宽、imm12 融合、直发 park、
 EA_CTRACE/EA_WDBG2 轨迹工具。
+
+## 迭代 37：CALL 边界轨迹工具（2026-09-24，已合入）
+
+EA_WDBG2 新增 emit_call_static 内 pre-call/post-call 双点 sp+槽内容
+dump（ea_h_spdump）。实现中捕获 ARM64 编码陷阱：**mov_reg64 对 31 号
+寄存器生成 ORR-XZR 形式（读出恒 0），SP 必须走 ADD-imm 形式**
+（a64_add_imm64(R1, SP, 0)）。轨迹钩子就位但动态触发尚不稳定
+（getenv 内嵌于发射码，间歇），HIR-2/HIR-3 栈布局对比留待下会话
+以稳定触发方式（编译期 env 缓存 + 无条件发射 + flag 判断）重做。
+
+三模式 257/258 复验（工具对语义无影响）。

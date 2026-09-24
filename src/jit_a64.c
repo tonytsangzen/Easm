@@ -15,6 +15,8 @@
 #include <pthread.h>
 #include <libkern/OSCacheControl.h>
 
+void ea_h_spdump(uint64_t tag, uint64_t sp);
+
 // ---------------------------------------------------------------- code region
 static uint8_t *g_code = NULL;
 static size_t g_code_len = 0, g_code_cap = 0;
@@ -197,6 +199,12 @@ EaEhRet ea_jit_eh_resume(EaExec *ex, EaInstance *inst, void *fp) {
     }
     ex->pending_exn = NULL;
     return eh_dispatch(ex, px, fp);
+}
+void ea_h_spdump(uint64_t tag, uint64_t sp) {
+    fprintf(stderr, "[SP] tag=%llu sp=%llu slots:", (unsigned long long)tag, (unsigned long long)sp);
+    for (int i = 0; i < 6; i++)
+        fprintf(stderr, " %llu", (unsigned long long)((uint64_t *)sp)[i]);
+    fprintf(stderr, "\n");
 }
 void ea_h_wdump6(uint64_t fp, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
     // fp points at the JIT frame; locals live at [fp-32-16*(nloc-k)] — we
@@ -1867,6 +1875,11 @@ static void emit_call_static(JC *c, EaInstr *in) {
         jfail(c, "bad callee");
         return;
     }
+    if (getenv("EA_WDBG2")) { // pre-call: the args' materialized layout
+        a64_movz32(&c->em, R0, 1);
+        a64_mov_reg64(&c->em, R1, SP);
+        call_helper(c, (const void *)ea_h_spdump);
+    }
     uint32_t foff = __builtin_offsetof(EaInstance, funcs);
     uint32_t isz = (uint32_t)sizeof(EaFuncInst);
     a64_ldr_imm64(&c->em, R16, R28, foff);                     // funcs array
@@ -1919,6 +1932,11 @@ static void emit_call_static(JC *c, EaInstr *in) {
         if (a > r) a64_add_imm64(&c->em, SP, SP, (a - r) * SLOT);
         uint32_t join2 = c->em.len;
         c->em.buf[skip_at] = 0x14000000 | ((join2 - skip_at) & 0x3FFFFFF);
+        if (getenv("EA_WDBG2")) { // post-call: the results' layout
+            a64_movz32(&c->em, R0, 2);
+            a64_add_imm64(&c->em, R1, SP, 0);
+            call_helper(c, (const void *)ea_h_spdump);
+        }
         reload_ctx(c);
     }
 }
