@@ -508,6 +508,11 @@ def convert(in_path, out_path, wasm_tools):
 if __name__ == '__main__':
     args = sys.argv[1:]
     wt = '/tmp/wasm-tools-1.259.0-aarch64-macos/wasm-tools'
+    if not os.path.exists(wt):  # /tmp is volatile; fall back to PATH
+        import shutil
+        found = shutil.which('wasm-tools')
+        if found:
+            wt = found
     if '--wasm-tools' in args:
         i = args.index('--wasm-tools')
         wt = args[i + 1]

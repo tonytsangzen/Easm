@@ -1217,3 +1217,37 @@ cref 层序交互），需要运行时寄存器轨迹（EA_WDBG2 挂点改造）
 - bench 墙钟持平（sum 0.069）：依赖链 1 周期/迭代为瓶颈，指令数已
   不在关键路径——代码密度收益真实，性能收益待 HIR-3 的跨语句驻留。
 - 三模式 257/258、解释器 257/258、WASI 15/15 零回归。
+
+## 迭代 32：HIR-3 第三次尝试 — 轨迹定位两连破（2026-09-24，部分合入 + 否定留档）
+
+轨迹工具首次实战即回本：
+
+1. **radix 一行修复**：EA_CTRACE 的 `reloc nc=2 np=0` 快照暴露 reloc 存储
+   序反转——`cref_reg(i)` 存到 `[sp+16*(np+i)]` 把最深 ref 放最低地址，
+   而 pre-decrement 栈语义下最深 = 最高地址。修复 =
+   `[sp+16*(np+nc-1-i)]`。radix 即刻转绿。
+2. **if.wast 槽位索引根因**（add64_u_with_carry 多值返回，EA_CACHE/
+   EA_WARM 2 assert）：反汇编逐指令对账确认——重定位溢出的物理布局为
+   `[window | pushes | refs]`（地址递减），而 emit_br_to/emit_return 的
+   多值返回拷贝、peek_x 等全部假设 `[sp + slot*16]` 无偏移索引——
+   slot k 的物理位置变为 `16*(n_mat + push_above(k))`。这正是预估的
+   「位置感知槽计算」——**部分实现（重定位溢出）无法局部修复，必须
+   全量落地槽位感知**。
+
+**回退至 73730c3 语义**（三模式 257/258 + 全部微测试复验）。
+
+### 环境修复（附带）
+
+机器重启清空 /tmp，wast_convert.py 依赖的 wasm-tools 二进制丢失 →
+25 个文件转换失败（假象性 233/258）。修复：brew install wasm-tools
+（持久）+ 脚本 PATH 回退链。教训：工具链依赖不得放 /tmp。
+
+### HIR-3 最终形态（下次实现清单）
+
+1. 描述符栈：`ops[N] = {kind: PHYS/WIN/CACHE, reg, local}`，push/pop
+   全走描述符（LIFO 由数组天然保证，不再需要 n_pushed 计数）；
+2. **槽位感知**：PHYS 条目的地址 = `[sp + 16*(其上 PHYS/WIN 条目数 +
+   n_mat)]`——emit_br_to/emit_return/peek 全部改走描述符计算；
+3. 物化（flush）= 重定位（本轮已验证的 sub/ldr/str 序列 + 正确 ref 序）；
+4. warm 回边免物化（cref 按局部索引解析，pin 透明——已验证）；
+5. 预估：sum 内环 27→~15 条、与 wasmtime < 2×；matmul FP 同批。
