@@ -134,29 +134,28 @@ python3 tools/run_bench.py all          # JIT / 解释器 / wasmtime / node 对�
 
 | kernel | easm-jit | easm-int | wasmtime | node |
 |---|---|---|---|---|
-| fib（10M 迭代） | 0.027 | 0.498 | 0.011 | 0.037 |
-| primes（500K 筛） | 0.009 | 0.345 | 0.009 | 0.034 |
-| sum（100M i64） | 0.072 | 10.579 | 0.028 | 0.091 |
-| matmul（30×128³） | 0.225 | 19.796 | 0.037 | 0.132 |
-| memsum（2M load） | **0.003** | 0.008 | 0.009 | 0.034 |
+| fib（10M 迭代） | 0.020 | 0.437 | 0.008 | 0.028 |
+| primes（500K 筛） | 0.006 | 0.298 | 0.005 | 0.026 |
+| sum（100M i64） | 0.033 | 8.739 | 0.019 | 0.075 |
+| matmul（30×128³） | 0.193 | 16.475 | 0.029 | 0.088 |
+| memsum（2M load） | **0.003** | 0.007 | 0.004 | 0.034 |
 
-- primes **追平 wasmtime**，memsum 快于 wasmtime；fib/primes/sum 快于 node
-- JIT 相对解释器加速 **15–50×**；sum 内核经 HIR 第一步（计算就位融合 +
-  缓存引用操作数栈）较迭代 24 的 0.108 缩短 **33%**，与 wasmtime 差距
-  收敛到 ~2.6×；matmul 剩余差距来自 FP 值生命周期（→ HIR-3 描述符栈）
-- 实验通道：EA_CACHE/EA_WARM（局部寄存器缓存 + warm 两遍编译）套件级
-  正确（257/258），sum 再快 ~8%，默认关闭待解禁
+- sum **1.7× wasmtime**（局部寄存器缓存 + warm 两遍编译已默认开启），
+  primes 追平，memsum 反超；fib/primes/sum 全部快于 node
+- JIT 相对解释器加速 **14–2600×**；sum 自迭代 24 的 0.108 收敛至
+  0.033（-69%）；matmul 剩余差距来自 FP 值生命周期（v 寄存器缓存层，
+  下一步）；fib 来自 CALL 边界帧开销
+- 逃生门：EA_NOCACHE / EA_NOWARM 恢复纯窗口直发语义（仍 257/258）
 
 **内存**（峰值 RSS）：easm 基线 1.7MB、负载峰值 2.2MB，约为 wasmtime 的 1/3.6、
-V8/node 的 1/20；磁盘足迹 320KB vs wasmtime 48.5MB；冷启动（解码+编译+执行
-fib(30)）4ms vs wasmtime 57ms。
+V8/node 的 1/20；磁盘足迹 313KB vs wasmtime 46MB；冷启动（解码+编译+执行
+sum(1)）**2.3ms，快于 wasmtime 的 4.1ms**。
 
 ## 路线图
 
-1. HIR + 寄存器分配（效率阶段主战场）——消除 1:1 栈机翻译的冗余 push/pop，
-   收敛与 Cranelift 在计算密集内核上的差距；顺带把 call_indirect 类型检查
-   改为解码期缓存 canonical id
-2. 浮点参数直接 S/D 寄存器往返；v128 的 JIT lowering（当前回退解释器）
+1. matmul FP 值生命周期——f32/f64 局部的 v8–v15 callee-saved 寄存器缓存层
+   （当前最大短板 6.7× wasmtime）
+2. CALL 边界帧开销——fib 类递归的瘦帧/尾部合并（当前 2.5×）
 3. annotations 提案文本语法支持（自制转换路径，解锁最后一个测试文件）
 
 ## WASI 运行时

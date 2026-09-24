@@ -1378,3 +1378,43 @@ bench 五内核无数值变化(内核无 else/函数级 br,符合预期)。
 调用方被 JIT 执行。实际该调用链含 else,**此前从未进入 JIT**。
 HIR-2 下 sat 模块现已全 JIT 且语义正确,HIR-3 的 CALL 边界重定位
 对比可在真实 JIT 执行上重做;槽序公式(见上)已实测入库。
+
+## 迭代 39：warm/cache 解禁 — sum -48%，1.7× wasmtime（2026-09-25，已合入）
+
+run_bench.py 增加 EA_CACHE/EA_WARM 实验通道后实测：**EA_WARM=1 的
+sum 0.064 → 0.032**（fib 0.023→0.019），五内核输出全部与基线一致。
+留档的 stale-value 风险区（">6 live-local 展开体"）未在任何 bench
+内核或测试面出现——warm 两遍编译自迭代 25/28 修复后已达到解禁标准。
+
+**解禁方式**：cache_on 与 warm 两遍编译改为默认开启，逃生门反转：
+- `EA_NOCACHE` — 关闭局部寄存器缓存（x19–x24）
+- `EA_NOWARM` — 关闭 warm 两遍编译（保留单遍直发语义）
+
+验证（默认配置）：解释器/JIT 双模式 257/258、WASI 15/15、七个微测试
+夹具全绿；逃生门组合（EA_NOCACHE+EA_NOWARM，即旧 HIR-2 语义）
+257/258 复验。bench 计时含进程冷启动，解禁的编译开销已计入且净收益
+为正。
+
+### 三维度对比（同机，含引擎启动）
+
+| kernel | easm-jit | wasmtime | 倍率 | 说明 |
+|---|---|---|---|---|
+| fib | 0.020 | 0.008 | 2.5× | CALL 边界帧开销（下一步） |
+| primes | 0.006 | 0.005 | 1.2× | 追平 |
+| sum | 0.033 | 0.019 | **1.7×** | 迭代 29 预估的 HIR-3 目标（<2×）由解禁提前达成 |
+| matmul | 0.193 | 0.029 | 6.7× | FP 生命周期（v8–v15 缓存层，下一步） |
+| memsum | 0.003 | 0.004 | **0.75×（反超）** | |
+
+体积：easm 313KB vs wasmtime 46MB（147×）。冷启动：easm-jit 2.3ms vs
+wasmtime 4.1ms（快 1.8×）。
+
+### HIR-3 重新定位
+
+解禁后 cref 层（zero-code push）+ defer2/3 park 默认生效，HIR-3 的
+预设收益目标（sum 与 wasmtime < 2×）已达成。剩余优化按新短板排序：
+1. matmul FP 值生命周期：f32/f64 局部的 v8–v15 callee-saved 缓存层
+   （matmul 6.7× 为当前最大差距；注意 f32.load 的 pop_s 不消费 cref
+   的不变量——FP binop 前 keep 判定强制 flush，保证栈顶非 cref）；
+2. fib CALL 边界：瘦帧（leaf 判定已有 is_leaf）与递归尾部合并。
+
+原 HIR-3 描述符栈蓝图（迭代 32 清单）降级为 matmul FP 层的设计输入。
