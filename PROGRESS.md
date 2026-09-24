@@ -1162,3 +1162,36 @@ spill，27 条中 ~9 条为溢出/重载对）。彻底解法 = 完整描述符�
 永不通物化（每描述符记录绝对槽偏移）。两者均为 ~300 行级改造，
 收益预估 sum 内环 27→~15 条、与 wasmtime < 2×；matmul FP 生命周期
 同批。风险与迭代 25/28 的经验一致：不变量必须先纸面证明再动手。
+
+## 迭代 30：HIR-3 第二次尝试 — 重定位溢出（2026-09-24，否定结果 + 设计留档）
+
+实现「push 不驱逐 cref」的完整方案：n_pushed 层序计数（pop 按 LIFO：
+push → cref 寄存器 → 栈）+ **重定位溢出**（flush 时 push 下移 16×nc、
+cref 填入原 push 区，`sub/ldr/str` 序列，地址序与逻辑序严格一致）+
+warm 回边免物化（cref 按局部索引解析寄存器，pin 透明）+ FP push 计数 +
+n_pushed ≥ 8 上限。微测试（t1/ip/fsum/cr）全过，sum 内环一度到
+**22 条**（表达式链 7 条 = wasmtime 同档，操作数全部直读缓存寄存器）。
+
+**未过：float_exprs compute_radix（EA_WARM 2 assert）**。f32/f64 两个
+radix 循环返回 2^24/2^53（循环退出条件失效）。纸面推演三轮均判正确，
+包括：头部 park 放宽、FP parked 路径 cref 读取、tee 写后读、
+warm_backedge 免物化、pass-1/pass-2 状态差——均排除。结论：存在
+纸面推演覆盖不到的执行路径交叉（疑似多循环函数的 warm 上下文切换 +
+cref 层序交互），需要运行时寄存器轨迹（EA_WDBG2 挂点改造）定位。
+
+**已回退至 73730c3 语义**（全量三模式 257/258 复验）。迭代 28 收益
+（sum 0.069、内环 27 条）完整保留。
+
+### HIR-3 下次会话的切入点
+
+1. **先造轨迹工具**：EA_WDBG2 的寄存器 dump 目前只挂 warm END——需
+   挂回边 + cref 层状态（n_cref/cref_local/n_pushed）打印，否则
+   radix 类失败只能靠反汇编猜。
+2. **可疑点排序**：多循环函数的第二个 warm 上下文（pass-1 的
+   cref 记账与 pass-2 的差异）；fsub/fadd 的 else 路径在
+   [cref|push|window] 混合态下的 flush 顺序；tee 的 push_x 守卫与
+   后续 cmp 的 cref 消费交错。
+3. **22 条形态已证可达**：表达式链 7 条（操作数直读缓存寄存器）
+   + 归纳步进 8 条 + 计数比较 4 条 + 分支 2 条。剩余差距 =
+   park mov ×2（结果直发 x17 可省）+ 常量 imm 融合（add xK, xK, #imm
+   可省 5）——两者都不依赖 cref 层，**可作为独立小步先行合入**。
