@@ -738,6 +738,12 @@ static void load_mem_regs(Em *e) {
 
 static void spill_crefs(JC *c);
 static uint32_t cref_reg(JC *c, uint32_t i);
+static int ea_ctrace_on(void) { // compile-time decision trace (EA_CTRACE)
+    static int on = -1;
+    if (on < 0) on = getenv("EA_CTRACE") != NULL;
+    return on;
+}
+#define CTRACE(c, ...) do { if (ea_ctrace_on()) fprintf(stderr, "[CT] f%u pc=%u " __VA_ARGS__); } while (0)
 // a physical push materializes pending refs first: a deeper virtual value
 // can only land ABOVE entries that already exist on the stack, so it must
 // be written before the push takes the lowest slot
@@ -887,9 +893,11 @@ static uint32_t cref_reg(JC *c, uint32_t i) {
     return ea_cache_reg[local_cached_slot(c, c->cref_local[i])];
 }
 static void spill_crefs(JC *c) { // deepest first (array order = highest
-    for (uint32_t i = 0; i < c->n_cref; i++) {  // address first); 64-bit
-        a64_str_pre64(&c->em, cref_reg(c, i), SP, -16);  // stores (i32 cache
-    }                          // values are zero-extended by invariant)
+    if (ea_ctrace_on())          // address first); 64-bit
+        fprintf(stderr, "[CT] f%u pc=%u spill n_cref=%u\n", c->fn_idx, c->cur_pc, c->n_cref);
+    for (uint32_t i = 0; i < c->n_cref; i++) {  // stores (i32 cache values
+        a64_str_pre64(&c->em, cref_reg(c, i), SP, -16);  // are zero-extended)
+    }
     c->n_cref = 0;
 }
 static bool cref_conflict_any(JC *c, uint32_t idx) {
@@ -1259,6 +1267,7 @@ static void push_result_w(JC *c) {
             if (!c->in_park) a64_mov_reg64(&c->em, R17, R16);
             c->in_park = false;
             c->def_kind1 = 1; c->def_count = 1; c->def_first = 0;
+            CTRACE(c, "prx park ip=%d\n", 0);
             return;
         }
         if (c->def_count == 0 && !c->def2_live && !c->cache_on && !c->wl_pass &&
@@ -1318,6 +1327,7 @@ static void push_result_x(JC *c) {
             if (!c->in_park) a64_mov_reg64(&c->em, R17, R16);
             c->in_park = false;
             c->def_kind1 = 1; c->def_count = 1; c->def_first = 0;
+            CTRACE(c, "prx park ip=%d\n", 0);
             return;
         }
         if (c->def_count == 0 && !c->def2_live && !c->cache_on && !c->wl_pass &&
@@ -1332,10 +1342,12 @@ static void push_result_x(JC *c) {
         defer2_possible(c, c->cur_pc, (uint32_t)c->f->code.n)) {
         c->def_kind0 = 1; c->def_count = 1; c->def_first = 1;
         c->def_first_reg = 0;
+        CTRACE(c, "prx pair-first\n");
         return;
     }
     if (c->def2_live) flush_deferred(c); // the result would push above x19
     push_x(&c->em, R16);
+    CTRACE(c, "prx push\n");
 }
 // f32/f64 binop result in v0: park in v1 for a following float op, or store
 // straight to a local slot
@@ -1347,6 +1359,7 @@ static void push_result_f(JC *c, int b) {
             // in place when the local is cache-resident: fmov straight into
             // its register (also keeps the register fresh — never bypass
             // set_local_val with a raw frame store)
+            CTRACE(c, "prf set\n");
             if (c->cache_on) {
                 uint32_t k = c->f->code.v[nx].imm.u32;
                 for (uint32_t i = 0; i < EA_CACHE_SLOTS; i++) {
@@ -1368,6 +1381,7 @@ static void push_result_f(JC *c, int b) {
             a64_fmov_reg(&c->em, V1, V0, b);
             c->def_kind1 = (uint8_t)(b == 4 ? 2 : 3);
             c->def_count = 1; c->def_first = 0;
+            CTRACE(c, "prf parkV1\n");
             return;
         }
     }
