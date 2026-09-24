@@ -1195,3 +1195,25 @@ cref 层序交互），需要运行时寄存器轨迹（EA_WDBG2 挂点改造）
    + 归纳步进 8 条 + 计数比较 4 条 + 分支 2 条。剩余差距 =
    park mov ×2（结果直发 x17 可省）+ 常量 imm 融合（add xK, xK, #imm
    可省 5）——两者都不依赖 cref 层，**可作为独立小步先行合入**。
+
+## 迭代 31：直发 park + imm12 融合（2026-09-24，已合入）
+
+迭代 30 列出的两个不依赖 cref 层的低风险小步，一次落地：
+
+1. **结果直发 park 寄存器**：binop_dst 在下一条为 int consumer 时返回
+   R17（in_park 标志），case 直接把结果算进 park 寄存器，push_result 的
+   park 分支免 mov。操作数安全：ARM 单指令内先读后写，dst 与 emit_a/emit_b
+   重合均合法。cache 无关（默认路径同享）。
+2. **imm12 融合**：const completer 在 consumer 为 ADD/SUB 且常量落在
+   imm12（含负数取反形式）时**完全不物化寄存器**（def_b_imm/def_imm），
+   ADD/SUB case 按符号选 add/sub-imm 形式；flush 路径补 mov 物化；
+   非 ADD/SUB consumer 走原 mov 路径。i32/i64 双宽度。
+
+### 实测
+
+- **sum 内环 27→16 条（-41%）**：表达式链 5 条（lsr/sub 直发 x17）+
+  归纳步进 `add xK, xK, #imm` ×4 + 计数比较 4 + 分支 2 + 常量 1。
+- **ip 微基准 warm 循环 11→8 条**（比 wasmtime 同形更紧）。
+- bench 墙钟持平（sum 0.069）：依赖链 1 周期/迭代为瓶颈，指令数已
+  不在关键路径——代码密度收益真实，性能收益待 HIR-3 的跨语句驻留。
+- 三模式 257/258、解释器 257/258、WASI 15/15 零回归。
