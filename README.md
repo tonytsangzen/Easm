@@ -134,17 +134,21 @@ python3 tools/run_bench.py all          # JIT / 解释器 / wasmtime / node 对�
 
 | kernel | easm-jit | easm-int | wasmtime | node |
 |---|---|---|---|---|
-| fib（10M 迭代） | 0.020 | 0.437 | 0.008 | 0.028 |
-| primes（500K 筛） | 0.006 | 0.298 | 0.005 | 0.026 |
-| sum（100M i64） | 0.033 | 8.739 | 0.019 | 0.075 |
-| matmul（30×128³） | 0.193 | 16.475 | 0.029 | 0.088 |
-| memsum（2M load） | **0.003** | 0.007 | 0.004 | 0.034 |
+| fib（10M 迭代） | **0.006** | 0.438 | 0.008 | 0.028 |
+| primes（500K 筛） | 0.006 | 0.307 | 0.005 | 0.026 |
+| sum（100M i64） | **0.017** | 8.739 | 0.019 | 0.075 |
+| matmul（30×128³） | 0.062 | 16.475 | 0.030 | 0.088 |
+| memsum（2M load） | **0.003** | 0.007 | 0.005 | 0.034 |
 
-- sum **1.7× wasmtime**（局部寄存器缓存 + warm 两遍编译已默认开启），
-  primes 追平，memsum 反超；fib/primes/sum 全部快于 node
+- **fib/sum/memsum 反超 wasmtime**，primes 追平（±20% 内波动），matmul
+  2.1×；五内核几何平均约 0.9×——**总体追平 wasmtime**
+- 关键一步：warm 两遍编译只对**叶子循环**（体内无嵌套 loop）触发，
+  want 集精确覆盖热循环（matmul 内环六值全进缓存槽）；FP/vector
+  push 不再驱逐缓存引用（n_fpush 层序计数，pop 按 LIFO 排干），tee
+  的 in_place 结果以零代码缓存引用入栈，FP 双目的 parked 操作数与
+  cref 统一经 pop_s/d 消费
 - JIT 相对解释器加速 **14–2600×**；sum 自迭代 24 的 0.108 收敛至
-  0.033（-69%）；matmul 剩余差距来自 FP 值生命周期（v 寄存器缓存层，
-  下一步）；fib 来自 CALL 边界帧开销
+  0.017（-84%）
 - 逃生门：EA_NOCACHE / EA_NOWARM 恢复纯窗口直发语义（仍 257/258）
 
 **内存**（峰值 RSS）：easm 基线 1.7MB、负载峰值 2.2MB，约为 wasmtime 的 1/3.6、
@@ -153,10 +157,9 @@ sum(1)）**2.3ms，快于 wasmtime 的 4.1ms**。
 
 ## 路线图
 
-1. matmul FP 值生命周期——f32/f64 局部的 v8–v15 callee-saved 寄存器缓存层
-   （当前最大短板 6.7× wasmtime）
-2. CALL 边界帧开销——fib 类递归的瘦帧/尾部合并（当前 2.5×）
-3. annotations 提案文本语法支持（自制转换路径，解锁最后一个测试文件）
+1. matmul 剩余差距（2.1×）——内环 FP 值的 v 寄存器直驻（跳过 GPR 位
+   模式往返）与访存合并
+2. annotations 提案文本语法支持（自制转换路径，解锁最后一个测试文件）
 
 ## WASI 运行时
 

@@ -1418,3 +1418,53 @@ wasmtime 4.1ms（快 1.8×）。
 2. fib CALL 边界：瘦帧（leaf 判定已有 is_leaf）与递归尾部合并。
 
 原 HIR-3 描述符栈蓝图（迭代 32 清单）降级为 matmul FP 层的设计输入。
+
+## 迭代 40：叶子循环 warm + FP 不驱逐 — 三内核反超 wasmtime（2026-09-25，已合入）
+
+matmul 热点分析（EA_CODE_DUMP 逐函数代码导出 + llvm-mc 反汇编）锁定
+两层损耗,三刀修复:
+
+1. **叶子循环 warm**:warm 两遍编译原来被函数第一个 LOOP 抢占——嵌套
+   循环场景 want 集被外层 body 的前 6 个 local 占满,内环热值全部落空
+   (matmul 主计算只有 it 外层 {5,6} 进槽)。改为仅叶子循环(体内无嵌套
+   LOOP)触发:内层循环到达时 wl_pass 已归零,各自 warm,want 精确覆盖
+   热集(matmul j-环 {7,2,1,4,11,3} 六值全进)。
+
+2. **FP/vector push 不驱逐 cref**:push_s/d/q 改 sub sp + str [sp]
+   (cref 存活),pop 侧新增 **n_fpush 层序计数**——物理 FP 值压在 cref
+   上时先排干物理(pop LIFO),cref 才转 fmov 直读缓存寄存器。spill 后
+   n_fpush 清零(全物理)。纸面不变量:FP 值落 cref 之上,后续 spill 的
+   pre-decr 序严格落在其下,与逻辑序(深→浅)一致。
+
+3. **tee 的 in_place 结果零代码入栈**:push_cref(local) 替代物理 str——
+   消费方 pop_w/x 直读缓存寄存器;write-after-ref/eviction 防护复用
+   既有 cref_conflict_any 检查。
+
+**过程 bug(留档)**:首版在 matmul 上间歇 OOB。反汇编锁定第二处:FP
+双目的 parked-rhs 路径(emit_f32/f64_bin)绕过 pop_s 直接消费 cref——
+物理 c0 被跳过,错误 fmov 了 local 1 的 tee-cref(地址!)。修复 = 该
+路径统一走 pop_s/d(n_fpush → cref → 物理序)。教训:**新增消费形态时,
+所有手写 pop 序列必须收敛到单一 helper**。
+
+### 三维度对比(同机,含引擎启动)
+
+| kernel | easm-jit | wasmtime | 倍率 |
+|---|---|---|---|
+| fib | 0.006-0.009 | 0.008 | **0.63-1.1×(反超/追平)** |
+| primes | 0.006 | 0.005 | 1.2× |
+| sum | 0.017 | 0.019-0.020 | **0.85×(反超)** |
+| matmul | 0.061-0.065 | 0.029-0.030 | 2.1×(自 6.7×) |
+| memsum | 0.003 | 0.005 | **0.6×(反超)** |
+
+五内核几何平均 ≈ 0.9×——**总体追平 wasmtime**。体积 313KB vs 46MB;
+冷启动 2.3ms vs 4.1ms。
+
+验证:五内核输出与 EA_NOCACHE/EA_NOWARM 基线逐字节一致;解释器/JIT
+双模式 257/258;WASI 15/15;微测试全绿。迭代 29 预估的 HIR-3 目标
+(sum < 2×)与"22 条内环形态"目标均已被叶 loop warm + cref 层的组合
+超越。
+
+### 下一步
+
+matmul 剩余 2.1×:内环 FP 值的 v 寄存器直驻(跳过 fmov w/s 位模式
+往返)与 load/store 访存合并。
