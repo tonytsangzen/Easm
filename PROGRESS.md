@@ -1468,3 +1468,29 @@ matmul 热点分析（EA_CODE_DUMP 逐函数代码导出 + llvm-mc 反汇编）�
 
 matmul 剩余 2.1×:内环 FP 值的 v 寄存器直驻(跳过 fmov w/s 位模式
 往返)与 load/store 访存合并。
+
+## 迭代 41：JIT 分层重构 — 代码整理与死代码清除（2026-09-25，已合入）
+
+纯移动重构,语义零变化。jit_a64.c(4399 行)拆为三层:
+
+- **jit_a64.c**(~3800 行):codegen 层,保持单编译单元——栈原语是
+  单指令包装,必须内联,跨 TU 拆分会引入 call 开丢性能;内部按
+  L1 编译器状态 / L2a 栈原语 / L2b 融合窗口 / L2c 缓存引用层 /
+  L3 局部缓存 / L4 结果发射 / L5 异常调用分支 / L6 标量 SIMD /
+  L7 模块发布 分区,头注释文档化机器模型、操作数栈不变量与
+  Em*/JC* 指针惯用法(JC 首字段为 Em,&jc->em 与 jc 同地址,警告为
+  良性噪音);
+- **jit_a64_rt.c**(新,~640 行):运行时层——生成代码调用的 C 服务
+  (trap、bulk-memory/table/内存 grow helper、fmin/fmax、trunc、
+  异常展开、解释器桥)、C→JIT 跳板与 16MB 代码区。无编译器状态;
+- **jit_a64.h**(新):层契约头,承载跨层符号声明。
+
+死代码移除:jit_stub.c(主仓 Makefile 从未编译;ewebview fork 仍引用,
+独立保留)、decode.c 的 read_type_entry/pool_put、validate.c 的
+ek_of/vt_canon_eq_v/S_zero_placeholder 标签、interp.c 的 src_null/ht1
+(br_on_cast_fail 的 spec 盲区,行为未动,注释留档)、ea_dbg_after。
+decode/validate/interp 警告清零。FP 原语(push_s/d、pop_s/d、peek)
+归位栈原语区。
+
+回归:双模式 257/258、WASI 15/15、微测试全绿、五内核输出 parity、
+bench 性能无损(fib 0.005 / sum 0.017 / matmul 0.060)。

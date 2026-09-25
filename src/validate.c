@@ -69,9 +69,6 @@ static bool push_val(V *v, EaValType t) {
     if (v->sp > v->max_stack) v->max_stack = v->sp;
     return true;
 }
-// minimal function-references subtyping: (ref $t) <: (ref null $t) <: funcref;
-// a typed ref also matches its declared supertypes
-static uint32_t ek_of(EaValType t) { return ((uint32_t)t >> 1) & 0xFu; }
 // heap type (s33 immediate) -> valtype; 0x7FFFFFFF on error
 static EaValType gc_ht_valtype(EaModule *m, int64_t ht, bool nullable) {
     if (ht >= 0) {
@@ -105,9 +102,6 @@ static EaValType gc_ht_valtype(EaModule *m, int64_t ht, bool nullable) {
 }
 
 // abstract heap kind subtyping: got kind <: expect kind
-// structural canonical type equivalence (shared semantics with the runtime)
-static bool vt_canon_eq_v(EaModule *m, EaValType a, EaValType b, int depth);
-
 // canonical equivalence of iso-recursive types, following the reference
 // interpreter's model: a defined type is (rec group, position); its body's
 // references into its OWN group are positional (Rec j), references elsewhere
@@ -216,12 +210,6 @@ bool ea_type_canon_eq1(EaModule *m, uint32_t a, uint32_t b) {
 static bool type_canon_eq(EaModule *m, uint32_t a, uint32_t b, int depth) {
     (void)depth;
     return ea_type_canon_eq1(m, a, b);
-}
-static bool vt_canon_eq_v(EaModule *m, EaValType a, EaValType b, int depth) {
-    if (a == b) return true;
-    if (ea_tref_real(a) && ea_tref_real(b))
-        return ea_type_canon_eq1(m, ea_tref_idx(a), ea_tref_idx(b));
-    return false;
 }
 
 static bool abs_kind_sub(uint32_t gk, uint32_t ek) {
@@ -1562,7 +1550,6 @@ int ea_validate_module(EaModule *m, char **err) {
                     vfail(&v, "type mismatch: array.len");
                     break;
                 }
-                S_zero_placeholder:;
                 push_val(&v, VT_I32);
                 break;
             }
@@ -1977,7 +1964,7 @@ int ea_validate_module(EaModule *m, char **err) {
         if (v.failed) {
             if (getenv("EA_VDBG")) {
                 fprintf(stderr, "EA_VDBG vfail func %u pc %u/%u op %x: %s (sp=%u csp=%u) nres=%u res0=%x\n", fi, cur_pc, v.cur_op,
-                        f->code.n, v.err ? v.err : "?", v.sp, v.csp, (void*)ft, ft->n_results,
+                        f->code.n, v.err ? v.err : "?", v.sp, v.csp, ft->n_results,
                         ft->n_results ? (unsigned)ft->results[0] : 0u);
                 for (uint32_t k = 0; k < f->code.n; k++)
                     fprintf(stderr, "   [%u] 0x%02x end=%u else=%d\n", k, f->code.v[k].opcode,

@@ -300,12 +300,6 @@ static bool read_comp_body(Rd *r, uint8_t form, EaType *t) {
     return false;
 }
 
-// one type-space entry: comptype, or sub / sub final wrapping a comptype
-static bool read_type_entry(Rd *r, EaType *t) {
-    uint8_t form;
-    if (!rd_byte(r, &form)) return false;
-    return read_type_entry_form(r, form, t);
-}
 static bool read_type_entry_form(Rd *r, uint8_t form, EaType *t) {
     bool _ok = read_type_entry_form_inner(r, form, t);
     if (!_ok && getenv("EA_VDBG2")) fprintf(stderr, "type entry FAIL form=%02x at off=%ld\n", form, (long)(r->p - r->start));
@@ -378,18 +372,6 @@ static bool ins_open(InsCtx *c, uint32_t idx) {
     if (getenv("EA_DDBG")) fprintf(stderr, "OPEN idx=%u n=%u sp=%u\n", idx, c->n, c->nest_sp);
     c->nest[c->nest_sp++] = idx;
     return true;
-}
-static uint32_t pool_put(InsCtx *c, const uint8_t *bytes, uint32_t n_bytes) {
-    uint32_t words = (n_bytes + 3) / 4;
-    while (c->pool_n + words > c->pool_cap) {
-        c->pool_cap = c->pool_cap ? c->pool_cap * 2 : 16;
-        c->pool = (uint32_t *)ea_realloc(c->pool, (size_t)c->pool_cap * 4);
-    }
-    uint32_t base = c->pool_n;
-    memset(&c->pool[base], 0, (size_t)words * 4);
-    memcpy(&c->pool[base], bytes, n_bytes);
-    c->pool_n += words;
-    return base;
 }
 static bool rd_memarg(Rd *r, EaInstr *in, bool multi_memory) {
     uint32_t align;

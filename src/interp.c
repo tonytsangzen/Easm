@@ -50,7 +50,7 @@ typedef struct {
     uint32_t block_idx;
     uint8_t is_loop;
     uint8_t is_try;
-    struct EaInstr *try_in; // try_table instruction (catch clauses)
+    EaInstr *try_in; // try_table instruction (catch clauses)
 } RCtl;
 
 #define MAX_CTRL 4096
@@ -1310,9 +1310,11 @@ int ea_interp_exec_function(EaExec *ex, EaFuncInst *fi) {
         }
         case EA_OP_BR_ON_CAST: case EA_OP_BR_ON_CAST_FAIL: {
             void *r = S[sp - 1].ref;
-            bool src_null = (in->imm.q.a & 1) != 0;
             bool dst_null = (in->imm.q.a & 2) != 0;
-            int64_t ht1 = (int64_t)(int32_t)in->imm.q.b;
+            // NOTE: the src-side null flag (in->imm.q.a & 1) and source heap
+            // type (imm.q.b) are not consulted here; br_on_cast_fail
+            // semantics are the one spec area without coverage (conversion
+            // failure), so this stays as-is until that test can run.
             int64_t ht2 = (int64_t)(int32_t)in->imm.q.c;
             bool cast_ok = ea_gc_match(m, r, ht2, dst_null);
             if (getenv("EA_GDBG")) fprintf(stderr, "BRONCAST r=%p ht2=%d ok=%d sp=%u arity=%u h=%u pc_end=%u loop=%d\n", r, (int)(int32_t)in->imm.q.c, cast_ok, sp, ctl[csp - 1 - in->imm.q.d].arity, ctl[csp - 1 - in->imm.q.d].height, ctl[csp - 1 - in->imm.q.d].pc_end, ctl[csp - 1 - in->imm.q.d].is_loop);
