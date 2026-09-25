@@ -134,15 +134,16 @@ python3 tools/run_bench.py all          # JIT / 解释器 / wasmtime / node 对�
   multi-memory、table64、**SIMD + relaxed-simd（全家族原生 NEON，含
   fmla/sdot/tbl 融合）**
 
-**性能**（同机与 wasmtime 48.0.2 / node 对比，含引擎启动）：
+**性能**（同机与 wasmtime 48.0.2 / node 对比，含引擎启动；2026-09-25
+重构后复测，三次取稳）：
 
 | kernel | easm-jit | easm-int | wasmtime | node |
 |---|---|---|---|---|
-| fib（10M 迭代） | **0.006** | 0.438 | 0.008 | 0.028 |
-| primes（500K 筛） | 0.006 | 0.307 | 0.005 | 0.026 |
-| sum（100M i64） | **0.017** | 8.739 | 0.019 | 0.075 |
-| matmul（30×128³） | 0.062 | 16.475 | 0.030 | 0.088 |
-| memsum（2M load） | **0.003** | 0.007 | 0.005 | 0.034 |
+| fib（10M 迭代） | **0.006–0.007** | 0.440 | 0.008 | 0.029 |
+| primes（500K 筛） | 0.006 | 0.304 | 0.005–0.006 | 0.027 |
+| sum（100M i64） | **0.018** | 8.843 | 0.020 | 0.082 |
+| matmul（30×128³） | 0.062 | 16.939 | 0.030 | 0.092 |
+| memsum（2M load） | **0.003** | 0.007 | 0.005 | 0.025 |
 
 - **fib/sum/memsum 反超 wasmtime**，primes 追平（±20% 内波动），matmul
   2.1×；五内核几何平均约 0.9×——**总体追平 wasmtime**
@@ -152,12 +153,12 @@ python3 tools/run_bench.py all          # JIT / 解释器 / wasmtime / node 对�
   的 in_place 结果以零代码缓存引用入栈，FP 双目的 parked 操作数与
   cref 统一经 pop_s/d 消费
 - JIT 相对解释器加速 **14–2600×**；sum 自迭代 24 的 0.108 收敛至
-  0.017（-84%）
+  0.018（-83%）
 - 逃生门：EA_NOCACHE / EA_NOWARM 恢复纯窗口直发语义（仍 257/258）
 
 **内存**（峰值 RSS）：easm 基线 1.7MB、负载峰值 2.2MB，约为 wasmtime 的 1/3.6、
-V8/node 的 1/20；磁盘足迹 313KB vs wasmtime 46MB；冷启动（解码+编译+执行
-sum(1)）**2.3ms，快于 wasmtime 的 4.1ms**。
+V8/node 的 1/20；磁盘足迹 314KB vs wasmtime 46MB；冷启动（解码+编译+执行
+sum(1)）**2.4ms，快于 wasmtime 的 4.3ms**。
 
 ## 路线图
 

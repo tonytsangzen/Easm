@@ -1494,3 +1494,10 @@ decode/validate/interp 警告清零。FP 原语(push_s/d、pop_s/d、peek)
 
 回归:双模式 257/258、WASI 15/15、微测试全绿、五内核输出 parity、
 bench 性能无损(fib 0.005 / sum 0.017 / matmul 0.060)。
+
+### 迭代 41 重构后 bench 复测（2026-09-25）
+
+分层重构合入后三次取稳：fib 0.006–0.007、primes 0.006、sum 0.018、
+matmul 0.062、memsum 0.003——与重构前一致（fib/sum/memsum 反超
+wasmtime，primes 追平，matmul 2.1×；几何平均 ≈0.9×）。体积 314KB、
+冷启动 2.4ms（wasmtime 4.3ms）。重构零性能回归确认。
