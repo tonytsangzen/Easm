@@ -35,6 +35,9 @@
 
 
 // ---------------------------------------------------------------- L1: compiler state (JC) & forward decls
+// operand-stack slot width and FP register numbers used by the emitters
+#define SLOT 16
+
 // float values move directly through S/D registers (no gpr<->fpr round-trip)
 #define V0 0
 #define V1 1
